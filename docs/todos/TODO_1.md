@@ -101,11 +101,11 @@ Nguồn sự thật:
 
 ## 9. Supervisor và shutdown — P1-12
 
-- [ ] `src/runtime/supervisor.rs`: spawn HTTP; theo dõi task; SIGTERM/SIGINT; CancellationToken.
-- [ ] `src/runtime/shutdown.rs`: readiness false → ngừng accept HTTP → đóng DB pool → release lock; deadline `shutdown_timeout_ms`.
-- [ ] Signal thứ hai exit ngay; panic task trọng yếu → exit có kiểm soát.
-- [ ] Test `tests/shutdown_http.rs`: SIGTERM khi có request; exit 0; không panic; lock release.
-- [ ] Chưa có MQTT; phần kick session để P2/P4.
+- [x] `src/runtime/supervisor.rs`: spawn HTTP; theo dõi task; SIGTERM/SIGINT; CancellationToken.
+- [x] `src/runtime/shutdown.rs`: readiness false → ngừng accept HTTP → đóng DB pool → release lock; deadline `shutdown_timeout_ms`.
+- [x] Signal thứ hai exit ngay; panic task trọng yếu → exit có kiểm soát.
+- [x] Test `tests/shutdown_http.rs`: SIGTERM khi có request; exit 0; không panic; lock release.
+- [x] Chưa có MQTT; phần kick session để P2/P4.
 
 ## 10. Test harness — P1-13
 
