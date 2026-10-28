@@ -4,12 +4,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rmqtt::context::ServerContext;
+use rmqtt::hook::Type;
 use rmqtt::server::MqttServer as RmqttServer;
+use sqlx::SqlitePool;
 use tokio::task::JoinHandle;
 
 use crate::config::schema::MqttConfig;
+use crate::core::presence::Presence;
 
+use super::acl::AclHooks;
+use super::auth::AuthHooks;
 use super::config;
+use super::presence::PresenceHooks;
 
 /// Running RMQTT listener and the channel used by core services.
 pub struct MqttServer {
@@ -20,10 +26,41 @@ pub struct MqttServer {
 
 impl MqttServer {
     /// Starts RMQTT in the current process and reports its bound address.
-    pub async fn start(config: &MqttConfig, readiness: Arc<AtomicBool>) -> anyhow::Result<Self> {
+    ///
+    /// Auth and presence hooks are registered before the listener runs.
+    pub async fn start(
+        config: &MqttConfig,
+        readiness: Arc<AtomicBool>,
+        pool: SqlitePool,
+        presence: Arc<Presence>,
+    ) -> anyhow::Result<Self> {
         let listener = config::listener(config)?;
         let address = listener.local_addr()?;
         let context = ServerContext::new().busy_check_enable(false).build().await;
+
+        let register = context.extends.hook_mgr().register();
+        register
+            .add_priority(
+                Type::ClientAuthenticate,
+                10,
+                Box::new(AuthHooks::new(pool.clone())),
+            )
+            .await;
+        register
+            .add_priority(Type::MessagePublishCheckAcl, 10, Box::new(AclHooks::new()))
+            .await;
+        register
+            .add_priority(Type::ClientSubscribeCheckAcl, 10, Box::new(AclHooks::new()))
+            .await;
+        let presence_hooks = PresenceHooks::new(pool, presence);
+        register
+            .add_priority(Type::ClientConnected, 10, Box::new(presence_hooks.clone()))
+            .await;
+        register
+            .add_priority(Type::ClientDisconnected, 10, Box::new(presence_hooks))
+            .await;
+        register.start().await;
+
         let task_readiness = Arc::clone(&readiness);
         let task = tokio::spawn(async move {
             let result = RmqttServer::new(context)

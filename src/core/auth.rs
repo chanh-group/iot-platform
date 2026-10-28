@@ -74,6 +74,23 @@ pub fn hash_token(token: &str) -> [u8; 32] {
     Sha256::digest(token.as_bytes()).into()
 }
 
+/// True when `value` is a canonical (lowercase, hyphenated) UUID v7.
+#[must_use]
+pub fn is_device_id(value: &str) -> bool {
+    uuid::Uuid::parse_str(value)
+        .is_ok_and(|id| id.get_version_num() == 7 && id.hyphenated().to_string() == value)
+}
+
+/// Constant-time comparison of a stored SHA-256 digest with `token`.
+///
+/// Length is not secret; the digest bytes are compared without early exit.
+#[must_use]
+pub fn token_matches(stored_hash: &[u8], token: &str) -> bool {
+    use subtle::ConstantTimeEq;
+
+    hash_token(token).ct_eq(stored_hash).into()
+}
+
 /// Milliseconds since the Unix epoch, clamped for pre-epoch clocks.
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -138,5 +155,28 @@ mod tests {
         assert_ne!(token, generate_session_token().unwrap());
         assert_eq!(hash_token(&token).len(), 32);
         assert_eq!(hash_token(&token), hash_token(&token));
+    }
+
+    #[test]
+    fn token_comparison_is_constant_time_and_rejects_wrong_values() {
+        let token = "iot_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let stored = hash_token(token);
+
+        assert!(token_matches(&stored, token));
+        assert!(!token_matches(&stored, "iot_wrong"));
+        assert!(!token_matches(&[], token));
+        assert!(!token_matches(&stored[..31], token));
+    }
+
+    #[test]
+    fn device_ids_must_be_canonical_uuid_v7() {
+        let v7 = uuid::Uuid::now_v7().to_string();
+        assert!(is_device_id(&v7));
+
+        let v4 = uuid::Uuid::new_v4().to_string();
+        assert!(!is_device_id(&v4));
+        assert!(!is_device_id(&v7.to_uppercase()));
+        assert!(!is_device_id(&v7.replace('-', "")));
+        assert!(!is_device_id("not-a-uuid"));
     }
 }

@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::LoadedConfig;
+use crate::core::presence::Presence;
 use crate::http::{AppState, router};
 use crate::mqtt::server::MqttServer;
 use crate::observability::logging;
@@ -50,7 +51,15 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
     }
 
     let mqtt_ready = Arc::new(AtomicBool::new(false));
-    let mut mqtt = match MqttServer::start(&loaded.config.mqtt, Arc::clone(&mqtt_ready)).await {
+    let presence = Arc::new(Presence::new());
+    let mut mqtt = match MqttServer::start(
+        &loaded.config.mqtt,
+        Arc::clone(&mqtt_ready),
+        pool.clone(),
+        presence,
+    )
+    .await
+    {
         Ok(server) => server,
         Err(error) => {
             tracing::error!(%error, "cannot start mqtt listener");
