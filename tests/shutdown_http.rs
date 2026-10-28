@@ -9,6 +9,7 @@ use iot_server::runtime::lock::DataDirLock;
 use reqwest::StatusCode;
 use serde_json::json;
 use tempfile::TempDir;
+use tokio::io::AsyncWriteExt;
 
 const PASSWORD: &str = "correct horse battery staple";
 
@@ -170,6 +171,60 @@ async fn sigterm_drains_in_flight_request_and_releases_lock() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("server starting"), "{stdout}");
     assert!(stdout.contains("server stopped"), "{stdout}");
+
+    let loaded = config::load_with_env(&config_path, |_| None).unwrap();
+    DataDirLock::acquire(&loaded.data_dir).expect("lock was not released");
+}
+
+#[tokio::test]
+async fn second_signal_exits_immediately_without_graceful_cleanup() {
+    let dir = TempDir::new().unwrap();
+    let port = free_port();
+    let config_path = write_config(&dir, port);
+
+    let server = Server::spawn(&config_path);
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    wait_until_healthy(&client, &base).await;
+
+    // An unfinished login body keeps one request in flight, so graceful
+    // shutdown stays busy until the second signal forces the exit.
+    let mut pending = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    pending
+        .write_all(
+            b"POST /api/v1/auth/login HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nX-IoT-CSRF: 1\r\nContent-Length: 64\r\n\r\n{\"username\":\"admin\"",
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let pid = server.id().to_string();
+    let first = Command::new("kill").args(["-TERM", &pid]).status().unwrap();
+    assert!(first.success());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let second = Command::new("kill").args(["-TERM", &pid]).status().unwrap();
+    assert!(second.success());
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || server.wait_with_output()),
+    )
+    .await
+    .expect("server did not exit after the second signal")
+    .expect("wait task panicked")
+    .expect("wait failed");
+
+    assert_eq!(output.status.code(), Some(1), "exit {:?}", output.status);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("second shutdown signal"), "{stdout}");
+    assert!(!stdout.contains("server stopped"), "{stdout}");
 
     let loaded = config::load_with_env(&config_path, |_| None).unwrap();
     DataDirLock::acquire(&loaded.data_dir).expect("lock was not released");
