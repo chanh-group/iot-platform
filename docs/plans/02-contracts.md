@@ -115,7 +115,9 @@ Mặc định deny. Bảng dưới là toàn bộ quyền của một device:
 - ACL kiểm tra cả lúc SUBSCRIBE và lúc broker giao message; wildcard không được mở rộng quyền.
 - Publish vào topic server-only (`telemetry/ack`, `commands`) bị từ chối.
 - Publish retained vào `telemetry` hoặc `attributes`: message **không** được ingest/xử lý; với telemetry có `event_id` hợp lệ, server gửi ACK `rejected/retained_not_allowed`. Publish retained vào topic server-only (`telemetry/ack`, `commands`, `commands/ack`) bị ACL từ chối.
-- Từ chối ACL: message không được route; RMQTT đóng kết nối (hành vi chính xác được xác nhận ở Phase 0). Không ghi telemetry, không đổi trạng thái.
+- Publish ACL deny: message không được route, RMQTT đóng connection và không gửi PUBACK; không ghi telemetry.
+- Subscribe ACL deny: RMQTT trả SUBACK failure `0x80`, giữ connection; không message nào của filter bị giao.
+- RMQTT gọi `MessagePublish` **trước** `MessagePublishCheckAcl`. `MessagePublish` chỉ parse/log tối thiểu, không enqueue/ghi SQL; ingest chỉ được thực hiện sau khi `MessagePublishCheckAcl` cho phép.
 - Không có API cấp quyền cross-device trong MVP.
 
 ### 2.5. Retained, session và tài nguyên
@@ -135,6 +137,7 @@ Mặc định deny. Bảng dưới là toàn bộ quyền của một device:
 - Retained chỉ hữu ích cho `status` và `data/#`; retained trên topic nghiệp vụ bị xử lý như §2.4.
 - Retained của cùng topic thay thế bản cũ; payload rỗng xóa retained.
 - Vượt retained cap là broker-level disconnect, không phải application ACK/retry response. Hook product phải increment metric có reason `retained_cap` và log có topic/size đã redact payload trước khi trả reject.
+- Product dùng `BudgetedRetainStorage` thay `DefaultRetainStorage` (no-op): kiểm tra cap và cập nhật counter trước khi set; replace trừ byte cũ, payload rỗng xóa topic và trừ toàn bộ byte; thao tác phải serialize để tránh race.
 - Retained/session không bền qua process restart. Sau restart, mọi device coi là offline đến khi reconnect.
 - Session offline vẫn có thể nhận message QoS 1 trong giới hạn queue; command không dựa vào queue này (xem §2.8).
 
@@ -285,6 +288,7 @@ Device ACK `devices/{id}/commands/ack`, QoS 0/1:
 - Command/ACK dùng QoS 1 để có ít nhất một lần giao trong session; node phải dedup.
 - Thứ tự publish trên cùng topic/session do broker bảo đảm theo QoS; application không cam kết ordering giữa các device.
 - Khi rotate/disable: commit SQL → kick connection. Nếu kick lỗi, retry có giới hạn, metric + readiness false; token cũ đã không thể reconnect.
+- Shutdown: dừng accept, kick toàn bộ session đang mở, chờ ngắn rồi abort listener. `abort` một mình chỉ nhả port, **không** đóng session; phải kick trước.
 - Duplicate `client_id`: broker đóng connection cũ trước khi nhận connection mới; presence dùng generation để sự kiện disconnect cũ không ghi đè trạng thái mới.
 
 ## 3. Contract SQLite
@@ -300,6 +304,8 @@ PRAGMA foreign_keys = ON;
 PRAGMA busy_timeout = 5000;
 PRAGMA wal_autocheckpoint = 1000;
 ```
+
+- Phase 0 all-in-one dùng `synchronous=FULL` để chứng minh durability; product MVP giữ `NORMAL` theo contract này. Nếu cần chống mất transaction khi mất điện (không chỉ kill process), đổi sang `FULL` bằng ADR + benchmark riêng.
 
 - Pool mặc định 5 connection; telemetry chỉ ghi qua một worker.
 - Database file phải nằm trong `server.data_dir`; nếu không, startup fail. Điều này cho phép một lock duy nhất bảo vệ DB + runtime file.
@@ -1216,16 +1222,17 @@ iot-server --version
 | §11 CLI/đóng gói | §6 |
 | §13 tiêu chí A01–A19 | `03-delivery-plan.md` |
 
-## 9. Điểm phải xác nhận ở Phase 0
+## 9. Kết quả Phase 0 đã chốt
 
-Các contract sau phụ thuộc hành vi thực tế của RMQTT 0.24 và phải được ghi lại trong báo cáo spike:
+Phase 0 PASS ngày 2026-10-28; bằng chứng đầy đủ trong `spike-rmqtt.md`. Các điểm dưới đây là contract cuối cùng, không còn là câu hỏi mở:
 
-1. Hook `ClientConnect` thấy protocol level và từ chối được level 3/5.
-2. `max_session_expiry_ms` áp dụng cho MQTT 3.1.1 `clean_session=0`; nếu không, wrapper phải xóa session theo tuổi.
-3. Thứ tự hook khi duplicate `client_id` (disconnect cũ trước connect mới) đủ cho presence generation.
-4. Retained hook đếm được topic/byte và chặn trước khi store; zero-length xóa đúng.
-5. `entry.publish` QoS1 tới session đang online/offline trong giới hạn queue.
-6. ACL deny đóng kết nối hay chỉ drop message; test A04 phải ổn định.
-7. Abort listener không còn accept connection mới và nhả port.
+1. Protocol level 3 bị từ chối bằng CONNACK `0x05`; level 5 bằng CONNACK `0x87`; `client_id != username` bằng `0x04`.
+2. Session expiry `clean_session=0` hoạt động với TTL ngắn trong test; production cấu hình tối đa 1 giờ (`max_session_expiry_ms`).
+3. Duplicate `client_id` đóng connection cũ trước connection mới; session id chứa `create_time` dùng được làm generation.
+4. Retained cap dùng `BudgetedRetainStorage`; vượt cap đóng connection, không PUBACK, metric `retained_cap`; replace/clear cập nhật counter đúng.
+5. `entry.publish` QoS 1 và `entry.kick` hoạt động; shutdown phải kick session trước khi abort listener.
+6. Publish ACL deny đóng connection; subscribe ACL deny trả SUBACK `0x80` và giữ connection; cả hai không route message.
+7. `MessagePublish` chạy trước `MessagePublishCheckAcl`; không ingest trong `MessagePublish`.
+8. Abort listener nhả port và không accept connection mới nhưng không đóng session; wrapper chịu trách nhiệm kick.
 
-Nếu bất kỳ điểm nào khác contract, sửa tài liệu này + ADR trước khi code, không tự điều chỉnh ngầm trong implementation.
+Nếu implementation Phase 1 phát hiện hành vi khác, dừng và sửa tài liệu này + ADR trước khi tiếp tục, không tự điều chỉnh ngầm.

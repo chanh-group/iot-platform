@@ -8,7 +8,7 @@ Hướng dẫn cho agent/code contributor trong repo này. Đọc trước khi s
 - `docs/plans/01-stack-and-architecture.md` — stack, version, ADR.
 - `docs/plans/02-contracts.md` — contract MQTT/SQLite/HTTP. Sửa hành vi phải sửa file này trước.
 - `docs/plans/03-delivery-plan.md` — thứ tự phase và test mapping.
-- `docs/TODO.md` — việc đang làm.
+- `docs/todos/TODO_1.md` — việc đang làm (Phase 1). `docs/todos/TODO_0.md` là hồ sơ Phase 0 đã xong.
 
 Không đổi version, broker, frontend, TLS nếu không có ADR mới trong `01`.
 
@@ -16,7 +16,7 @@ Không đổi version, broker, frontend, TLS nếu không có ADR mới trong `0
 
 Phase 0 — **PASS** ngày 2026-10-28. Phase 1 chưa bắt đầu. Code trong `spikes/` là **throwaway**, không merge vào sản phẩm và không đặt trong `src/`. Chỉ báo cáo `docs/plans/spike-rmqtt.md` được giữ lại.
 
-Phase 1 chỉ bắt đầu sau khi các khác biệt contract trong `docs/plans/spike-rmqtt.md` được chốt trong `docs/plans/02-contracts.md`.
+Phase 1 chỉ bắt đầu sau khi các khác biệt contract trong `docs/plans/spike-rmqtt.md` được chốt trong `docs/plans/02-contracts.md`. Đã chốt; Phase 1 đang ở bước TODO, chưa có code.
 
 ## Lệnh bắt buộc
 
@@ -58,7 +58,7 @@ Nếu crate spike không nằm trong workspace root, chạy các lệnh trên tr
 - Bug fix: grep mọi caller của hàm bị sửa, sửa ở nguồn chung, thêm test tái hiện.
 - Integration test dùng temp dir riêng, port tự do; không phụ thuộc thời gian thực dài (inject clock/TTL ngắn).
 - Test MQTT dùng `rumqttc`; không dùng thao tác tay làm evidence duy nhất.
-- Phase 0 dùng đúng tên test trong `docs/TODO.md` (`auth_hooks`, `protocol_reject`, `acl_cross_device`, `server_publish_kick`, `retained`, `session_expiry`, `shutdown`) để báo cáo chạy lại được.
+- Phase 0 dùng đúng tên test trong `docs/todos/TODO_0.md` (`auth_hooks`, `protocol_reject`, `acl_cross_device`, `server_publish_kick`, `retained`, `session_expiry`, `shutdown`) để báo cáo chạy lại được.
 
 ## Git
 
