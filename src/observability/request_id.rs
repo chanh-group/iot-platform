@@ -4,6 +4,7 @@ use axum::extract::{FromRequestParts, Request};
 use axum::http::{HeaderName, HeaderValue, request::Parts};
 use axum::middleware::Next;
 use axum::response::Response;
+use tracing::Instrument;
 use uuid::Uuid;
 
 const HEADER: &str = "x-request-id";
@@ -37,7 +38,14 @@ fn attach(mut response: Response, id: &str) -> Response {
 pub async fn middleware(mut request: Request, next: Next) -> Response {
     let id = normalize(request.headers().get(HEADER));
     request.extensions_mut().insert(RequestId(id.clone()));
-    attach(next.run(request).await, &id)
+    let span = tracing::info_span!(
+        "request",
+        request_id = %id,
+        method = %request.method(),
+        path = %request.uri().path(),
+    );
+    let response = next.run(request).instrument(span).await;
+    attach(response, &id)
 }
 
 impl<S> FromRequestParts<S> for RequestId
