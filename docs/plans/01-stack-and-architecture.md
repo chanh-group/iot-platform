@@ -111,17 +111,17 @@ Phải chứng minh bằng code throwaway, không merge vào sản phẩm:
 3. `ClientSubscribeCheckAcl` và `MessagePublishCheckAcl` nhận đúng session/topic/qos/retain; từ chối được.
 4. `ClientConnected`/`ClientDisconnected` nhận đúng session id; dùng session id làm connection generation.
 5. `entry.publish(from_system, publish_qos1)` tới device đang online; `entry.kick(true, true, true)` đóng connection.
-6. Retained publish trên `status` được deliver lại cho subscriber mới; hook đếm được retained topic/byte và từ chối khi vượt cap.
-7. `MqttServer::run()` spawn/abort được; sau abort không còn accept connection mới.
+6. Retained publish trên `status` được deliver lại cho subscriber mới; hook đếm được retained topic/byte và, khi vượt cap, ghi metric/log rồi chấp nhận RMQTT đóng connection không PUBACK.
+7. `MqttServer::run()` spawn/abort được; abort chỉ đóng listener và không đóng session đang mở.
 
 ### Khoảng trống và cách xử lý
 
 | Khoảng trống | Cách xử lý |
 | --- | --- |
 | API 0.x có thể đổi | Pin chính xác `=0.24.0`; mọi kiểu RMQTT chỉ nằm trong `src/mqtt/`; nâng version phải chạy lại protocol suite A19 |
-| Không có graceful stop công khai | Wrapper kicks toàn bộ session đang online, chờ ngắn, rồi abort listener task; dữ liệu bền vững đã nằm trong SQL |
-| Không có cap retained mặc định | Hook tự đếm `(topic, bytes)`; từ chối retained mới khi vượt `max_retained_messages`/`max_retained_bytes` |
-| Thư viện chấp nhận MQTT 5/3.1 | Hook `ClientConnect` từ chối protocol level khác 4 (MQTT 3.1.1) |
+| Không có graceful stop công khai | `abort()` chỉ đóng listener, không đóng session. Shutdown bắt buộc kick toàn bộ session đang online, chờ ngắn, rồi abort listener task; dữ liệu bền vững đã nằm trong SQL |
+| Không có cap retained mặc định | Hook tự đếm `(topic, bytes)`; trước khi reject ghi metric/log `retained_cap`. RMQTT sau đó đóng connection, không PUBACK |
+| Thư viện chấp nhận MQTT 5/3.1 | Hook `ClientConnect` từ chối protocol level khác 4; giữ mã RMQTT thực tế: v3.1 `0x05`, v5 `0x87` |
 | Session/retained không bền qua restart | MVP không cam kết; thiết bị reconnect, command/telemetry đã commit vẫn còn trong SQL |
 | Log dùng `log`, app dùng `tracing` | Bật feature `tracing-log` và cài `LogTracer` để gom log RMQTT vào cùng pipeline |
 
@@ -334,7 +334,7 @@ core -> không import axum/rmqtt/sqlx
 ### Shutdown sequence
 
 1. Nhận SIGTERM/SIGINT; set readiness false; hủy HTTP accept (graceful).
-2. Dừng nhận MQTT connection mới; kick các session đang online (best effort, timeout ngắn).
+2. Dừng nhận MQTT connection mới; vì `abort()` không đóng session, kick các session đang online (best effort, timeout ngắn) trước khi abort listener.
 3. Đóng ingest queue; worker drain tới `shutdown_timeout_ms`, commit nốt batch.
 4. Dừng dispatcher/retention; đóng DB pool; release file lock.
 5. Nếu hết deadline: log số item còn lại, exit code 1; không ACK item chưa commit.

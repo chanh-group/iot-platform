@@ -56,11 +56,11 @@ Mọi lỗi JSON có cùng envelope, không có stack trace:
 ### 2.1. Protocol và kết nối
 
 - Chỉ chấp nhận **MQTT 3.1.1**, protocol level `4`.
-- Protocol level `3` (MQTT 3.1): CONNACK `0x01` (unacceptable protocol version).
-- Protocol level `5` (MQTT 5): CONNACK `0x84` (unsupported protocol version) nếu broker mã hóa được gói MQTT 5; nếu không, đóng kết nối. Phase 0 ghi lại hành vi thực tế.
+- Protocol level `3` (MQTT 3.1): RMQTT trả CONNACK `0x05`; client phải coi là bị từ chối protocol. Đây là hành vi đã xác nhận của broker, không tự map sang `0x01`.
+- Protocol level `5` (MQTT 5): RMQTT trả CONNACK `0x87`; client phải coi là bị từ chối protocol. Không tự map sang `0x84`.
 - `allow_anonymous` chỉ được `false`. Cấu hình `true` làm startup fail.
 - `username` = `device_id`; `password` = device token; `client_id` = `device_id`.
-- `client_id` khác `username`: CONNACK `0x02` (identifier rejected).
+- `client_id` khác `username`: RMQTT trả CONNACK `0x04`; không phân biệt với credential sai ra bên ngoài.
 - Unknown device, device disabled, credential revoked, sai token: CONNACK `0x04` (bad username/password), không phân biệt lý do.
 - Token đúng nhưng device vừa bị disable/rotate: từ chối; kết nối đang mở bị kick.
 - `clean_session` 0 và 1 đều được phép. Session offline tối đa `max_session_expiry_ms` (mặc định 1 giờ), sau đó xóa.
@@ -122,8 +122,8 @@ Mặc định deny. Bảng dưới là toàn bộ quyền của một device:
 
 | Giới hạn | Giá trị mặc định | Hành vi khi vượt |
 | --- | --- | --- |
-| Retained messages | 10 000 | Từ chối retained mới; metric + log |
-| Retained bytes | 16 MiB | Từ chối retained mới; metric + log |
+| Retained messages | 10 000 | Hook ghi metric/log rồi RMQTT đóng connection; không có PUBACK |
+| Retained bytes | 16 MiB | Hook ghi metric/log rồi RMQTT đóng connection; không có PUBACK |
 | Session expiry sau disconnect | 1 giờ | Session bị xóa; client phải clean session/reconnect |
 | Subscriptions/client | 8 | SUBACK failure cho subscription vượt |
 | Inflight/client | 32 | Broker backpressure theo QoS |
@@ -134,6 +134,7 @@ Mặc định deny. Bảng dưới là toàn bộ quyền của một device:
 
 - Retained chỉ hữu ích cho `status` và `data/#`; retained trên topic nghiệp vụ bị xử lý như §2.4.
 - Retained của cùng topic thay thế bản cũ; payload rỗng xóa retained.
+- Vượt retained cap là broker-level disconnect, không phải application ACK/retry response. Hook product phải increment metric có reason `retained_cap` và log có topic/size đã redact payload trước khi trả reject.
 - Retained/session không bền qua process restart. Sau restart, mọi device coi là offline đến khi reconnect.
 - Session offline vẫn có thể nhận message QoS 1 trong giới hạn queue; command không dựa vào queue này (xem §2.8).
 

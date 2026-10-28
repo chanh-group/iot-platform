@@ -27,7 +27,7 @@ Không có trạng thái “gần pass”: thiếu bất cứ gate nào thì Pha
 - [x] Đăng ký và chạy được hook: authenticate, connect, connected, disconnected, subscribe ACL, publish ACL và publish.
 - [x] Xác nhận hook nhận đúng `client_id`, username, password, session ID, protocol level, topic, QoS, retain.
 - [x] MQTT 3.1.1 (level 4), `client_id == username`, token đúng: kết nối thành công.
-- [x] MQTT 3.1 (level 3), MQTT 5 (level 5), token sai và `client_id != username`: bị từ chối; không còn session mới.
+- [x] MQTT 3.1 (level 3) trả `0x05`, MQTT 5 (level 5) trả `0x87`, `client_id != username` trả `0x04`; tất cả bị từ chối và không còn session mới.
 
 ### 3. ACL và giao nhận
 
@@ -43,14 +43,14 @@ Không có trạng thái “gần pass”: thiếu bất cứ gate nào thì Pha
 
 - [x] Retained `devices/A/status` được subscriber mới nhận.
 - [x] Retained replacement và zero-length clear hoạt động.
-- [x] Cap retained theo số topic và byte từ chối publish mới khi vượt; counter không âm khi replace/clear.
+- [x] Cap retained theo số topic và byte: hook ghi metric/log `retained_cap`, RMQTT đóng connection không PUBACK; counter không âm khi replace/clear.
 - [x] Restart spike không giữ retained state (đúng scope MVP).
 - [x] `clean_session=0` reconnect hoạt động; session expiry tối đa 1 giờ được chứng minh hoặc có wrapper cụ thể, test được.
 - [x] Smoke QoS 0/1/2, wildcard hợp lệ, LWT và session reconnect pass.
 
 ### 5. Lifecycle và all-in-one feasibility
 
-- [x] `MqttServer::run()` chạy trong task; shutdown/abort nhả port và không accept connection mới.
+- [x] `MqttServer::run()` chạy trong task; abort nhả port/không accept mới nhưng không đóng session; graceful shutdown kick session trước abort.
 - [x] Không panic khi shutdown trong lúc có client/session.
 - [x] Spike riêng `spikes/allinone/`: SQLx 0.9 migration + SQLite WAL với `synchronous=FULL`, Axum asset/WS echo và RMQTT cùng một process.
 

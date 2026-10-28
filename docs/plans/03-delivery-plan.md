@@ -39,13 +39,13 @@ P0 → P1 → P2 → P3 → P4 → (release MVP)
 | --- | --- | --- | --- |
 | P0-01 | Tạo crate spike tối thiểu, pin `rmqtt = "=0.24.0"` feature `retain`; bật log | `spikes/rmqtt/Cargo.toml` (throwaway) | `cargo run` mở listener 1883 |
 | P0-02 | Đăng ký hook auth/connect/connected/disconnected/subscribe ACL/publish ACL/publish | `spikes/rmqtt/src/main.rs` | Log đủ field: client_id, username, session, topic, QoS, retain, protocol |
-| P0-03 | Từ chối protocol level 3/5; client_id≠username; sai token | spike | CONNACK đúng; không có session |
+| P0-03 | Từ chối protocol level 3/5; client_id≠username; sai token | spike | Mã RMQTT chốt: v3.1 `0x05`, v5 `0x87`, client ID mismatch `0x04`; không có session |
 | P0-04 | ACL theo `02` §2.4; test wildcard/cross-device | spike + rumqttc | Không giao message; ghi lại deny đóng hay drop |
 | P0-05 | Server publish `entry.publish(FromType::System, QoS1)` tới device online/offline | spike | Client nhận đúng topic/payload |
 | P0-06 | `entry.kick` khi rotate/disable; duplicate client ID | spike | Connection cũ đóng; hook order ghi lại |
-| P0-07 | Retained: status, thay thế, zero-length clear, cap topic/byte | spike | Subscriber mới nhận; cap chặn; restart rỗng |
+| P0-07 | Retained: status, thay thế, zero-length clear, cap topic/byte | spike | Subscriber mới nhận; cap ghi metric/log rồi đóng connection, không PUBACK; restart rỗng |
 | P0-08 | Session expiry 1h cho `clean_session=0` | spike | Session biến mất sau expiry; ghi lại API/cơ chế |
-| P0-09 | Lifecycle: spawn `run()`, abort, nhả port, không accept mới | spike | Test shell/curl connect fail sau abort |
+| P0-09 | Lifecycle: spawn `run()`, abort, nhả port, không accept mới; kick session | spike | Abort không accept mới nhưng không đóng session; shutdown wrapper kick session trước abort |
 | P0-10 | SQLx 0.9 migrate + SQLite WAL + Axum embed + WS echo trong cùng binary | `spikes/allinone` | Một process phục vụ cả 3 |
 | P0-11 | Protocol smoke: QoS0/1/2, retain, LWT, session reconnect, MQTT5/3.1 reject | rumqttc | Kết quả từng case |
 | P0-12 | Viết báo cáo pass/fail + API snippet + khác biệt contract | `docs/plans/spike-rmqtt.md` | Review xong |

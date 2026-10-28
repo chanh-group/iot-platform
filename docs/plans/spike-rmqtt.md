@@ -225,12 +225,12 @@ Tổng: **13 passed, 0 failed**. Không có test ignored.
 
 | # | Contract (`docs/plans/02-contracts.md`) | Thực tế RMQTT 0.24 | Xử lý |
 | --- | --- | --- | --- |
-| 1 | §2.1: MQTT 3.1 (level 3) → CONNACK `0x01` | `0x05` (NotAuthorized) | Cập nhật §2.1 theo hành vi thực tế, hoặc fork/patch RMQTT nếu bắt buộc đúng `0x01`. Gate chỉ yêu cầu “từ chối”, nên không fail Phase 0. |
-| 2 | §2.1: MQTT 5 → CONNACK `0x84` nếu mã hóa được, nếu không đóng kết nối | v5 CONNACK `0x87` (NotAuthorized) | §2.1 đã cho phép ghi nhận hành vi thực tế; cập nhật thành `0x87`. |
-| 3 | §2.1: `client_id != username` → CONNACK `0x02` | `0x04` (BadUserNamePassword) | Cùng xử lý như #1. Trên thực tế `0x04` an toàn hơn vì không xác nhận client ID nào tồn tại. |
+| 1 | §2.1: MQTT 3.1 (level 3) → CONNACK `0x01` | `0x05` (NotAuthorized) | **Đã chốt:** contract dùng mã RMQTT thực tế `0x05`; không fork/patch. Gate chỉ yêu cầu “từ chối”, nên không fail Phase 0. |
+| 2 | §2.1: MQTT 5 → CONNACK `0x84` nếu mã hóa được, nếu không đóng kết nối | v5 CONNACK `0x87` (NotAuthorized) | **Đã chốt:** contract dùng `0x87`; không fork/patch. |
+| 3 | §2.1: `client_id != username` → CONNACK `0x02` | `0x04` (BadUserNamePassword) | **Đã chốt:** contract dùng `0x04`; không phân biệt với credential sai. |
 | 4 | Không quy định thứ tự `MessagePublish` và ACL | `MessagePublish` chạy **trước** `MessagePublishCheckAcl` | Không đặt ingest trong `MessagePublish`; ingest quyết định trong/after `MessagePublishCheckAcl` (spike đã làm). Ghi rõ trong contract/Phase 1. |
-| 5 | §2.5: retained vượt cap → từ chối retained mới; metric + log | `RetainStorage::set` trả lỗi; RMQTT đóng session, không PUBACK; wrapper chưa phát metric/log | Thêm metric/log trong product wrapper; ghi rõ client phải reconnect. Contract nên nói rõ “đóng kết nối, không PUBACK”. |
-| 6 | §2.5: shutdown/abort không accept connection mới, không panic | `task.abort()` đóng listener và nhả port; **không** tự đóng các session đang mở | Gate đạt. Nếu cần graceful drain, product phải gọi `kick`/đóng session trước khi abort; ghi vào Phase 1. |
+| 5 | §2.5: retained vượt cap → từ chối retained mới; metric + log | `RetainStorage::set` trả lỗi; RMQTT đóng session, không PUBACK; wrapper chưa phát metric/log | **Đã chốt:** contract quy định product hook phải ghi metric/log `retained_cap`, sau đó chấp nhận disconnect/no PUBACK; client phải reconnect với backoff. |
+| 6 | §2.5: shutdown/abort không accept connection mới, không panic | `task.abort()` đóng listener và nhả port; **không** tự đóng các session đang mở | **Đã chốt:** shutdown wrapper kick session trước abort listener. |
 | 7 | §2.4: ACL deny — contract chỉ nói publish bị đóng kết nối | Subscribe deny trả SUBACK failure và giữ connection; publish deny đóng connection | Hành vi publish khớp contract; bổ sung câu cho subscribe nếu muốn chốt. |
 | 8 | §2.5: session expiry mặc định 1 giờ | Cơ chế chứng minh với TTL 2 s; listener production đặt `3600 s`, cap `3600 s` | Test dùng TTL ngắn theo yêu cầu; Phase 1 dùng config thật, không hard-code. |
 
@@ -252,12 +252,7 @@ Lý do:
 - Shutdown không panic, không accept connection mới, nhả port.
 - All-in-one SQLx + SQLite WAL/FULL + Axum + RMQTT chạy trong một process.
 
-Việc bắt buộc trước khi viết code auth ở Phase 1:
-
-1. Sửa `docs/plans/02-contracts.md` §2.1 theo mã CONNACK thực tế (`0x05`, `0x87`, `0x04`) **hoặc** quyết định fork/patch RMQTT. Không để code trả mã khác contract mà không sửa contract.
-2. Chốt hành vi retained vượt cap: đóng kết nối, không PUBACK; thêm metric + log trong product wrapper.
-3. Chốt graceful shutdown: `abort()` chỉ đóng listener; nếu cần đóng session đang mở thì gọi `kick` trước khi abort.
-4. Đưa các limit `max_*` vào test Phase 1/A19 thay vì chỉ cấu hình.
+Các quyết định bắt buộc trước MQTT auth đã được chốt trong contract: mã CONNACK thực tế, retained-cap disconnect/metric/log và kick trước abort. Việc còn lại cho Phase 1/A19 là đưa các limit `max_*` vào test, thay vì chỉ cấu hình.
 
 Rủi ro còn lại:
 
