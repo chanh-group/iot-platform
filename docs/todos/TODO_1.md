@@ -85,12 +85,12 @@ Nguồn sự thật:
 
 ## 7. HTTP shell, health, static — P1-10
 
-- [ ] `src/http/router.rs`: `/api/v1` + fallback; body limit, timeout, request ID, trace.
-- [ ] `GET /healthz` 200 `{"status":"ok"}`; không auth, không DB.
-- [ ] `GET /readyz` kiểm tra `SELECT 1` timeout 1s; 200/503; không lộ lỗi.
-- [ ] Placeholder dashboard HTML trong `src/http/assets.rs` (chưa cần `web/`); `dashboard=false` → 404.
-- [ ] 404/405 JSON đúng `02`; static fallback không áp dụng cho `/api`.
-- [ ] Test `tests/http_shell.rs`: health, ready, 404, 405, dashboard toggle.
+- [x] `src/http/router.rs`: `/api/v1` + fallback; body limit, timeout, request ID, trace.
+- [x] `GET /healthz` 200 `{"status":"ok"}`; không auth, không DB.
+- [x] `GET /readyz` kiểm tra `SELECT 1` timeout 1s; 200/503; không lộ lỗi.
+- [x] Placeholder dashboard HTML trong `src/http/assets.rs` (chưa cần `web/`); `dashboard=false` → 404.
+- [x] 404/405 JSON đúng `02`; static fallback không áp dụng cho `/api`.
+- [x] Test `tests/http_shell.rs`: health, ready, 404, 405, dashboard toggle.
 
 ## 8. Observability — P1-11
 
