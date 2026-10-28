@@ -7,6 +7,7 @@ pub mod middleware;
 pub mod router;
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use sqlx::SqlitePool;
@@ -19,6 +20,7 @@ pub struct AppState {
     pub pool: SqlitePool,
     pub config: Arc<LoadedConfig>,
     pub login_limiter: Arc<LoginRateLimiter>,
+    pub ready: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -31,6 +33,7 @@ impl AppState {
             pool,
             config,
             login_limiter: Arc::new(limiter),
+            ready: Arc::new(AtomicBool::new(true)),
         }
     }
 }

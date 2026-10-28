@@ -58,12 +58,14 @@ async fn healthz() -> Json<Value> {
 
 async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     // shortcut: phase 1 has no MQTT/ingest tasks, so only the database is checked.
-    let database_ok = tokio::time::timeout(
-        Duration::from_secs(1),
-        sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(&state.pool),
-    )
-    .await
-    .is_ok_and(|result| result.is_ok());
+    let ready = state.ready.load(std::sync::atomic::Ordering::Acquire);
+    let database_ok = ready
+        && tokio::time::timeout(
+            Duration::from_secs(1),
+            sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(&state.pool),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok());
 
     if database_ok {
         (

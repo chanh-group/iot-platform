@@ -1,0 +1,176 @@
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::Duration;
+
+use iot_server::config;
+use iot_server::runtime::lock::DataDirLock;
+use reqwest::StatusCode;
+use serde_json::json;
+use tempfile::TempDir;
+
+const PASSWORD: &str = "correct horse battery staple";
+
+struct Server {
+    child: Option<Child>,
+}
+
+impl Server {
+    fn spawn(config_path: &Path) -> Self {
+        let child = Command::new(env!("CARGO_BIN_EXE_iot-server"))
+            .args(["run", "--config"])
+            .arg(config_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        Self { child: Some(child) }
+    }
+
+    fn id(&self) -> u32 {
+        self.child.as_ref().unwrap().id()
+    }
+
+    fn wait_with_output(mut self) -> io::Result<Output> {
+        self.child.take().unwrap().wait_with_output()
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+fn write_config(dir: &TempDir, port: u16) -> PathBuf {
+    let path = dir.path().join("conf.toml");
+    fs::write(
+        &path,
+        format!(
+            "config_version = 1\n\
+             [server]\n\
+             data_dir = \"./data\"\n\
+             shutdown_timeout_ms = 5000\n\
+             [http]\n\
+             listen = \"127.0.0.1:{port}\"\n\
+             [database]\n\
+             url = \"sqlite://./data/iot.db\"\n"
+        ),
+    )
+    .unwrap();
+    path
+}
+
+fn run_cli(args: &[&str], config_path: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_iot-server"))
+        .args(args)
+        .arg("--config")
+        .arg(config_path)
+        .output()
+        .unwrap()
+}
+
+async fn wait_until_healthy(client: &reqwest::Client, base: &str) {
+    for _ in 0..100 {
+        if let Ok(response) = client.get(format!("{base}/healthz")).send().await
+            && response.status() == StatusCode::OK
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("server did not become healthy");
+}
+
+#[tokio::test]
+async fn sigterm_drains_in_flight_request_and_releases_lock() {
+    let dir = TempDir::new().unwrap();
+    let port = free_port();
+    let config_path = write_config(&dir, port);
+
+    let migrate = run_cli(&["migrate"], &config_path);
+    assert!(
+        migrate.status.success(),
+        "migrate failed: {}",
+        String::from_utf8_lossy(&migrate.stderr)
+    );
+
+    let password_file = dir.path().join("password.txt");
+    fs::write(&password_file, PASSWORD).unwrap();
+    let create = Command::new(env!("CARGO_BIN_EXE_iot-server"))
+        .args(["admin", "create", "--config"])
+        .arg(&config_path)
+        .args(["--password-file"])
+        .arg(&password_file)
+        .output()
+        .unwrap();
+    assert!(
+        create.status.success(),
+        "admin create failed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let server = Server::spawn(&config_path);
+    let base = format!("http://127.0.0.1:{port}");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    wait_until_healthy(&client, &base).await;
+
+    let login = tokio::spawn({
+        let client = client.clone();
+        let url = format!("{base}/api/v1/auth/login");
+        async move {
+            client
+                .post(url)
+                .header("content-type", "application/json")
+                .header("x-iot-csrf", "1")
+                .json(&json!({ "username": "admin", "password": PASSWORD }))
+                .send()
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let kill = Command::new("kill")
+        .args(["-TERM", &server.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(kill.success());
+
+    let response = tokio::time::timeout(Duration::from_secs(5), login)
+        .await
+        .expect("login did not finish")
+        .expect("login task panicked")
+        .expect("login request failed");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || server.wait_with_output()),
+    )
+    .await
+    .expect("server did not exit")
+    .expect("wait task panicked")
+    .expect("wait failed");
+
+    assert!(output.status.success(), "exit {:?}", output.status);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("server starting"), "{stdout}");
+    assert!(stdout.contains("server stopped"), "{stdout}");
+
+    let loaded = config::load_with_env(&config_path, |_| None).unwrap();
+    DataDirLock::acquire(&loaded.data_dir).expect("lock was not released");
+}

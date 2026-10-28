@@ -9,12 +9,10 @@ use clap::{Parser, Subcommand};
 use crate::config::{self, LoadedConfig};
 use crate::core::auth;
 use crate::runtime::lock::DataDirLock;
+use crate::runtime::{EXIT_CONFIG, EXIT_LOCK, EXIT_MIGRATION, supervisor};
 use crate::storage::sqlite::users::{self, CreateAdminError};
 use crate::storage::sqlite::{migrate, pool};
 
-const EXIT_CONFIG: u8 = 3;
-const EXIT_MIGRATION: u8 = 4;
-const EXIT_LOCK: u8 = 5;
 const EXIT_ADMIN_EXISTS: u8 = 6;
 
 #[derive(Debug, Parser)]
@@ -80,11 +78,19 @@ pub fn run() -> ExitCode {
                     password_file,
                 },
         } => admin_create(&cli.config, &username, password_file.as_deref()),
-        Command::Run => {
-            eprintln!("iot-server: run not implemented yet");
-            ExitCode::FAILURE
-        }
+        Command::Run => run_server(&cli.config),
     }
+}
+
+fn run_server(config_path: &Path) -> ExitCode {
+    let loaded = match config::load(config_path) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            eprintln!("iot-server: {error}");
+            return ExitCode::from(EXIT_CONFIG);
+        }
+    };
+    block_on(supervisor::run(config_path, loaded))
 }
 
 fn check(config_path: &Path) -> ExitCode {
