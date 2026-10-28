@@ -109,10 +109,10 @@ Nguồn sự thật:
 
 ## 10. Test harness — P1-13
 
-- [ ] `tests/common/mod.rs`: temp data dir; config builder; free port; spawn app; chờ `/readyz`; HTTP client cookie jar.
-- [ ] Retry free-port tối đa 3 lần; mỗi test data dir riêng.
-- [ ] Không dùng chung `conf.toml`/DB; cleanup temp.
-- [ ] MQTT/WS helper để Phase 2.
+- [x] `tests/common/mod.rs`: temp data dir; config builder; free port; spawn app; chờ `/readyz`; HTTP client cookie jar.
+- [x] Retry free-port tối đa 3 lần; mỗi test data dir riêng.
+- [x] Không dùng chung `conf.toml`/DB; cleanup temp.
+- [x] Chỗ mở rộng MQTT/WS helper cho Phase 2 (Phase 1 chưa có protocol).
 
 ## 11. Kiểm tra cuối Phase 1
 
