@@ -94,10 +94,10 @@ Nguồn sự thật:
 
 ## 8. Observability — P1-11
 
-- [ ] `src/observability/logging.rs`: JSON/text, level từ config, `tracing-log`, request_id span.
-- [ ] Không log token/password/payload/DB URL; test redaction.
-- [ ] `src/observability/metrics.rs`: registry skeleton cho connection/ingest/commit/command; **chưa mở `/metrics`** (P2-13).
-- [ ] Log startup/shutdown có config path, revision, bind addr; không log secret.
+- [x] `src/observability/logging.rs`: JSON/text, level từ config, `tracing-log`, request_id span.
+- [x] Không log token/password/payload/DB URL; test redaction.
+- [x] `src/observability/metrics.rs`: registry skeleton cho connection/ingest/commit/command; **chưa mở `/metrics`** (P2-13).
+- [x] Log startup/shutdown có config path, revision, bind addr; không log secret.
 
 ## 9. Supervisor và shutdown — P1-12
 
