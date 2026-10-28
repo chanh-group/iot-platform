@@ -18,52 +18,58 @@ Nguồn sự thật:
   - `MessagePublish` chạy trước `MessagePublishCheckAcl`; không ingest trong `MessagePublish`.
   - Retained cap dùng `BudgetedRetainStorage`; vượt cap đóng connection, không PUBACK, metric `retained_cap`.
   - Shutdown phải kick session trước khi abort listener.
-- [x] `02` ghi chú SQLite: spike dùng `synchronous=FULL`; product MVP dùng `NORMAL` trừ khi có ADR mới.
-- [ ] Đọc lại `02` §1, §3, §4, §5, §6 trước khi code.
+- [x] `02` chốt SQLite: dùng `synchronous=FULL` cho cả spike và product vì application ACK chỉ gửi sau commit; `NORMAL` chỉ được xem xét sau này như chế độ performance riêng kèm ADR hạ cam kết durability.
+- [x] Đọc lại `02` §1, §3, §4, §5, §6 trước khi code.
 
 ## 1. Scaffold và tooling — P1-01, P1-02
 
-- [ ] Đổi `Cargo.toml` thành package `iot-server`, version `0.1.0`, edition 2024, `rust-version = "1.94"`.
-- [ ] Tạo `src/lib.rs` export module; `src/main.rs` chỉ gọi CLI.
-- [ ] Tạo skeleton module: `config`, `runtime`, `storage`, `core`, `http`, `observability`, `cli`.
-- [ ] Thêm dependency Phase 1 theo `01`; **chưa thêm `rmqtt`** (để P2-01).
-- [ ] Tạo `rust-toolchain.toml` pin `1.98.0`, component `rustfmt`, `clippy`.
-- [ ] Cập nhật `.gitignore`: `target/`, `data/`, `web/node_modules/`, `web/dist/`, log, `.env`.
-- [ ] Tạo `deny.toml` tối thiểu; commit `Cargo.lock`.
-- [ ] `cargo build` và `cargo run -- --version` chạy được.
+- [x] Đổi `Cargo.toml` thành package `iot-server`, version `0.1.0`, edition 2024, `rust-version = "1.94"`.
+- [x] Tạo `src/lib.rs` export module; `src/main.rs` chỉ gọi CLI.
+- [x] Tạo skeleton module: `config`, `runtime`, `storage`, `core`, `http`, `observability`, `cli`.
+- [x] Thêm dependency Phase 1 theo `01`; **chưa thêm `rmqtt`** (để P2-01).
+- [x] Tạo `rust-toolchain.toml` pin `1.98.0`, component `rustfmt`, `clippy`.
+- [x] Cập nhật `.gitignore`: `target/`, `data/`, `web/node_modules/`, `web/dist/`, log, `.env`.
+- [x] Tạo `deny.toml` tối thiểu; commit `Cargo.lock`.
+- [x] `cargo build` và `cargo run -- --version` chạy được.
 
 **Evidence:** `cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`.
 
 ## 2. Error và request ID — P1-03
 
-- [ ] `src/core/error.rs`: domain error (`Validation`, `NotFound`, `Conflict`, `Unauthorized`, `Unavailable`, `Internal`).
-- [ ] `src/http/error.rs`: map domain error → envelope `{code,message,request_id,details}`; không stack/SQL/secret.
-- [ ] `src/observability/request_id.rs`: nhận `X-Request-ID` hợp lệ hoặc sinh UUID v7; luôn trả header.
-- [ ] Test: envelope đúng; request ID lạ bị thay; không lộ chi tiết nội bộ.
+- [x] `src/core/error.rs`: domain error (`Validation`, `NotFound`, `Conflict`, `Unauthorized`, `Unavailable`, `Internal`).
+- [x] `src/http/error.rs`: map domain error → envelope `{code,message,request_id,details}`; không stack/SQL/secret.
+- [x] `src/observability/request_id.rs`: nhận `X-Request-ID` hợp lệ hoặc sinh UUID v7; luôn trả header.
+- [x] Test: envelope đúng; request ID lạ bị thay; không lộ chi tiết nội bộ.
 
 ## 3. Config — P1-04
 
-- [ ] `src/config/schema.rs`: đủ section `server/http/mqtt/database/telemetry/commands/auth/runtime/logging`; `deny_unknown_fields`.
-- [ ] `src/config/load.rs`: đọc `conf.toml`; resolve path theo thư mục config; đọc `url_env`; không interpolate chuỗi.
-- [ ] `src/config/validate.rs`: range/cross-field theo `02` §5.2–§5.3; trả tất cả lỗi kèm path.
-- [ ] `src/config/paths.rs`: `data_dir`; SQLite file và `runtime.settings_path` phải nằm trong `data_dir`; normalize lexical, không cần tồn tại khi `check`.
-- [ ] `src/config/runtime.rs`: đọc/validate/merge `runtime.toml` nếu có; revision mặc định 0; parse lỗi → startup fail. **Chưa viết PATCH.**
-- [ ] Redaction: `GET /config` sau này không lộ DB URL/token/password; hàm redaction có test.
-- [ ] Điền `conf.toml` mẫu từ `02` §5.1 (không chứa secret thật).
-- [ ] Test `tests/config_validation.rs`: valid; unknown field; `url` + `url_env`; env thiếu; range sai; path ngoài data_dir; runtime lỗi; redaction.
+- [x] `src/config/schema.rs`: đủ section `server/http/mqtt/database/telemetry/commands/auth/runtime/logging`; `deny_unknown_fields`.
+- [x] `src/config/load.rs`: đọc `conf.toml`; resolve path theo thư mục config; đọc `url_env`; không interpolate chuỗi.
+- [x] `src/config/validate.rs`: range/cross-field theo `02` §5.2–§5.3; trả tất cả lỗi kèm path.
+- [x] `src/config/paths.rs`: `data_dir`; SQLite file và `runtime.settings_path` phải nằm trong `data_dir`; normalize lexical, không cần tồn tại khi `check`.
+- [x] `src/config/runtime.rs`: đọc/validate/merge `runtime.toml` nếu có; revision mặc định 0; parse lỗi → startup fail. **Chưa viết PATCH.**
+- [x] Redaction: `GET /config` sau này không lộ DB URL/token/password; hàm redaction có test.
+- [x] Điền `conf.toml` mẫu từ `02` §5.1 (không chứa secret thật).
+- [x] Test `tests/config_validation.rs`: valid; unknown field; `url` + `url_env`; env thiếu; range sai; path ngoài data_dir; runtime lỗi; redaction.
 
-## 4. SQLite, migration, lock — P1-06, P1-07
+## 4. CLI check — P1-05
 
-- [ ] `migrations/sqlite/0001_init.sql` đúng DDL `02` §3.2.
-- [ ] `src/storage/sqlite/pool.rs`: SQLx SQLite, pool `max_connections`, `busy_timeout`, `create_if_missing`.
-- [ ] Pragma mỗi connection: WAL, `synchronous=NORMAL`, `foreign_keys=ON`, `busy_timeout=5000`, `wal_autocheckpoint=1000`.
-- [ ] `src/storage/sqlite/migrate.rs`: `sqlx::migrate!`, chạy trước listener; lỗi → exit 4.
-- [ ] `src/runtime/lock.rs`: exclusive lock `<data_dir>/.lock`; ghi PID; giữ đến khi process thoát; không lấy được → exit 5.
-- [ ] `migrate` CLI: tạo data dir, lock, migrate, thoát; chạy lại idempotent.
-- [ ] Test `tests/migration.rs`: bảng + `_sqlx_migrations`; pragma; migrate 2 lần; lock conflict exit 5.
-- [ ] Ghi chú trong code: spike dùng `FULL`, product dùng `NORMAL` theo `02` §3.1.
+- [x] `iot-server check --config <path>` chỉ validate config/env/runtime overlay; không tạo data dir hoặc DB.
+- [x] Config hợp lệ → exit 0; config/env/runtime lỗi → exit 3 và không in secret.
+- [x] `tests/cli_check.rs`: valid check không tạo data dir; invalid check exit 3.
 
-## 5. Admin, session, CSRF — P1-08, P1-09
+## 5. SQLite, migration, lock — P1-06, P1-07
+
+- [x] `migrations/sqlite/0001_init.sql` đúng DDL `02` §3.2.
+- [x] `src/storage/sqlite/pool.rs`: SQLx SQLite, pool `max_connections`, `busy_timeout`, `create_if_missing`.
+- [x] Pragma mỗi connection: WAL, `synchronous=FULL`, `foreign_keys=ON`, `busy_timeout=5000`, `wal_autocheckpoint=1000`.
+- [x] `src/storage/sqlite/migrate.rs`: `sqlx::migrate!`, chạy trước listener; lỗi → exit 4.
+- [x] `src/runtime/lock.rs`: exclusive lock `<data_dir>/.lock` bằng `std::fs::File::try_lock`; ghi PID; giữ đến khi process thoát; không lấy được → exit 5.
+- [x] `migrate` CLI: tạo data dir, lock, migrate, thoát; chạy lại idempotent.
+- [x] Test `tests/migration.rs`: bảng + `_sqlx_migrations`; pragma; migrate 2 lần; lock conflict exit 5.
+- [x] Ghi chú trong code: dùng `synchronous=FULL` theo `02` §3.1 (application ACK chỉ sau commit, cần sống qua power loss; `NORMAL` không dùng trong MVP).
+
+## 6. Admin, session, CSRF — P1-08, P1-09
 
 - [ ] `src/core/auth.rs`: Argon2id verify/hash; password min theo config; username regex.
 - [ ] `src/storage/sqlite/users.rs`: tạo admin, tìm theo username; một admin duy nhất.
@@ -77,7 +83,7 @@ Nguồn sự thật:
 - [ ] Test `tests/auth.rs`: không admin mặc định; create/login/logout; sai password; rate limit; cookie flags; CSRF fail; audit không chứa token.
 - [ ] A02 pass.
 
-## 6. HTTP shell, health, static — P1-10
+## 7. HTTP shell, health, static — P1-10
 
 - [ ] `src/http/router.rs`: `/api/v1` + fallback; body limit, timeout, request ID, trace.
 - [ ] `GET /healthz` 200 `{"status":"ok"}`; không auth, không DB.
@@ -86,14 +92,14 @@ Nguồn sự thật:
 - [ ] 404/405 JSON đúng `02`; static fallback không áp dụng cho `/api`.
 - [ ] Test `tests/http_shell.rs`: health, ready, 404, 405, dashboard toggle.
 
-## 7. Observability — P1-11
+## 8. Observability — P1-11
 
 - [ ] `src/observability/logging.rs`: JSON/text, level từ config, `tracing-log`, request_id span.
 - [ ] Không log token/password/payload/DB URL; test redaction.
 - [ ] `src/observability/metrics.rs`: registry skeleton cho connection/ingest/commit/command; **chưa mở `/metrics`** (P2-13).
 - [ ] Log startup/shutdown có config path, revision, bind addr; không log secret.
 
-## 8. Supervisor và shutdown — P1-12
+## 9. Supervisor và shutdown — P1-12
 
 - [ ] `src/runtime/supervisor.rs`: spawn HTTP; theo dõi task; SIGTERM/SIGINT; CancellationToken.
 - [ ] `src/runtime/shutdown.rs`: readiness false → ngừng accept HTTP → đóng DB pool → release lock; deadline `shutdown_timeout_ms`.
@@ -101,14 +107,14 @@ Nguồn sự thật:
 - [ ] Test `tests/shutdown_http.rs`: SIGTERM khi có request; exit 0; không panic; lock release.
 - [ ] Chưa có MQTT; phần kick session để P2/P4.
 
-## 9. Test harness — P1-13
+## 10. Test harness — P1-13
 
 - [ ] `tests/common/mod.rs`: temp data dir; config builder; free port; spawn app; chờ `/readyz`; HTTP client cookie jar.
 - [ ] Retry free-port tối đa 3 lần; mỗi test data dir riêng.
 - [ ] Không dùng chung `conf.toml`/DB; cleanup temp.
 - [ ] MQTT/WS helper để Phase 2.
 
-## 10. Kiểm tra cuối Phase 1
+## 11. Kiểm tra cuối Phase 1
 
 Chạy bắt buộc:
 
@@ -144,7 +150,7 @@ Kiểm tra âm:
 - [ ] Mutation thiếu `X-IoT-CSRF` → 403.
 - [ ] Không có admin mặc định; login sai → 401; login đúng → cookie.
 
-## 11. Cổng Phase 1
+## 12. Cổng Phase 1
 
 - [ ] A02 pass.
 - [ ] A01 đạt phần HTTP/DB; MQTT ready để Phase 2.
@@ -156,7 +162,7 @@ Kiểm tra âm:
 
 Nếu gate fail: không sang Phase 2; ghi lỗi vào `docs/todos/TODO_1.md` và sửa.
 
-## 12. Không làm trong Phase 1
+## 13. Không làm trong Phase 1
 
 - RMQTT adapter, hook auth/ACL, presence, retained cap (Phase 2).
 - Telemetry ingest, dedup, ACK, history/latest (Phase 2).
@@ -165,7 +171,7 @@ Nếu gate fail: không sang Phase 2; ghi lỗi vào `docs/todos/TODO_1.md` và 
 - Docker, backup, load test, security suite (Phase 4).
 - PostgreSQL/MySQL (Phase 5).
 
-## 13. Commit
+## 14. Commit
 
 - [ ] Commit theo từng nhóm task; mỗi commit build/test được.
 - [ ] Không commit `target/`, `data/`, `web/dist/`, log.

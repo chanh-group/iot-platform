@@ -305,7 +305,7 @@ PRAGMA busy_timeout = 5000;
 PRAGMA wal_autocheckpoint = 1000;
 ```
 
-- Phase 0 all-in-one dùng `synchronous=FULL` để chứng minh durability; product MVP giữ `NORMAL` theo contract này. Nếu cần chống mất transaction khi mất điện (không chỉ kill process), đổi sang `FULL` bằng ADR + benchmark riêng.
+- `synchronous=FULL` bắt buộc cho cả Phase 0 và product MVP: application ACK `stored` chỉ được gửi sau commit, nên commit phải sống qua power loss/hard reboot. `NORMAL` có thể rollback transaction đã commit (WAL chưa fsync), chỉ được xem xét sau này như chế độ performance riêng kèm ADR hạ cam kết durability.
 
 - Pool mặc định 5 connection; telemetry chỉ ghi qua một worker.
 - Database file phải nằm trong `server.data_dir`; nếu không, startup fail. Điều này cho phép một lock duy nhất bảo vệ DB + runtime file.
@@ -314,6 +314,7 @@ PRAGMA wal_autocheckpoint = 1000;
 - SQLx quản lý bảng `_sqlx_migrations`; đây là `schema_migrations` logic của SPEC. Không tạo bảng trùng.
 - Không tự downgrade schema. Migration mới chỉ thêm/sửa theo hướng tương thích; migration phá hủy phải có ghi chú backup.
 - `synchronous=FULL` là bắt buộc: chỉ trả application ACK `stored` sau commit bền vững qua application crash và power loss. Không cung cấp cấu hình hạ xuống `NORMAL` trong MVP.
+- SQLite file được tạo trước khi migration chạy. Nếu migration lỗi, application không tự xóa file rỗng/partial: operator đọc lỗi, restore nếu có dữ liệu, hoặc chỉ xóa file khi đã xác nhận nó chưa từng chứa dữ liệu cần giữ rồi chạy lại `migrate`.
 
 ### 3.2. DDL — `migrations/sqlite/0001_init.sql`
 
@@ -1050,7 +1051,7 @@ format = "json"
 | `mqtt.max_retained_bytes` | integer | 0..16 777 216, default 16 777 216 | 0 = cấm retained |
 | `database.url` / `url_env` | string | đúng một trong hai | MVP chỉ `sqlite://` |
 | `database.max_connections` | integer | 1..64, default 5 | |
-| `database.connect_timeout_ms` | integer | 100..60 000, default 5 000 | |
+| `database.connect_timeout_ms` | integer | 100..60 000, default 5 000 | SQLite không có connect timeout riêng; MVP map sang SQLx pool acquire timeout |
 | `database.busy_timeout_ms` | integer | 100..60 000, default 5 000 | SQLite |
 | `telemetry.queue_capacity` | integer | 16..65 536, default 4 096 | |
 | `telemetry.batch_size` | integer | 1..2 000, default 500 | `<= queue_capacity` |
@@ -1135,7 +1136,7 @@ iot-server --version
 | Lệnh | Hành vi | Exit |
 | --- | --- | --- |
 | `check` | Validate config + env; không tạo DB/file | 0 hợp lệ, 3 lỗi config |
-| `migrate` | Lock, mở/tạo DB, chạy migration, thoát | 0, 3, 4 migration, 5 lock |
+| `migrate` | Lock, mở/tạo DB, chạy migration, thoát | 0, 3 config, 4 mở/tạo DB hoặc migration, 5 lock |
 | `admin create` | Lock, migrate? **Không**; yêu cầu schema đã có; tạo admin duy nhất | 0, 3, 5, 6 đã có admin |
 | `run` | Lock, migrate, start HTTP/MQTT/worker | 0 graceful, 1 runtime, 3, 4, 5 |
 | Clap usage | Thiếu/sai tham số | 2 |

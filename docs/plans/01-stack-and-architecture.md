@@ -36,7 +36,7 @@ Các version dưới đây là version đã kiểm tra tại thời điểm lậ
 | Static assets | `rust-embed` | 8.13.0 | nhúng `web/dist` vào binary release |
 | Static MIME | `mime_guess` | 2.0.5 | `Content-Type` cho asset nhúng |
 | Async stream | `futures-util` | 0.3.31 | split/select WebSocket |
-| Lock file | `fs4` | 1.1.0 | khóa data dir, chặn hai instance |
+| Lock file | Rust standard library `File::try_lock` | Rust 1.94+ | khóa data dir, chặn hai instance; không cần dependency |
 | Config snapshot | `arc-swap` | 1.9.3 | đọc config không khóa ở hot path |
 | Trait async | `async-trait` | 0.1.92 | repository/port object-safe |
 | Error | `thiserror` / `anyhow` | 2.0.21 / 1.0.104 | lỗi domain/API; lỗi CLI/bootstrap |

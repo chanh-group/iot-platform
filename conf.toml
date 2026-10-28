@@ -1,0 +1,73 @@
+config_version = 1
+
+[server]
+name = "my-iot-server"
+data_dir = "./data"
+shutdown_timeout_ms = 10000
+
+[http]
+listen = "127.0.0.1:8080"
+dashboard = true
+max_body_bytes = 262144
+cookie_secure = false
+request_timeout_ms = 30000
+max_ws_connections = 100
+ws_queue_capacity = 256
+metrics = false
+# Khi metrics = true, bắt buộc đặt tên biến môi trường; không ghi token trong TOML.
+# metrics_bearer_token_env = "IOT_METRICS_TOKEN"
+
+[mqtt]
+listen = "127.0.0.1:1883"
+allow_anonymous = false
+max_connections = 1000
+max_packet_bytes = 262144
+max_inflight_per_client = 32
+max_queued_messages_per_client = 256
+max_subscriptions_per_client = 8
+max_session_expiry_ms = 3600000
+max_client_id_len = 64
+max_topic_levels = 16
+max_retained_messages = 10000
+max_retained_bytes = 16777216
+
+[database]
+url = "sqlite://./data/iot.db"
+max_connections = 5
+connect_timeout_ms = 5000
+busy_timeout_ms = 5000
+# Hoặc thay `url` bằng:
+# url_env = "IOT_DATABASE_URL"
+
+[telemetry]
+queue_capacity = 4096
+batch_size = 500
+max_batch_bytes = 8388608
+flush_interval_ms = 1000
+retention_days = 30
+max_future_skew_ms = 300000
+max_past_skew_ms = 31536000000
+max_payload_bytes = 65536
+max_keys = 128
+max_string_bytes = 4096
+
+[commands]
+default_ttl_ms = 60000
+max_ttl_ms = 86400000
+max_pending_per_device = 100
+retry_initial_ms = 1000
+retry_max_ms = 30000
+dispatch_interval_ms = 500
+
+[auth]
+session_ttl_ms = 86400000
+login_max_attempts = 5
+login_window_ms = 300000
+password_min_length = 12
+
+[runtime]
+settings_path = "./data/runtime.toml"
+
+[logging]
+level = "info"
+format = "json"
