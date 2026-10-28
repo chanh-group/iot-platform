@@ -1,5 +1,6 @@
 //! Axum router, middleware, handlers, and static assets.
 
+pub mod assets;
 pub mod auth;
 pub mod error;
 pub mod middleware;
