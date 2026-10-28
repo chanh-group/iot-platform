@@ -1,14 +1,17 @@
 //! `X-Request-ID` accept/generate/echo (`02` §1.2).
 
+use std::convert::Infallible;
+
 use axum::extract::{FromRequestParts, Request};
-use axum::http::{HeaderName, HeaderValue, request::Parts};
+use axum::http::request::Parts;
+use axum::http::{HeaderName, HeaderValue};
 use axum::middleware::Next;
 use axum::response::Response;
-use tracing::Instrument;
 use uuid::Uuid;
 
 const HEADER: &str = "x-request-id";
 
+/// Per-request correlation id from `X-Request-ID` or a generated UUIDv7.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RequestId(pub String);
 
@@ -36,6 +39,8 @@ fn attach(mut response: Response, id: &str) -> Response {
 }
 
 pub async fn middleware(mut request: Request, next: Next) -> Response {
+    use tracing::Instrument;
+
     let id = normalize(request.headers().get(HEADER));
     request.extensions_mut().insert(RequestId(id.clone()));
     let span = tracing::info_span!(
@@ -52,10 +57,10 @@ impl<S> FromRequestParts<S> for RequestId
 where
     S: Send + Sync,
 {
-    type Rejection = std::convert::Infallible;
+    type Rejection = Infallible;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        // Middleware luôn gắn id; fallback chỉ để dùng handler độc lập trong test.
+        // Middleware always attaches an id; the fallback covers handlers used standalone in tests.
         Ok(parts
             .extensions
             .get::<RequestId>()

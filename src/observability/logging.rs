@@ -32,6 +32,7 @@ pub fn startup(config_path: &Path, loaded: &LoadedConfig, http_listen: SocketAdd
     );
 }
 
+/// Emits the final lifecycle event; call after the listeners have drained.
 pub fn shutdown(reason: &str) {
     tracing::info!(reason, "server stopped");
 }
@@ -54,6 +55,7 @@ mod tests {
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
+    use crate::config;
 
     #[derive(Clone, Default)]
     struct Buffer(Arc<Mutex<Vec<u8>>>);
@@ -97,7 +99,7 @@ mod tests {
              url = \"sqlite://./data/iot.db\"\n",
         )
         .unwrap();
-        let mut loaded = crate::config::load_with_env(&config_path, |_| None).unwrap();
+        let mut loaded = config::load_with_env(&config_path, |_| None).unwrap();
         loaded.database_url = "sqlite:///private/iot.db".to_owned();
         loaded.metrics_token = Some("super-secret-token".to_owned());
 

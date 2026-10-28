@@ -2,31 +2,40 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Monotonic counter.
 #[derive(Debug, Default)]
 pub struct Counter(AtomicU64);
 
 impl Counter {
+    /// Adds one.
     pub fn inc(&self) {
         self.add(1);
     }
 
+    /// Adds `value`.
     pub fn add(&self, value: u64) {
         self.0.fetch_add(value, Ordering::Relaxed);
     }
 
+    /// Returns the current value.
+    #[must_use]
     pub fn get(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
     }
 }
 
+/// Last-value gauge.
 #[derive(Debug, Default)]
 pub struct Gauge(AtomicU64);
 
 impl Gauge {
+    /// Replaces the current value.
     pub fn set(&self, value: u64) {
         self.0.store(value, Ordering::Relaxed);
     }
 
+    /// Returns the current value.
+    #[must_use]
     pub fn get(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
     }
@@ -51,6 +60,8 @@ pub struct Metrics {
 }
 
 impl Metrics {
+    /// Empty registry; counters start at zero.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
