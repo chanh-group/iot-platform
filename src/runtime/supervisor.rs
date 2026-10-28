@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::process::{self, ExitCode};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use tokio::net::TcpListener;
@@ -13,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::LoadedConfig;
 use crate::http::{AppState, router};
+use crate::mqtt::server::MqttServer;
 use crate::observability::logging;
 use crate::runtime::data_dir_lock::DataDirLock;
 use crate::runtime::{EXIT_LOCK, EXIT_MIGRATION, EXIT_RUNTIME, shutdown};
@@ -47,10 +49,21 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
         return ExitCode::from(EXIT_MIGRATION);
     }
 
+    let mqtt_ready = Arc::new(AtomicBool::new(false));
+    let mut mqtt = match MqttServer::start(&loaded.config.mqtt, Arc::clone(&mqtt_ready)).await {
+        Ok(server) => server,
+        Err(error) => {
+            tracing::error!(%error, "cannot start mqtt listener");
+            pool.close().await;
+            return ExitCode::FAILURE;
+        }
+    };
+
     let listener = match TcpListener::bind(loaded.config.http.listen).await {
         Ok(listener) => listener,
         Err(error) => {
             tracing::error!(%error, "cannot bind http listener");
+            mqtt.abort();
             pool.close().await;
             return ExitCode::FAILURE;
         }
@@ -59,6 +72,7 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
         Ok(addr) => addr,
         Err(error) => {
             tracing::error!(%error, "cannot read http listener address");
+            mqtt.abort();
             pool.close().await;
             return ExitCode::FAILURE;
         }
@@ -67,7 +81,7 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
     logging::startup(config_path, &loaded, listen_addr);
 
     let shutdown_timeout = Duration::from_millis(loaded.config.server.shutdown_timeout_ms);
-    let state = AppState::new(pool.clone(), Arc::new(loaded));
+    let state = AppState::new(pool.clone(), Arc::new(loaded), mqtt_ready);
     let app = router::build(state.clone());
 
     let cancel = CancellationToken::new();
@@ -86,6 +100,7 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
         Err(error) => {
             tracing::error!(%error, "cannot listen for SIGTERM");
             server.abort();
+            mqtt.abort();
             state.pool.close().await;
             return ExitCode::FAILURE;
         }
@@ -95,6 +110,7 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
         Err(error) => {
             tracing::error!(%error, "cannot listen for SIGINT");
             server.abort();
+            mqtt.abort();
             state.pool.close().await;
             return ExitCode::FAILURE;
         }
@@ -127,8 +143,21 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
             state.pool.close().await;
             return ExitCode::FAILURE;
         }
+        result = mqtt.wait() => {
+            match result {
+                Ok(()) => tracing::error!("mqtt listener stopped unexpectedly"),
+                Err(error) => tracing::error!(%error, "mqtt listener failed"),
+            }
+            let outcome = shutdown::http(&state.ready, &cancel, server, shutdown_timeout).await;
+            state.pool.close().await;
+            if let Err(error) = outcome {
+                tracing::error!(%error, "http shutdown after mqtt failure failed");
+            }
+            return ExitCode::FAILURE;
+        }
     }
 
+    mqtt.abort();
     let outcome = shutdown::http(&state.ready, &cancel, server, shutdown_timeout).await;
     state.pool.close().await;
     drop(lock);

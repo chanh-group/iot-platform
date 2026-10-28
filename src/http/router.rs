@@ -59,7 +59,6 @@ async fn healthz() -> Json<Value> {
 }
 
 async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
-    // shortcut: phase 1 has no MQTT/ingest tasks, so only the database is checked.
     let ready = state.ready.load(Ordering::Acquire);
     let database_ok = ready
         && tokio::time::timeout(
@@ -69,16 +68,24 @@ async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
         .await
         .is_ok_and(|result| result.is_ok());
 
-    if database_ok {
+    let mqtt_ok = state.mqtt_ready.load(Ordering::Acquire);
+
+    if database_ok && mqtt_ok {
         (
             StatusCode::OK,
-            Json(json!({ "status": "ready", "checks": { "database": "ok" } })),
+            Json(json!({ "status": "ready", "checks": { "database": "ok", "mqtt": "ok" } })),
         )
     } else {
         tracing::warn!("readiness check failed");
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "status": "not_ready", "checks": { "database": "error" } })),
+            Json(json!({
+                "status": "not_ready",
+                "checks": {
+                    "database": if database_ok { "ok" } else { "error" },
+                    "mqtt": if mqtt_ok { "ok" } else { "error" }
+                }
+            })),
         )
     }
 }

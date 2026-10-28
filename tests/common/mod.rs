@@ -5,11 +5,13 @@
 use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use iot_server::config::{self, LoadedConfig};
 use iot_server::core::auth;
 use iot_server::http::{AppState, router};
+use iot_server::mqtt::server::MqttServer;
 use iot_server::runtime::data_dir_lock::DataDirLock;
 use iot_server::storage::sqlite::users;
 use iot_server::storage::sqlite::{migrate, pool};
@@ -53,6 +55,8 @@ pub struct TestApp {
     pub base: String,
     pub pool: SqlitePool,
     pub config: Arc<LoadedConfig>,
+    pub mqtt_addr: SocketAddr,
+    mqtt: MqttServer,
     handle: JoinHandle<()>,
     _lock: DataDirLock,
     _dir: TempDir,
@@ -79,10 +83,15 @@ impl TestApp {
             .unwrap();
         tx.commit().await.unwrap();
     }
+
+    pub fn abort_mqtt(&self) {
+        self.mqtt.abort();
+    }
 }
 
 impl Drop for TestApp {
     fn drop(&mut self) {
+        self.mqtt.abort();
         self.handle.abort();
     }
 }
@@ -129,6 +138,7 @@ impl TestAppBuilder {
     pub async fn start(self) -> TestApp {
         let dir = TempDir::new().unwrap();
         let config_path = dir.path().join("conf.toml");
+        let mqtt_port = free_port();
         fs::write(
             &config_path,
             format!(
@@ -140,11 +150,17 @@ impl TestAppBuilder {
                  dashboard = {}\n\
                  cookie_secure = {}\n\
                  max_body_bytes = {}\n\
+                 [mqtt]\n\
+                 listen = \"127.0.0.1:{}\"\n\
                  [database]\n\
                  url = \"sqlite://./data/iot.db\"\n\
                  [auth]\n\
                  login_max_attempts = {}\n",
-                self.dashboard, self.cookie_secure, self.max_body_bytes, self.login_max_attempts,
+                self.dashboard,
+                self.cookie_secure,
+                self.max_body_bytes,
+                mqtt_port,
+                self.login_max_attempts,
             ),
         )
         .unwrap();
@@ -154,7 +170,12 @@ impl TestAppBuilder {
         let pool = pool::connect(&loaded).await.unwrap();
         migrate::run(&pool).await.unwrap();
 
-        let state = AppState::new(pool.clone(), Arc::clone(&loaded));
+        let mqtt_ready = Arc::new(AtomicBool::new(false));
+        let mqtt = MqttServer::start(&loaded.config.mqtt, Arc::clone(&mqtt_ready))
+            .await
+            .unwrap();
+        let mqtt_addr = mqtt.local_addr();
+        let state = AppState::new(pool.clone(), Arc::clone(&loaded), mqtt_ready);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = router::build(state);
@@ -174,6 +195,8 @@ impl TestAppBuilder {
             base,
             pool,
             config: loaded,
+            mqtt_addr,
+            mqtt,
             handle,
             _lock: lock,
             _dir: dir,

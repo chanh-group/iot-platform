@@ -29,7 +29,7 @@ async fn healthz_is_public_and_readyz_tracks_the_database() {
     assert_eq!(ready.status(), StatusCode::OK);
     assert_eq!(
         json_body(ready).await,
-        json!({ "status": "ready", "checks": { "database": "ok" } })
+        json!({ "status": "ready", "checks": { "database": "ok", "mqtt": "ok" } })
     );
 
     server.pool.close().await;

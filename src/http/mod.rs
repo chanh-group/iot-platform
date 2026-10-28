@@ -15,7 +15,7 @@ use sqlx::SqlitePool;
 use crate::config::LoadedConfig;
 use middleware::LoginRateLimiter;
 
-/// Shared handler state: database pool, config, login limiter, readiness flag.
+/// Shared handler state: database pool, config, login limiter, and task readiness.
 #[derive(Clone)]
 pub struct AppState {
     /// SQLite connection pool.
@@ -26,11 +26,13 @@ pub struct AppState {
     pub login_limiter: Arc<LoginRateLimiter>,
     /// Cleared during shutdown so `/readyz` reports not-ready.
     pub ready: Arc<AtomicBool>,
+    /// Cleared if the MQTT listener stops.
+    pub mqtt_ready: Arc<AtomicBool>,
 }
 
 impl AppState {
     /// Builds state with a fresh limiter and readiness set to `true`.
-    pub fn new(pool: SqlitePool, config: Arc<LoadedConfig>) -> Self {
+    pub fn new(pool: SqlitePool, config: Arc<LoadedConfig>, mqtt_ready: Arc<AtomicBool>) -> Self {
         let limiter = LoginRateLimiter::new(
             config.config.auth.login_max_attempts,
             Duration::from_millis(config.config.auth.login_window_ms),
@@ -40,6 +42,7 @@ impl AppState {
             config,
             login_limiter: Arc::new(limiter),
             ready: Arc::new(AtomicBool::new(true)),
+            mqtt_ready,
         }
     }
 }
