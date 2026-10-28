@@ -14,9 +14,9 @@ Không đổi version, broker, frontend, TLS nếu không có ADR mới trong `0
 
 ## Trạng thái hiện tại
 
-Phase 0 — **PASS** ngày 2026-10-28. Phase 1 chưa bắt đầu. Code trong `spikes/` là **throwaway**, không merge vào sản phẩm và không đặt trong `src/`. Chỉ báo cáo `docs/plans/spike-rmqtt.md` được giữ lại.
+Phase 0 — **PASS** ngày 2026-10-28. Phase 1 — **PASS** ngày 2026-10-29 (A02; A01 phần HTTP/DB; MQTT để Phase 2). Code trong `spikes/` là **throwaway**, không merge vào sản phẩm và không đặt trong `src/`. Chỉ báo cáo `docs/plans/spike-rmqtt.md` được giữ lại.
 
-Phase 1 chỉ bắt đầu sau khi các khác biệt contract trong `docs/plans/spike-rmqtt.md` được chốt trong `docs/plans/02-contracts.md`. Đã chốt; Phase 1 đang ở bước TODO, chưa có code.
+Phase 2 chưa bắt đầu. Các khác biệt contract Phase 0 đã chốt trong `docs/plans/02-contracts.md`.
 
 ## Lệnh bắt buộc
 

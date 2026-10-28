@@ -141,24 +141,26 @@ curl -fsS http://127.0.0.1:8080/healthz
 curl -fsS http://127.0.0.1:8080/readyz
 ```
 
+Đã chạy 2026-10-29 trên temp dir/port riêng: 63 test pass; smoke CLI/HTTP 29 check pass (migrate idempotent, lock, admin, login/cookie, CSRF, SIGTERM).
+
 Kiểm tra âm:
 
-- [ ] Config sai → exit 3, không tạo DB.
-- [ ] Hai process cùng data dir → process thứ hai exit 5.
-- [ ] `admin create` lần hai → exit 6.
-- [ ] DB đóng/read-only → `/readyz` 503; không panic.
-- [ ] Mutation thiếu `X-IoT-CSRF` → 403.
-- [ ] Không có admin mặc định; login sai → 401; login đúng → cookie.
+- [x] Config sai → exit 3, không tạo DB.
+- [x] Hai process cùng data dir → process thứ hai exit 5.
+- [x] `admin create` lần hai → exit 6.
+- [x] DB đóng/read-only → `/readyz` 503; không panic (`http_shell::healthz_is_public_and_readyz_tracks_the_database`).
+- [x] Mutation thiếu `X-IoT-CSRF` → 403.
+- [x] Không có admin mặc định; login sai → 401; login đúng → cookie.
 
 ## 12. Cổng Phase 1
 
-- [ ] A02 pass.
-- [ ] A01 đạt phần HTTP/DB; MQTT ready để Phase 2.
-- [ ] `migrate` idempotent; lock chặn instance thứ hai.
-- [ ] `/healthz` và `/readyz` đúng; readiness phản ánh DB.
-- [ ] Admin/session/CSRF/rate limit hoạt động; không lộ secret.
-- [ ] `cargo fmt`, `clippy -D warnings`, `cargo test --all` sạch.
-- [ ] Không có code MQTT/telemetry/command/dashboard trong `src/` (ngoài skeleton rỗng).
+- [x] A02 pass.
+- [x] A01 đạt phần HTTP/DB; MQTT ready để Phase 2.
+- [x] `migrate` idempotent; lock chặn instance thứ hai.
+- [x] `/healthz` và `/readyz` đúng; readiness phản ánh DB.
+- [x] Admin/session/CSRF/rate limit hoạt động; không lộ secret.
+- [x] `cargo fmt`, `clippy -D warnings`, `cargo test --all` sạch.
+- [x] Không có code MQTT/telemetry/command/dashboard trong `src/` (ngoài skeleton rỗng).
 
 Nếu gate fail: không sang Phase 2; ghi lỗi vào `docs/todos/TODO_1.md` và sửa.
 
@@ -173,6 +175,6 @@ Nếu gate fail: không sang Phase 2; ghi lỗi vào `docs/todos/TODO_1.md` và 
 
 ## 14. Commit
 
-- [ ] Commit theo từng nhóm task; mỗi commit build/test được.
-- [ ] Không commit `target/`, `data/`, `web/dist/`, log.
-- [ ] Message gợi ý: `feat: phase 1 foundation`, `feat(config): typed config`, `feat(storage): sqlite migration`.
+- [x] Commit theo từng nhóm task; mỗi commit build/test được.
+- [x] Không commit `target/`, `data/`, `web/dist/`, log.
+- [x] Message gợi ý: `feat: phase 1 foundation`, `feat(config): typed config`, `feat(storage): sqlite migration`.
