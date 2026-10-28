@@ -6,6 +6,7 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+/// Failures while draining the HTTP server.
 #[derive(Debug, thiserror::Error)]
 pub enum ShutdownError {
     #[error("shutdown deadline exceeded")]

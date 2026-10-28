@@ -2,29 +2,30 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::process::ExitCode;
+use std::process::{self, ExitCode};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::TcpListener;
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::signal::unix::{self, SignalKind};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::LoadedConfig;
 use crate::http::{AppState, router};
 use crate::observability::logging;
-use crate::runtime::lock::DataDirLock;
-use crate::runtime::{EXIT_LOCK, EXIT_MIGRATION, shutdown};
+use crate::runtime::data_dir_lock::DataDirLock;
+use crate::runtime::{EXIT_LOCK, EXIT_MIGRATION, EXIT_RUNTIME, shutdown};
 use crate::storage::sqlite::{migrate, pool};
 
+/// Runs the server until SIGINT/SIGTERM, then drains HTTP within the deadline.
 pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
     if let Err(error) = logging::init(&loaded) {
         eprintln!("iot-server: cannot initialize logging: {error}");
         return ExitCode::FAILURE;
     }
 
-    let lock = match DataDirLock::acquire(&loaded.data_dir) {
+    let lock = match DataDirLock::try_new(&loaded.data_dir) {
         Ok(lock) => lock,
         Err(error) => {
             tracing::error!(%error, "cannot acquire data dir lock");
@@ -80,7 +81,7 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
         .await
     });
 
-    let mut sigterm = match signal(SignalKind::terminate()) {
+    let mut sigterm = match unix::signal(SignalKind::terminate()) {
         Ok(signal) => signal,
         Err(error) => {
             tracing::error!(%error, "cannot listen for SIGTERM");
@@ -89,7 +90,7 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut sigint = match signal(SignalKind::interrupt()) {
+    let mut sigint = match unix::signal(SignalKind::interrupt()) {
         Ok(signal) => signal,
         Err(error) => {
             tracing::error!(%error, "cannot listen for SIGINT");
@@ -111,7 +112,7 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
             _ = sigint.recv() => {}
         }
         tracing::warn!("second shutdown signal, exiting now");
-        std::process::exit(i32::from(crate::runtime::EXIT_RUNTIME));
+        process::exit(i32::from(EXIT_RUNTIME));
     });
 
     tokio::select! {

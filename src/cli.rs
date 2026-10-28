@@ -8,13 +8,14 @@ use clap::{Parser, Subcommand};
 
 use crate::config::{self, LoadedConfig};
 use crate::core::auth;
-use crate::runtime::lock::DataDirLock;
+use crate::runtime::data_dir_lock::DataDirLock;
 use crate::runtime::{EXIT_CONFIG, EXIT_LOCK, EXIT_MIGRATION, supervisor};
 use crate::storage::sqlite::users::{self, CreateAdminError};
 use crate::storage::sqlite::{migrate, pool};
 
 const EXIT_ADMIN_EXISTS: u8 = 6;
 
+/// Server command line: global `--config` plus one subcommand.
 #[derive(Debug, Parser)]
 #[command(name = "iot-server", version, about = "Single-binary MQTT IoT server")]
 pub struct Cli {
@@ -27,10 +28,12 @@ pub struct Cli {
     )]
     pub config: PathBuf,
 
+    /// Subcommand to execute.
     #[command(subcommand)]
     pub command: Command,
 }
 
+/// Top-level subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Validate config and environment without touching the data dir
@@ -39,6 +42,7 @@ pub enum Command {
     Migrate,
     /// Administrative commands
     Admin {
+        /// Administrative subcommand.
         #[command(subcommand)]
         command: AdminCommand,
     },
@@ -46,10 +50,12 @@ pub enum Command {
     Run,
 }
 
+/// Administrative operations.
 #[derive(Debug, Subcommand)]
 pub enum AdminCommand {
     /// Create the single admin user
     Create {
+        /// Admin username; must match the config username rule.
         #[arg(long, default_value = "admin", value_parser = parse_username)]
         username: String,
         /// Read the password from this file instead of prompting
@@ -66,6 +72,7 @@ fn parse_username(value: &str) -> Result<String, String> {
     }
 }
 
+/// Parses `argv` and dispatches to the selected subcommand.
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
@@ -187,7 +194,7 @@ async fn admin_create_async(
     username: String,
     password_hash: String,
 ) -> ExitCode {
-    let _lock = match DataDirLock::acquire(&loaded.data_dir) {
+    let _lock = match DataDirLock::try_new(&loaded.data_dir) {
         Ok(lock) => lock,
         Err(error) => {
             eprintln!("iot-server: {error}");
@@ -230,7 +237,7 @@ async fn admin_create_async(
 }
 
 async fn migrate_async(loaded: LoadedConfig) -> ExitCode {
-    let _lock = match DataDirLock::acquire(&loaded.data_dir) {
+    let _lock = match DataDirLock::try_new(&loaded.data_dir) {
         Ok(lock) => lock,
         Err(error) => {
             eprintln!("iot-server: {error}");

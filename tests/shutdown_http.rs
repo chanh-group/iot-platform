@@ -8,7 +8,7 @@ mod common;
 
 use common::{PASSWORD, free_port, wait_ready};
 use iot_server::config;
-use iot_server::runtime::lock::DataDirLock;
+use iot_server::runtime::data_dir_lock::DataDirLock;
 use reqwest::StatusCode;
 use serde_json::json;
 use tempfile::TempDir;
@@ -157,7 +157,7 @@ async fn sigterm_drains_in_flight_request_and_releases_lock() {
     assert!(stdout.contains("server stopped"), "{stdout}");
 
     let loaded = config::load_with_env(&config_path, |_| None).unwrap();
-    DataDirLock::acquire(&loaded.data_dir).expect("lock was not released");
+    let _lock = DataDirLock::try_new(&loaded.data_dir).expect("lock was not released");
 }
 
 #[tokio::test]
@@ -211,5 +211,5 @@ async fn second_signal_exits_immediately_without_graceful_cleanup() {
     assert!(!stdout.contains("server stopped"), "{stdout}");
 
     let loaded = config::load_with_env(&config_path, |_| None).unwrap();
-    DataDirLock::acquire(&loaded.data_dir).expect("lock was not released");
+    let _lock = DataDirLock::try_new(&loaded.data_dir).expect("lock was not released");
 }

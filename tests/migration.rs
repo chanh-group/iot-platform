@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use iot_server::config;
-use iot_server::runtime::lock::DataDirLock;
+use iot_server::runtime::data_dir_lock::DataDirLock;
 use iot_server::storage::sqlite::{migrate, pool};
 use tempfile::TempDir;
 
@@ -42,7 +42,7 @@ async fn migration_creates_schema_and_is_idempotent() {
     let dir = TempDir::new().unwrap();
     let path = write_config(&dir);
     let loaded = config::load_with_env(&path, |_| None).unwrap();
-    let _lock = DataDirLock::acquire(&loaded.data_dir).unwrap();
+    let _lock = DataDirLock::try_new(&loaded.data_dir).unwrap();
     let pool = pool::connect(&loaded).await.unwrap();
 
     migrate::run(&pool).await.unwrap();
@@ -74,7 +74,7 @@ async fn every_pool_connection_gets_contract_pragmas() {
     let dir = TempDir::new().unwrap();
     let path = write_config(&dir);
     let loaded = config::load_with_env(&path, |_| None).unwrap();
-    let _lock = DataDirLock::acquire(&loaded.data_dir).unwrap();
+    let _lock = DataDirLock::try_new(&loaded.data_dir).unwrap();
     let pool = pool::connect(&loaded).await.unwrap();
     migrate::run(&pool).await.unwrap();
 
@@ -151,7 +151,7 @@ fn second_process_exits_5_while_lock_is_held() {
     let dir = TempDir::new().unwrap();
     let path = write_config(&dir);
     let loaded = config::load_with_env(&path, |_| None).unwrap();
-    let lock = DataDirLock::acquire(&loaded.data_dir).unwrap();
+    let lock = DataDirLock::try_new(&loaded.data_dir).unwrap();
 
     let output = run_migrate(&path);
     assert_eq!(

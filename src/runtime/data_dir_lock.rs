@@ -3,9 +3,11 @@
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::process;
 
 use thiserror::Error;
 
+/// Failures while creating, opening, or locking `<data_dir>/.lock`.
 #[derive(Debug, Error)]
 pub enum LockError {
     #[error("cannot create data dir {path}: {source}")]
@@ -37,12 +39,14 @@ pub enum LockError {
 }
 
 /// Closing the file releases the advisory lock; no explicit unlock needed.
+#[must_use = "dropping the lock releases the data dir immediately"]
 pub struct DataDirLock {
     _file: File,
 }
 
 impl DataDirLock {
-    pub fn acquire(data_dir: &Path) -> Result<Self, LockError> {
+    /// Takes the exclusive lock and writes this process id into the file.
+    pub fn try_new(data_dir: &Path) -> Result<Self, LockError> {
         std::fs::create_dir_all(data_dir).map_err(|source| LockError::DataDir {
             path: data_dir.to_path_buf(),
             source,
@@ -74,8 +78,7 @@ impl DataDirLock {
                 path: path.clone(),
                 source,
             })?;
-        writeln!(file, "{}", std::process::id())
-            .map_err(|source| LockError::Pid { path, source })?;
+        writeln!(file, "{}", process::id()).map_err(|source| LockError::Pid { path, source })?;
 
         Ok(Self { _file: file })
     }
@@ -88,15 +91,15 @@ mod tests {
     #[test]
     fn second_lock_in_same_process_fails_until_dropped() {
         let dir = tempfile::TempDir::new().unwrap();
-        let first = DataDirLock::acquire(dir.path()).unwrap();
+        let first = DataDirLock::try_new(dir.path()).unwrap();
         let pid = std::fs::read_to_string(dir.path().join(".lock")).unwrap();
         assert_eq!(pid.trim(), std::process::id().to_string());
 
         assert!(matches!(
-            DataDirLock::acquire(dir.path()),
+            DataDirLock::try_new(dir.path()),
             Err(LockError::Busy { .. })
         ));
         drop(first);
-        DataDirLock::acquire(dir.path()).unwrap();
+        let _reacquired = DataDirLock::try_new(dir.path()).unwrap();
     }
 }

@@ -10,7 +10,7 @@ use std::time::Duration;
 use iot_server::config::{self, LoadedConfig};
 use iot_server::core::auth;
 use iot_server::http::{AppState, router};
-use iot_server::runtime::lock::DataDirLock;
+use iot_server::runtime::data_dir_lock::DataDirLock;
 use iot_server::storage::sqlite::users;
 use iot_server::storage::sqlite::{migrate, pool};
 use reqwest::StatusCode;
@@ -150,7 +150,7 @@ impl TestAppBuilder {
         .unwrap();
 
         let loaded = Arc::new(config::load_with_env(&config_path, |_| None).unwrap());
-        let lock = DataDirLock::acquire(&loaded.data_dir).unwrap();
+        let lock = DataDirLock::try_new(&loaded.data_dir).unwrap();
         let pool = pool::connect(&loaded).await.unwrap();
         migrate::run(&pool).await.unwrap();
 
