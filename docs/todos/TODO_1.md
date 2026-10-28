@@ -71,17 +71,17 @@ Nguồn sự thật:
 
 ## 6. Admin, session, CSRF — P1-08, P1-09
 
-- [ ] `src/core/auth.rs`: Argon2id verify/hash; password min theo config; username regex.
-- [ ] `src/storage/sqlite/users.rs`: tạo admin, tìm theo username; một admin duy nhất.
-- [ ] `src/storage/sqlite/sessions.rs`: tạo/verify/revoke session; lưu SHA-256 token; cleanup hết hạn.
-- [ ] `admin create --config`: prompt 2 lần hoặc `--password-file`; không nhận password qua argv; đã có admin → exit 6; audit `admin.create`.
-- [ ] `http/auth.rs`: `POST /api/v1/auth/login`, `POST /logout`, `GET /me`.
-- [ ] Cookie `iot_session`: HttpOnly, SameSite=Strict, Path=/, Max-Age theo TTL, Secure theo config.
-- [ ] Login rate limit theo IP + username; 429 + `Retry-After`.
-- [ ] `http/middleware.rs`: CSRF `X-IoT-CSRF`, `Content-Type`, Origin/Host; không CORS; request timeout/body limit.
-- [ ] `sessions.last_seen_at` cập nhật tối đa 1 lần/5 phút.
-- [ ] Test `tests/auth.rs`: không admin mặc định; create/login/logout; sai password; rate limit; cookie flags; CSRF fail; audit không chứa token.
-- [ ] A02 pass.
+- [x] `src/core/auth.rs`: Argon2id verify/hash; password min theo config; username regex.
+- [x] `src/storage/sqlite/users.rs`: tạo admin, tìm theo username; một admin duy nhất.
+- [x] `src/storage/sqlite/sessions.rs`: tạo/verify/revoke session; lưu SHA-256 token; cleanup hết hạn.
+- [x] `admin create --config`: prompt 2 lần hoặc `--password-file`; không nhận password qua argv; đã có admin → exit 6; audit `admin.create`.
+- [x] `http/auth.rs`: `POST /api/v1/auth/login`, `POST /logout`, `GET /me`.
+- [x] Cookie `iot_session`: HttpOnly, SameSite=Strict, Path=/, Max-Age theo TTL, Secure theo config.
+- [x] Login rate limit theo IP + username; 429 + `Retry-After`.
+- [x] `http/middleware.rs`: CSRF `X-IoT-CSRF`, `Content-Type`, Origin/Host; không CORS; request timeout/body limit.
+- [x] `sessions.last_seen_at` cập nhật tối đa 1 lần/5 phút.
+- [x] Test `tests/auth.rs`: không admin mặc định; create/login/logout; sai password; rate limit; cookie flags; CSRF fail; audit không chứa token.
+- [x] A02 pass.
 
 ## 7. HTTP shell, health, static — P1-10
 
