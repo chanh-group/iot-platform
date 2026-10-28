@@ -6,6 +6,7 @@ use uuid::Uuid;
 const LAST_SEEN_INTERVAL_MS: i64 = 5 * 60 * 1000;
 const REVOKED_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
+/// Live session joined with the owning user's username.
 #[derive(Debug, Clone)]
 pub struct Session {
     pub id: String,

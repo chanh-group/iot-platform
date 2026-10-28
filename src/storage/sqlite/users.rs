@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::storage::sqlite::audit::{self, AuditEvent};
 
+/// Admin account row returned to callers.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct User {
     pub id: String,
@@ -15,6 +16,7 @@ pub struct User {
     pub enabled: bool,
 }
 
+/// Failures when creating the single admin user.
 #[derive(Debug, Error)]
 pub enum CreateAdminError {
     #[error("an admin user already exists")]
@@ -75,6 +77,7 @@ pub async fn create_admin(
     })
 }
 
+/// Looks up an enabled or disabled admin by exact username.
 pub async fn find_by_username(
     pool: &SqlitePool,
     username: &str,

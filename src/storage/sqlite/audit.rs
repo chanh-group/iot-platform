@@ -2,6 +2,7 @@
 
 use sqlx::SqliteConnection;
 
+/// One row destined for `audit_events`.
 pub struct AuditEvent<'a> {
     pub actor_type: &'a str,
     pub actor_id: Option<&'a str>,
@@ -13,6 +14,7 @@ pub struct AuditEvent<'a> {
     pub details_json: Option<&'a str>,
 }
 
+/// Inserts one audit row inside the caller's transaction.
 pub async fn insert(
     conn: &mut SqliteConnection,
     occurred_at: i64,
