@@ -4,14 +4,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
 
+mod common;
+
+use common::{PASSWORD, free_port, wait_ready};
 use iot_server::config;
 use iot_server::runtime::lock::DataDirLock;
 use reqwest::StatusCode;
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
-
-const PASSWORD: &str = "correct horse battery staple";
 
 struct Server {
     child: Option<Child>,
@@ -47,11 +48,6 @@ impl Drop for Server {
     }
 }
 
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
-}
-
 fn write_config(dir: &TempDir, port: u16) -> PathBuf {
     let path = dir.path().join("conf.toml");
     fs::write(
@@ -78,18 +74,6 @@ fn run_cli(args: &[&str], config_path: &Path) -> Output {
         .arg(config_path)
         .output()
         .unwrap()
-}
-
-async fn wait_until_healthy(client: &reqwest::Client, base: &str) {
-    for _ in 0..100 {
-        if let Ok(response) = client.get(format!("{base}/healthz")).send().await
-            && response.status() == StatusCode::OK
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("server did not become healthy");
 }
 
 #[tokio::test]
@@ -126,7 +110,7 @@ async fn sigterm_drains_in_flight_request_and_releases_lock() {
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
-    wait_until_healthy(&client, &base).await;
+    wait_ready(&client, &base).await;
 
     let login = tokio::spawn({
         let client = client.clone();
@@ -188,7 +172,7 @@ async fn second_signal_exits_immediately_without_graceful_cleanup() {
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
-    wait_until_healthy(&client, &base).await;
+    wait_ready(&client, &base).await;
 
     // An unfinished login body keeps one request in flight, so graceful
     // shutdown stays busy until the second signal forces the exit.
