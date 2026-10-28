@@ -34,24 +34,24 @@ Nguồn sự thật:
 
 ## 2. Auth thiết bị và presence — P2-02, P2-04
 
-- [ ] Bổ sung repository lookup thiết bị/credential active: device enabled, SHA-256 token BLOB và so sánh constant-time; không log token/hash/password.
-- [ ] Hook `ClientConnect` chỉ chấp nhận protocol level 4; từ chối 3/5 bằng mã RMQTT đã chốt.
-- [ ] Hook `ClientAuthenticate`: bắt buộc `username = client_id = UUID v7 canonical`; sai/missing token, unknown/disabled device hoặc credential revoked đều trả `0x04`, không lộ nguyên nhân.
-- [ ] Không tin device ID trong payload; principal xác thực là nguồn danh tính duy nhất.
-- [ ] Tạo `src/core/presence.rs` và `src/mqtt/presence.rs`: ghi online/offline trong RAM, connection generation lấy từ session id/create time; disconnect cũ không được ghi đè connection mới khi duplicate client ID.
-- [ ] Chỉ cập nhật `devices.last_seen_at` ở connect/disconnect để tránh write amplification; lỗi write phải được xử lý theo readiness/log, không panic.
-- [ ] Test `tests/mqtt_auth.rs`: token đúng/sai, unknown, disabled, revoked, client-id mismatch, MQTT 3.1/5 reject, duplicate client ID và generation.
-- [ ] Đánh dấu A03 chỉ pass khi sai token và device disable đều bị từ chối, không thể ghi telemetry.
+- [x] Bổ sung repository lookup thiết bị/credential active: device enabled, SHA-256 token BLOB và so sánh constant-time; không log token/hash/password.
+- [x] Hook `ClientConnect` chỉ chấp nhận protocol level 4; từ chối 3/5 bằng mã RMQTT đã chốt. Ghi chú: `ClientConnect` không đặt được CONNACK trong RMQTT 0.24, nên gate nằm ở `ClientAuthenticate` (`NotAuthorized` → `0x05`/`0x87`).
+- [x] Hook `ClientAuthenticate`: bắt buộc `username = client_id = UUID v7 canonical`; sai/missing token, unknown/disabled device hoặc credential revoked đều trả `0x04`, không lộ nguyên nhân.
+- [x] Không tin device ID trong payload; principal xác thực là nguồn danh tính duy nhất.
+- [x] Tạo `src/core/presence.rs` và `src/mqtt/presence.rs`: ghi online/offline trong RAM, connection generation lấy từ session id/create time; disconnect cũ không được ghi đè connection mới khi duplicate client ID.
+- [x] Chỉ cập nhật `devices.last_seen_at` trực tiếp trong hook connect/disconnect để tránh write amplification. Đây là low-volume MVP; DB chậm làm chậm hook/CONNACK của client đó nhưng không chặn listener hay client khác. Lỗi ghi chỉ log + metric, không từ chối connect và không làm readiness false. `shortcut: last_seen_at ghi inline trong hook, chuyển sang presence channel nếu connect/CONNACK p95 hoặc hook backlog xấu dưới tải.`
+- [x] Test `tests/mqtt_auth.rs`: token đúng/sai, unknown, disabled, revoked, client-id mismatch, MQTT 3.1/5 reject, duplicate client ID và generation.
+- [ ] Đánh dấu A03 chỉ pass khi sai token và device disable đều bị từ chối, không thể ghi telemetry. — phần auth đã pass (refused, 0 session/presence); vế "không có row telemetry" chờ ingest ở mục 4.
 
 ## 3. ACL deny mặc định — P2-03
 
-- [ ] Viết hàm thuần `src/core/acl.rs`, table test toàn bộ matrix `02` §2.3–§2.4; adapter `src/mqtt/acl.rs` chỉ map type RMQTT vào hàm này.
-- [ ] Publish chỉ cho phép topic cụ thể của principal: `telemetry`, `attributes`, `commands/ack`, `status`, `data/{...}`; không wildcard, không `$SYS`, `$share`, server-only topic hoặc device khác.
-- [ ] Subscribe chỉ cho phép `telemetry/ack`, `commands`, `status`, `data/#`/filter con thuộc prefix chính device; cấm `devices/{self}`, `devices/{self}/#` và mở rộng sang topic nghiệp vụ khác.
-- [ ] Kiểm tra tại subscribe **và** giao message để wildcard không mở quyền chéo thiết bị.
-- [ ] Đưa ingest chỉ sau publish ACL allow; publish bị deny không route, không SQL, không broadcast.
-- [ ] Test unit matrix và `tests/mqtt_acl.rs`: T12, T13, T14, cross-device wildcard, `$SYS`, `$share`, server-only topics, publish filter có `+/#`.
-- [ ] A04 mức Phase 2 chỉ pass khi ACL unit và integration chứng minh device A không thể đọc/ghi dữ liệu B, kể cả wildcard.
+- [x] Viết hàm thuần `src/core/acl.rs`, table test toàn bộ matrix `02` §2.3–§2.4; adapter `src/mqtt/acl.rs` chỉ map type RMQTT vào hàm này.
+- [x] Publish chỉ cho phép topic cụ thể của principal: `telemetry`, `attributes`, `commands/ack`, `status`, `data/{...}`; không wildcard, không `$SYS`, `$share`, server-only topic hoặc device khác.
+- [x] Subscribe chỉ cho phép `telemetry/ack`, `commands`, `status`, `data/#`/filter con thuộc prefix chính device; cấm `devices/{self}`, `devices/{self}/#` và mở rộng sang topic nghiệp vụ khác.
+- [x] Wildcard không mở quyền chéo thiết bị: RMQTT 0.24 không có hook deny lúc giao message (`MessageDelivered` chỉ thay payload), nên enforcement nằm ở SUBSCRIBE; mọi filter allow đều nằm trong `devices/{self}/`. Đã ghi vào `02` §2.4 và `spike-rmqtt.md` §5 #9.
+- [x] Publish bị deny không route/không broadcast (không có SQL/ingest để gọi ở phase này); ingest ở §4 phải nối sau `MessagePublishCheckAcl`, không đặt trong `MessagePublish`.
+- [x] Test unit matrix và `tests/mqtt_acl.rs`: T12, T13, T14, cross-device wildcard, `$SYS`, `$share`, server-only topics, publish filter có `+/#` (gửi raw vì rumqttc chặn wildcard ở client). T12 kiểm "không giao cho B"; "không row telemetry" chờ pipeline §4.
+- [x] A04 mức Phase 2 chỉ pass khi ACL unit và integration chứng minh device A không thể đọc/ghi dữ liệu B, kể cả wildcard. — đã pass; cổng A04 đầy đủ vẫn chốt ở Phase 4.
 
 ## 4. Telemetry validate và bounded ingest — P2-05, P2-06
 

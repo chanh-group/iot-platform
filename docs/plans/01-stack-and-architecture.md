@@ -216,7 +216,7 @@ Bật feature `tls` của RMQTT + rustls; thêm listener TLS, cert reload, test 
 - Rotate/disable: transaction SQL → commit → `entry.kick(true, true, true)`; token cũ không reconnect được.
 - Không tin `device_id` trong payload; lấy từ principal + topic.
 - Server nội bộ dùng `FromType::System` với id `$server` khi publish command/ACK; đây không phải MQTT login và không đi qua ACL thiết bị.
-- Không cho cross-device pub/sub trong MVP; ACL chỉ mở topic của chính thiết bị.
+- Không cho cross-device pub/sub trong MVP; ACL chỉ mở topic của chính thiết bị. ACL chặn ở PUBLISH và SUBSCRIBE; RMQTT 0.24 không có hook deny lúc giao message nên quyền đọc chốt bằng filter đã duyệt nằm trong `devices/{self}/` (`02` §2.4).
 
 ### Log/audit
 
@@ -268,7 +268,7 @@ flowchart LR
 | --- | --- | --- | --- | --- |
 | ingest | `telemetry.queue_capacity` (4096) | MQTT hook | Telemetry worker | `try_send` fail; không ACK; metric `ingest_rejected_total{reason=queue_full}` |
 | command ACK | 4096 | MQTT hook | Command service | `try_send` fail; command retry/ACK lại; metric |
-| presence | 4096 | MQTT hooks | Presence registry | `send().await` (low volume) |
+| presence | — | MQTT hooks | Presence registry trong RAM | Cập nhật inline (low volume); không queue/block. `last_seen_at` ghi trực tiếp vào SQL, lỗi chỉ log + metric. |
 | broadcast | 1024 | Telemetry/command/presence | WS clients | Subscriber lag → disconnect 1013 |
 | WS per-client | 256 | Broadcast | WS writer | Disconnect client chậm |
 | shutdown | 1 | Supervisor | Tất cả task | — |
@@ -347,6 +347,7 @@ core -> không import axum/rmqtt/sqlx
 | RMQTT không có graceful stop | Trung bình | Kick session + abort listener; state bền trong SQL; test SIGTERM |
 | Retained cap tự viết sai | Trung bình | Unit test cap, clear retained, restart; default nhỏ |
 | SQLite write contention | Trung bình | Một telemetry writer; transaction ngắn; WAL; busy timeout |
+| Presence/`last_seen_at` ghi inline trong MQTT hook | Thấp (MVP) | DB chậm chỉ làm chậm hook/CONNACK của client đó; log + metric khi lỗi, không đổi readiness. Đo connect/CONNACK p95 và hook backlog ở Phase 4; chuyển sang channel khi xấu. |
 | Latest query chậm | Trung bình | Index; benchmark; chỉ thêm projection khi có số liệu |
 | Frontend version mới (Svelte 5/Vite 8/TS 7) | Thấp | Pin lockfile; `svelte-check`; build trong CI |
 | Không có số liệu throughput | Cao | Không cam kết số; load test Phase 4/5 ghi hardware/rõ điều kiện |

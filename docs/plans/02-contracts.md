@@ -112,7 +112,7 @@ Mặc định deny. Bảng dưới là toàn bộ quyền của một device:
 | SUBSCRIBE | `devices/{self}/status` |
 | SUBSCRIBE | `devices/{self}/data/#` hoặc filter con của nó |
 
-- ACL kiểm tra cả lúc SUBSCRIBE và lúc broker giao message; wildcard không được mở rộng quyền.
+- ACL kiểm tra tại PUBLISH và SUBSCRIBE. RMQTT 0.24 không có hook từ chối lúc giao message (`MessageDelivered` chỉ thay payload), nên quyền đọc được chốt bằng filter đã duyệt: mọi filter được allow đều nằm trong `devices/{self}/`, wildcard không thể match topic của thiết bị khác.
 - Publish vào topic server-only (`telemetry/ack`, `commands`) bị từ chối.
 - Publish retained vào `telemetry` hoặc `attributes`: message **không** được ingest/xử lý; với telemetry có `event_id` hợp lệ, server gửi ACK `rejected/retained_not_allowed`. Publish retained vào topic server-only (`telemetry/ack`, `commands`, `commands/ack`) bị ACL từ chối.
 - Publish ACL deny: message không được route, RMQTT đóng connection và không gửi PUBACK; không ghi telemetry.

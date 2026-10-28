@@ -233,6 +233,7 @@ Tổng: **13 passed, 0 failed**. Không có test ignored.
 | 6 | §2.5: shutdown/abort không accept connection mới, không panic | `task.abort()` đóng listener và nhả port; **không** tự đóng các session đang mở | **Đã chốt:** shutdown wrapper kick session trước abort listener. |
 | 7 | §2.4: ACL deny — contract chỉ nói publish bị đóng kết nối | Subscribe deny trả SUBACK failure và giữ connection; publish deny đóng connection | Hành vi publish khớp contract; bổ sung câu cho subscribe nếu muốn chốt. |
 | 8 | §2.5: session expiry mặc định 1 giờ | Cơ chế chứng minh với TTL 2 s; listener production đặt `3600 s`, cap `3600 s` | Test dùng TTL ngắn theo yêu cầu; Phase 1 dùng config thật, không hard-code. |
+| 9 | §2.4: ACL kiểm tra cả lúc broker giao message | `MessageDelivered` chỉ thay payload, không có kết quả allow/deny | **Đã chốt:** chặn ở SUBSCRIBE; filter allow luôn nằm trong `devices/{self}/` nên delivery không thể vượt prefix thiết bị. |
 
 Không phải khác biệt, nhưng **chưa kiểm chứng end-to-end** trong Phase 0 (đã cấu hình trong `Builder`, sẽ test ở Phase 1/A19):
 
