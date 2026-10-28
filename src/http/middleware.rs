@@ -2,21 +2,24 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use axum::extract::{FromRequest, Request};
 use axum::http::{HeaderMap, Method, StatusCode, header};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde::de::DeserializeOwned;
+use tokio::sync::Mutex;
 
 use crate::observability::request_id::RequestId;
 
-use super::error::ApiError;
+use super::api_error::ApiError;
 
 const CSRF_HEADER: &str = "x-iot-csrf";
 const CLEANUP_THRESHOLD: usize = 1024;
 
+/// Why a mutating request failed the CSRF gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CsrfError {
     UnsupportedMediaType,
     Forbidden,
@@ -62,21 +65,22 @@ fn is_json(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
 }
 
-pub async fn csrf(request: Request, next: axum::middleware::Next) -> Response {
+/// Rejects mutating requests that fail the CSRF gate.
+pub async fn csrf(request: Request, next: Next) -> Response {
     let request_id = request_id(&request);
     match check_csrf(request.method(), request.headers()) {
         Ok(()) => next.run(request).await,
         Err(CsrfError::UnsupportedMediaType) => ApiError::new(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "unsupported_media_type",
-            "content type must be application/json",
+            "content type must be application/json".to_owned(),
             request_id,
         )
         .into_response(),
         Err(CsrfError::Forbidden) => ApiError::new(
             StatusCode::FORBIDDEN,
             "csrf_failed",
-            "csrf check failed",
+            "csrf check failed".to_owned(),
             request_id,
         )
         .into_response(),
@@ -123,7 +127,7 @@ where
                     ),
                     _ => (StatusCode::BAD_REQUEST, "invalid_json", "invalid JSON body"),
                 };
-                Err(ApiError::new(status, code, message, request_id))
+                Err(ApiError::new(status, code, message.to_owned(), request_id))
             }
         }
     }
@@ -137,10 +141,12 @@ struct Inner {
 pub struct LoginRateLimiter {
     max_attempts: usize,
     window: Duration,
+    // Async mutex: no poisoning, so a panicked request cannot wedge login.
     inner: Mutex<Inner>,
 }
 
 impl LoginRateLimiter {
+    /// Builds a limiter with a fixed failure budget per window.
     pub fn new(max_attempts: u64, window: Duration) -> Self {
         Self {
             max_attempts: usize::try_from(max_attempts).unwrap_or(usize::MAX).max(1),
@@ -152,10 +158,11 @@ impl LoginRateLimiter {
     }
 
     /// Returns `Retry-After` seconds when this key is over the limit.
-    pub fn check(&self, ip: IpAddr, username: &str) -> Option<u64> {
+    #[must_use]
+    pub async fn check(&self, ip: IpAddr, username: &str) -> Option<u64> {
         let now = Instant::now();
         let key = rate_key(ip, username);
-        let mut inner = self.lock();
+        let mut inner = self.inner.lock().await;
         let times = inner.failures.get_mut(&key)?;
         prune(times, now, self.window);
         if times.len() < self.max_attempts {
@@ -176,10 +183,11 @@ impl LoginRateLimiter {
         )
     }
 
-    pub fn record_failure(&self, ip: IpAddr, username: &str) {
+    /// Records one failed attempt and prunes expired entries.
+    pub async fn record_failure(&self, ip: IpAddr, username: &str) {
         let now = Instant::now();
         let key = rate_key(ip, username);
-        let mut inner = self.lock();
+        let mut inner = self.inner.lock().await;
         if inner.failures.len() >= CLEANUP_THRESHOLD {
             inner.failures.retain(|_, times| {
                 prune(times, now, self.window);
@@ -194,15 +202,10 @@ impl LoginRateLimiter {
         times.push_back(now);
     }
 
-    pub fn clear(&self, ip: IpAddr, username: &str) {
+    /// Forgets the failures for this key after a successful login.
+    pub async fn clear(&self, ip: IpAddr, username: &str) {
         let key = rate_key(ip, username);
-        self.lock().failures.remove(&key);
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.inner.lock().await.failures.remove(&key);
     }
 }
 
@@ -296,16 +299,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rate_limit_blocks_after_max_failures_until_cleared() {
+    #[tokio::test]
+    async fn rate_limit_blocks_after_max_failures_until_cleared() {
         let limiter = LoginRateLimiter::new(2, Duration::from_secs(60));
         let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        assert_eq!(limiter.check(ip, "Admin"), None);
-        limiter.record_failure(ip, "Admin");
-        limiter.record_failure(ip, "admin");
-        assert!(limiter.check(ip, "ADMIN").is_some());
-        limiter.clear(ip, "admin");
-        assert_eq!(limiter.check(ip, "admin"), None);
+        assert_eq!(limiter.check(ip, "Admin").await, None);
+        limiter.record_failure(ip, "Admin").await;
+        limiter.record_failure(ip, "admin").await;
+        assert!(limiter.check(ip, "ADMIN").await.is_some());
+        limiter.clear(ip, "admin").await;
+        assert_eq!(limiter.check(ip, "admin").await, None);
     }
 
     #[test]
@@ -319,11 +322,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rate_limit_prunes_old_failures() {
+    #[tokio::test]
+    async fn rate_limit_prunes_old_failures() {
         let limiter = LoginRateLimiter::new(1, Duration::ZERO);
         let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        limiter.record_failure(ip, "admin");
-        assert_eq!(limiter.check(ip, "admin"), None);
+        limiter.record_failure(ip, "admin").await;
+        assert_eq!(limiter.check(ip, "admin").await, None);
     }
 }

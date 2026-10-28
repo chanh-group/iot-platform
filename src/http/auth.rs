@@ -12,18 +12,19 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::core::auth;
-use crate::core::error::DomainError;
+use crate::core::domain_error::DomainError;
 use crate::observability::request_id::RequestId;
 use crate::storage::sqlite::audit::{self, AuditEvent};
 use crate::storage::sqlite::sessions::{self, Session};
 use crate::storage::sqlite::users;
 
 use super::AppState;
-use super::error::ApiError;
+use super::api_error::ApiError;
 use super::middleware::ApiJson;
 
 const SESSION_COOKIE: &str = "iot_session";
 
+/// Body of `POST /api/v1/auth/login`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoginRequest {
@@ -31,6 +32,7 @@ pub struct LoginRequest {
     pub password: String,
 }
 
+/// Extracted session for routes that require an authenticated admin.
 pub struct AuthSession(pub Session);
 
 impl FromRequestParts<AppState> for AuthSession {
@@ -64,6 +66,7 @@ impl FromRequestParts<AppState> for AuthSession {
     }
 }
 
+/// Verifies credentials, records the audit row, and sets the session cookie.
 pub async fn login(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -72,11 +75,11 @@ pub async fn login(
     ApiJson(payload): ApiJson<LoginRequest>,
 ) -> Result<Response, ApiError> {
     let ip = peer.ip();
-    if let Some(retry_after) = state.login_limiter.check(ip, &payload.username) {
+    if let Some(retry_after) = state.login_limiter.check(ip, &payload.username).await {
         let mut response = ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
-            "too many login attempts",
+            "too many login attempts".to_owned(),
             request_id,
         )
         .into_response();
@@ -90,11 +93,17 @@ pub async fn login(
         .await
         .map_err(|error| internal(error, &request_id))?;
     let Some(user) = user else {
-        state.login_limiter.record_failure(ip, &payload.username);
+        state
+            .login_limiter
+            .record_failure(ip, &payload.username)
+            .await;
         return Err(invalid_credentials(request_id));
     };
     if !user.enabled {
-        state.login_limiter.record_failure(ip, &payload.username);
+        state
+            .login_limiter
+            .record_failure(ip, &payload.username)
+            .await;
         return Err(invalid_credentials(request_id));
     }
 
@@ -105,10 +114,13 @@ pub async fn login(
             .await
             .map_err(|error| internal(error, &request_id))?;
     if !valid {
-        state.login_limiter.record_failure(ip, &payload.username);
+        state
+            .login_limiter
+            .record_failure(ip, &payload.username)
+            .await;
         return Err(invalid_credentials(request_id));
     }
-    state.login_limiter.clear(ip, &payload.username);
+    state.login_limiter.clear(ip, &payload.username).await;
 
     let token = auth::generate_session_token().map_err(|error| internal(error, &request_id))?;
     let token_hash = auth::hash_token(&token);
@@ -171,6 +183,7 @@ pub async fn login(
     Ok(response)
 }
 
+/// Revokes the current session and clears the cookie.
 pub async fn logout(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -216,6 +229,7 @@ pub async fn logout(
     Ok(response)
 }
 
+/// Returns the current admin user and session expiry.
 pub async fn me(AuthSession(session): AuthSession) -> Json<Value> {
     Json(json!({
         "id": session.user_id,
@@ -228,13 +242,13 @@ fn invalid_credentials(request_id: String) -> ApiError {
     ApiError::new(
         StatusCode::UNAUTHORIZED,
         "invalid_credentials",
-        "invalid credentials",
+        "invalid credentials".to_owned(),
         request_id,
     )
 }
 
 fn internal(error: impl Into<anyhow::Error>, request_id: &str) -> ApiError {
-    ApiError::from_domain(DomainError::Internal(error.into()), request_id)
+    ApiError::from_domain(DomainError::Internal(error.into()), request_id.to_owned())
 }
 
 fn session_cookie(token: &str, ttl_ms: u64, secure: bool) -> String {

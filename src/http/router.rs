@@ -1,12 +1,13 @@
 //! Axum router shell: API, health, SPA fallback (`02` §4.9).
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{Method, StatusCode, Uri, header};
 use axum::middleware::from_fn;
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing;
 use axum::{Json, Router};
 use serde_json::{Value, json};
 use tower_http::timeout::TimeoutLayer;
@@ -15,27 +16,28 @@ use tower_http::trace::TraceLayer;
 use crate::observability::request_id::{self, RequestId};
 
 use super::AppState;
+use super::api_error::ApiError;
 use super::assets;
 use super::auth;
-use super::error::ApiError;
 use super::middleware;
 
+/// Builds the app: API routes, health checks, SPA fallback, and layers.
 pub fn build(state: AppState) -> Router {
     let max_body_bytes = state.config.config.http.max_body_bytes;
     let request_timeout_ms = state.config.config.http.request_timeout_ms;
     let dashboard = state.config.config.http.dashboard;
 
     let mut router = Router::new()
-        .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz))
-        .route("/api/v1/auth/login", post(auth::login))
-        .route("/api/v1/auth/logout", post(auth::logout))
-        .route("/api/v1/auth/me", get(auth::me))
+        .route("/healthz", routing::get(healthz))
+        .route("/readyz", routing::get(readyz))
+        .route("/api/v1/auth/login", routing::post(auth::login))
+        .route("/api/v1/auth/logout", routing::post(auth::logout))
+        .route("/api/v1/auth/me", routing::get(auth::me))
         .fallback(fallback)
         .method_not_allowed_fallback(method_not_allowed);
 
     if dashboard {
-        router = router.route("/", get(index));
+        router = router.route("/", routing::get(index));
     }
 
     router
@@ -58,7 +60,7 @@ async fn healthz() -> Json<Value> {
 
 async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     // shortcut: phase 1 has no MQTT/ingest tasks, so only the database is checked.
-    let ready = state.ready.load(std::sync::atomic::Ordering::Acquire);
+    let ready = state.ready.load(Ordering::Acquire);
     let database_ok = ready
         && tokio::time::timeout(
             Duration::from_secs(1),
@@ -109,14 +111,19 @@ async fn fallback(
 }
 
 async fn not_found(RequestId(request_id): RequestId) -> ApiError {
-    ApiError::new(StatusCode::NOT_FOUND, "not_found", "not found", request_id)
+    ApiError::new(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        "not found".to_owned(),
+        request_id,
+    )
 }
 
 async fn method_not_allowed(RequestId(request_id): RequestId) -> ApiError {
     ApiError::new(
         StatusCode::METHOD_NOT_ALLOWED,
         "method_not_allowed",
-        "method not allowed",
+        "method not allowed".to_owned(),
         request_id,
     )
 }

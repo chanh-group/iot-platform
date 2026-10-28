@@ -10,6 +10,7 @@ pub struct FieldError {
     pub reason: String,
 }
 
+/// Failures that map onto the HTTP error envelope; adapters convert their errors.
 #[derive(Debug, Error)]
 pub enum DomainError {
     #[error("{message}")]
@@ -34,6 +35,8 @@ pub enum DomainError {
 }
 
 impl DomainError {
+    /// True when the cause must stay out of responses and be logged instead.
+    #[must_use]
     pub fn is_internal(&self) -> bool {
         matches!(self, Self::Internal(_))
     }

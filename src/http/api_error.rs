@@ -6,10 +6,11 @@ use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::core::error::DomainError;
+use crate::core::domain_error::DomainError;
 
 const JSON_UTF8: &str = "application/json; charset=utf-8";
 
+/// HTTP error body shared by every endpoint (`code`, `message`, `request_id`).
 #[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
@@ -20,23 +21,24 @@ pub struct ApiError {
 }
 
 impl ApiError {
+    /// Builds an error envelope without `details`.
     pub fn new(
         status: StatusCode,
         code: &'static str,
-        message: impl Into<String>,
-        request_id: impl Into<String>,
+        message: String,
+        request_id: String,
     ) -> Self {
         Self {
             status,
             code,
-            message: message.into(),
+            message,
             details: None,
-            request_id: request_id.into(),
+            request_id,
         }
     }
 
-    pub fn from_domain(error: DomainError, request_id: impl Into<String>) -> Self {
-        let request_id = request_id.into();
+    /// Maps a domain error onto its contract status and code.
+    pub fn from_domain(error: DomainError, request_id: String) -> Self {
         match error {
             DomainError::Validation { message, details } => Self {
                 status: StatusCode::BAD_REQUEST,
@@ -73,7 +75,7 @@ impl ApiError {
                 details: None,
                 request_id,
             },
-            // Chi tiết lỗi do tầng phát sinh log, tránh lộ DB URL/secret ra response.
+            // The originating layer logs the detail; keep DB URLs/secrets out of responses.
             DomainError::Internal(_) => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "internal_error",
@@ -120,7 +122,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::core::error::FieldError;
+    use crate::core::domain_error::FieldError;
 
     async fn json_body(response: Response) -> Value {
         let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
@@ -136,7 +138,7 @@ mod tests {
                 reason: "must not be empty".to_owned(),
             }],
         };
-        let response = ApiError::from_domain(error, "req-12345678").into_response();
+        let response = ApiError::from_domain(error, "req-12345678".to_owned()).into_response();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         let body = json_body(response).await;
@@ -152,7 +154,7 @@ mod tests {
         let error = DomainError::Internal(anyhow::anyhow!(
             "SELECT * FROM users; sqlite:///secret/path"
         ));
-        let response = ApiError::from_domain(error, "req-12345678").into_response();
+        let response = ApiError::from_domain(error, "req-12345678".to_owned()).into_response();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
         let body = json_body(response).await;
@@ -171,7 +173,7 @@ mod tests {
     #[tokio::test]
     async fn unavailable_hides_cause() {
         let error = DomainError::Unavailable("database is locked".to_owned());
-        let response = ApiError::from_domain(error, "req-12345678").into_response();
+        let response = ApiError::from_domain(error, "req-12345678".to_owned()).into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         let body = json_body(response).await;

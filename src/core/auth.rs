@@ -2,23 +2,24 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
-use base64::Engine;
+use argon2::{Argon2, PasswordHash};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use rand::TryRng;
 use rand::rngs::{SysError, SysRng};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use thiserror::Error;
 
+/// Length of a raw session token before base64url encoding.
 pub const SESSION_TOKEN_BYTES: usize = 32;
 
-#[derive(Debug, Error, PartialEq, Eq)]
+/// Failures of the password policy checked before hashing.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum PasswordPolicyError {
     #[error("password must be at least {min_length} characters")]
     TooShort { min_length: u64 },
 }
 
 /// `^[a-z0-9_.-]{3,32}$` without pulling in a regex dependency.
+#[must_use]
 pub fn is_valid_username(username: &str) -> bool {
     (3..=32).contains(&username.len())
         && username.bytes().all(|byte| {
@@ -26,6 +27,7 @@ pub fn is_valid_username(username: &str) -> bool {
         })
 }
 
+/// Rejects passwords shorter than `min_length` characters (not bytes).
 pub fn validate_password(password: &str, min_length: u64) -> Result<(), PasswordPolicyError> {
     if (password.chars().count() as u64) < min_length {
         return Err(PasswordPolicyError::TooShort { min_length });
@@ -35,11 +37,17 @@ pub fn validate_password(password: &str, min_length: u64) -> Result<(), Password
 
 /// Argon2id with the crate defaults, encoded as a PHC string.
 pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
+    use argon2::PasswordHasher;
+
     let hash = Argon2::default().hash_password(password.as_bytes())?;
     Ok(hash.to_string())
 }
 
+/// Returns `false` for wrong passwords and for malformed PHC strings.
+#[must_use]
 pub fn verify_password(password_hash: &str, password: &str) -> bool {
+    use argon2::PasswordVerifier;
+
     PasswordHash::new(password_hash).is_ok_and(|parsed| {
         Argon2::default()
             .verify_password(password.as_bytes(), &parsed)
@@ -49,16 +57,24 @@ pub fn verify_password(password_hash: &str, password: &str) -> bool {
 
 /// 32 random bytes as base64url without padding (43 characters).
 pub fn generate_session_token() -> Result<String, SysError> {
+    use base64::Engine;
+    use rand::TryRng;
+
     let mut bytes = [0u8; SESSION_TOKEN_BYTES];
     let mut rng = SysRng;
     rng.try_fill_bytes(&mut bytes)?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
+/// SHA-256 of the cookie token; only this digest is stored.
+#[must_use]
 pub fn hash_token(token: &str) -> [u8; 32] {
+    use sha2::Digest;
+
     Sha256::digest(token.as_bytes()).into()
 }
 
+/// Milliseconds since the Unix epoch, clamped for pre-epoch clocks.
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
