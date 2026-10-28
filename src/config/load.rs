@@ -6,6 +6,7 @@ use std::path::Path;
 use crate::config::schema::Config;
 use crate::config::{ConfigError, LoadedConfig, paths, runtime, validate};
 
+/// Reads `conf.toml`, resolves paths and env, applies `runtime.toml`, validates.
 pub fn load(path: &Path) -> Result<LoadedConfig, ConfigError> {
     load_with_env(path, |name| std::env::var(name).ok())
 }

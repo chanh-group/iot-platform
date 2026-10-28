@@ -3,6 +3,7 @@
 use std::path::{Component, Path, PathBuf};
 
 /// Lexical normalization: no filesystem access, `..` cannot climb above root.
+#[must_use]
 pub fn normalize(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -22,11 +23,13 @@ pub fn normalize(path: &Path) -> PathBuf {
 }
 
 /// Resolve a config-relative path against the directory containing `conf.toml`.
+#[must_use]
 pub fn resolve(base: &Path, path: &Path) -> PathBuf {
     normalize(&base.join(path))
 }
 
 /// Append the given components to `base`, used by path-containment checks.
+#[must_use]
 pub fn is_within(candidate: &Path, base: &Path) -> bool {
     candidate.starts_with(base)
 }

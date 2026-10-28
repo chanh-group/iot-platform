@@ -8,6 +8,7 @@ fn range(errors: &mut Vec<String>, path: &str, value: u64, min: u64, max: u64) {
     }
 }
 
+/// Checks every range and cross-field rule, returning all failures.
 pub fn validate(config: &Config) -> Vec<String> {
     let mut errors = Vec::new();
 

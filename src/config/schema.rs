@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// Top-level `conf.toml` schema; every section has contract defaults.
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -29,6 +30,7 @@ pub struct Config {
     pub logging: LoggingConfig,
 }
 
+/// Process identity, data directory, and shutdown deadline.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ServerConfig {
@@ -47,6 +49,7 @@ impl Default for ServerConfig {
     }
 }
 
+/// HTTP listener, limits, dashboard, and cookie policy.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct HttpConfig {
@@ -78,6 +81,7 @@ impl Default for HttpConfig {
     }
 }
 
+/// MQTT listener and per-client limits (enforced from phase 2).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct MqttConfig {
@@ -114,6 +118,7 @@ impl Default for MqttConfig {
     }
 }
 
+/// SQLite location, pool size, and timeouts.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct DatabaseConfig {
@@ -138,6 +143,7 @@ impl Default for DatabaseConfig {
     }
 }
 
+/// Ingest queue, batching, retention, and payload limits.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct TelemetryConfig {
@@ -170,6 +176,7 @@ impl Default for TelemetryConfig {
     }
 }
 
+/// Command TTL, pending limits, retry, and dispatch tuning.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CommandsConfig {
@@ -194,6 +201,7 @@ impl Default for CommandsConfig {
     }
 }
 
+/// Session lifetime and login throttling.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct AuthConfig {
@@ -214,6 +222,7 @@ impl Default for AuthConfig {
     }
 }
 
+/// Location of the hot-reloadable `runtime.toml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct RuntimeConfig {
@@ -228,6 +237,7 @@ impl Default for RuntimeConfig {
     }
 }
 
+/// Log level and output format.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct LoggingConfig {
@@ -244,6 +254,7 @@ impl Default for LoggingConfig {
     }
 }
 
+/// Log verbosity, mapped to `tracing` filter directives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
@@ -254,6 +265,7 @@ pub enum LogLevel {
     Error,
 }
 
+/// Log output encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogFormat {

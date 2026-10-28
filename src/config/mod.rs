@@ -1,24 +1,25 @@
 //! Typed configuration: schema, load, validate, paths, runtime overlay, redaction.
 
+use std::fmt;
 use std::path::PathBuf;
 
-use serde_json::Value;
-use thiserror::Error;
-
+pub mod config_error;
 pub mod load;
 pub mod paths;
+pub mod redact;
 pub mod runtime;
 pub mod schema;
 pub mod validate;
 
+pub use config_error::ConfigError;
 pub use load::{load, load_with_env};
+pub use redact::redact;
 pub use schema::{Config, LogFormat, LogLevel};
 pub use validate::validate;
 
-const REDACTED: &str = "<redacted>";
-
 /// Effective configuration after path/env resolution and runtime overlay.
 pub struct LoadedConfig {
+    /// Parsed, overlaid, and validated configuration.
     pub config: Config,
     /// Absolute, lexically normalized data dir.
     pub data_dir: PathBuf,
@@ -28,63 +29,17 @@ pub struct LoadedConfig {
     pub runtime_settings_path: PathBuf,
     /// Secret from `metrics_bearer_token_env`; never serialize or log.
     pub metrics_token: Option<String>,
+    /// Applied `runtime.toml` revision; 0 when the file is absent.
     pub revision: u64,
 }
 
-impl std::fmt::Debug for LoadedConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Không in config/DB URL/token: các field đó có thể chứa secret.
+impl fmt::Debug for LoadedConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Never print config/DB URL/token: those fields may hold secrets.
         f.debug_struct("LoadedConfig")
             .field("data_dir", &self.data_dir)
             .field("runtime_settings_path", &self.runtime_settings_path)
             .field("revision", &self.revision)
             .finish_non_exhaustive()
     }
-}
-
-#[derive(Debug, Error)]
-pub enum ConfigError {
-    #[error("cannot read {path}: {source}")]
-    Read {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("cannot parse {path}: {source}")]
-    Parse {
-        path: PathBuf,
-        #[source]
-        source: toml::de::Error,
-    },
-    #[error("cannot resolve config directory {path}: {source}")]
-    Dir {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("invalid configuration: {}", .0.join("; "))]
-    Invalid(Vec<String>),
-}
-
-/// Serialize for `GET /config` with DB URL and secret env names masked.
-pub fn redact(config: &Config) -> Result<Value, serde_json::Error> {
-    let mut value = serde_json::to_value(config)?;
-
-    if let Some(database) = value.get_mut("database").and_then(Value::as_object_mut) {
-        for key in ["url", "url_env"] {
-            if database.contains_key(key) {
-                database.insert(key.to_owned(), Value::String(REDACTED.to_owned()));
-            }
-        }
-    }
-    if let Some(http) = value.get_mut("http").and_then(Value::as_object_mut)
-        && http.contains_key("metrics_bearer_token_env")
-    {
-        http.insert(
-            "metrics_bearer_token_env".to_owned(),
-            Value::String(REDACTED.to_owned()),
-        );
-    }
-
-    Ok(value)
 }
