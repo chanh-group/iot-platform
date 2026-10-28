@@ -20,6 +20,21 @@ pub struct ApiError {
 }
 
 impl ApiError {
+    pub fn new(
+        status: StatusCode,
+        code: &'static str,
+        message: impl Into<String>,
+        request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            status,
+            code,
+            message: message.into(),
+            details: None,
+            request_id: request_id.into(),
+        }
+    }
+
     pub fn from_domain(error: DomainError, request_id: impl Into<String>) -> Self {
         let request_id = request_id.into();
         match error {
