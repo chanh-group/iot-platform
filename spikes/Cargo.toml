@@ -1,0 +1,3 @@
+[workspace]
+members = ["rmqtt", "allinone"]
+resolver = "3"

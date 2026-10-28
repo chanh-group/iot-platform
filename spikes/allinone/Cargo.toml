@@ -1,0 +1,16 @@
+[package]
+name = "allinone-spike"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1"
+axum = { version = "=0.8.9", features = ["ws"] }
+futures-util = "0.3"
+rmqtt-spike = { path = "../rmqtt" }
+rumqttc = "=0.25.1"
+rust-embed = "=8.13.0"
+sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+tokio = { version = "=1.54.1", features = ["full"] }
+tokio-tungstenite = "0.29"
