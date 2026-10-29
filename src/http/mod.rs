@@ -28,11 +28,18 @@ pub struct AppState {
     pub ready: Arc<AtomicBool>,
     /// Cleared if the MQTT listener stops.
     pub mqtt_ready: Arc<AtomicBool>,
+    /// Cleared while telemetry commits are failing and retried.
+    pub telemetry_ready: Arc<AtomicBool>,
 }
 
 impl AppState {
     /// Builds state with a fresh limiter and readiness set to `true`.
-    pub fn new(pool: SqlitePool, config: Arc<LoadedConfig>, mqtt_ready: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        pool: SqlitePool,
+        config: Arc<LoadedConfig>,
+        mqtt_ready: Arc<AtomicBool>,
+        telemetry_ready: Arc<AtomicBool>,
+    ) -> Self {
         let limiter = LoginRateLimiter::new(
             config.config.auth.login_max_attempts,
             Duration::from_millis(config.config.auth.login_window_ms),
@@ -43,6 +50,7 @@ impl AppState {
             login_limiter: Arc::new(limiter),
             ready: Arc::new(AtomicBool::new(true)),
             mqtt_ready,
+            telemetry_ready,
         }
     }
 }

@@ -5,3 +5,4 @@ pub mod auth;
 pub mod config;
 pub mod presence;
 pub mod server;
+mod server_publish;

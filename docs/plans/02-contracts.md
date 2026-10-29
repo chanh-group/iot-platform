@@ -114,7 +114,7 @@ Mặc định deny. Bảng dưới là toàn bộ quyền của một device:
 
 - ACL kiểm tra tại PUBLISH và SUBSCRIBE. RMQTT 0.24 không có hook từ chối lúc giao message (`MessageDelivered` chỉ thay payload), nên quyền đọc được chốt bằng filter đã duyệt: mọi filter được allow đều nằm trong `devices/{self}/`, wildcard không thể match topic của thiết bị khác.
 - Publish vào topic server-only (`telemetry/ack`, `commands`) bị từ chối.
-- Publish retained vào `telemetry` hoặc `attributes`: message **không** được ingest/xử lý; với telemetry có `event_id` hợp lệ, server gửi ACK `rejected/retained_not_allowed`. Publish retained vào topic server-only (`telemetry/ack`, `commands`, `commands/ack`) bị ACL từ chối.
+- Publish retained vào `telemetry` hoặc `attributes`: message **bị từ chối ở broker ACL trước retained storage**, không ingest/xử lý; với telemetry có `event_id` hợp lệ, server gửi ACK `rejected/retained_not_allowed`. Publish retained vào topic server-only (`telemetry/ack`, `commands`, `commands/ack`) bị ACL từ chối.
 - Publish ACL deny: message không được route, RMQTT đóng connection và không gửi PUBACK; không ghi telemetry.
 - Subscribe ACL deny: RMQTT trả SUBACK failure `0x80`, giữ connection; không message nào của filter bị giao.
 - RMQTT gọi `MessagePublish` **trước** `MessagePublishCheckAcl`. `MessagePublish` chỉ parse/log tối thiểu, không enqueue/ghi SQL; ingest chỉ được thực hiện sau khi `MessagePublishCheckAcl` cho phép.
@@ -193,6 +193,8 @@ ACK topic `devices/{id}/telemetry/ack`, QoS 1, non-retained:
 
 - `stored`/`duplicate`: chỉ publish ACK sau khi transaction commit.
 - `rejected`: publish ngay sau validate; không ghi SQL.
+- Nếu validation không có `event_id` hợp lệ để echo, ACK `rejected` dùng `event_id: null`; không echo chuỗi event ID sai định dạng.
+- Application ACK dùng hàng đợi nội bộ bounded 256; khi đầy, drop ACK + increment `telemetry_ack_dropped_total`, không tạo task mới. Device retry; dedup trả `duplicate` nếu event đã commit.
 - `retryable`: publish khi queue đầy hoặc DB lỗi; node retry cùng `event_id` với exponential backoff + jitter.
 - Nếu device không subscribe ACK, ACK bị mất; node retry và nhận `duplicate`.
 - QoS 0 vẫn nhận ACK nếu server xử lý được, nhưng node không được coi QoS 0 là bền vững.
@@ -1160,7 +1162,7 @@ iot-server --version
 | # | Input | Kỳ vọng |
 | --- | --- | --- |
 | T1 | `{"event_id":"evt-1","ts":1793149200000,"values":{"temperature":27.5,"humidity":65,"relay":true}}` | 1 row; ACK `stored` |
-| T2 | Thiếu `event_id` | Không row; ACK `rejected/missing_event_id` |
+| T2 | Thiếu `event_id` | Không row; ACK `rejected/missing_event_id`, `event_id: null` |
 | T3 | `values:{"x":null}` | Không row; ACK `rejected/invalid_payload`, field `values.x` |
 | T4 | `values:{"x":{"a":1}}` | Không row; `invalid_payload` |
 | T5 | String 4 097 byte | Không row; `invalid_payload` |

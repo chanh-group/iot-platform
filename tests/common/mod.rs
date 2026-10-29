@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use iot_server::config::{self, LoadedConfig};
 use iot_server::core::auth;
 use iot_server::core::presence::Presence;
+use iot_server::core::telemetry::{self as telemetry_core, TelemetryPayload};
 use iot_server::http::{AppState, router};
 use iot_server::mqtt::server::MqttServer;
 use iot_server::runtime::data_dir_lock::DataDirLock;
@@ -65,6 +66,7 @@ pub struct TestApp {
     pub mqtt_addr: SocketAddr,
     pub presence: Arc<Presence>,
     mqtt: MqttServer,
+    telemetry_task: JoinHandle<()>,
     handle: JoinHandle<()>,
     _lock: DataDirLock,
     _dir: TempDir,
@@ -182,11 +184,16 @@ impl TestApp {
     pub fn abort_mqtt(&self) {
         self.mqtt.abort();
     }
+
+    pub async fn retained_count(&self) -> isize {
+        self.mqtt.retained_count().await
+    }
 }
 
 impl Drop for TestApp {
     fn drop(&mut self) {
         self.mqtt.abort();
+        self.telemetry_task.abort();
         self.handle.abort();
     }
 }
@@ -267,16 +274,34 @@ impl TestAppBuilder {
 
         let mqtt_ready = Arc::new(AtomicBool::new(false));
         let presence = Arc::new(Presence::new());
-        let mqtt = MqttServer::start(
+        let telemetry = &loaded.config.telemetry;
+        let limits = TelemetryPayload::try_from(telemetry).unwrap();
+        let telemetry_ready = Arc::new(AtomicBool::new(true));
+        let (ingest, telemetry_task) = telemetry_core::spawn_worker(
+            pool.clone(),
+            telemetry.queue_capacity as usize,
+            telemetry.batch_size as usize,
+            telemetry.max_batch_bytes as usize,
+            Duration::from_millis(telemetry.flush_interval_ms),
+            Arc::clone(&telemetry_ready),
+        );
+        let mqtt = MqttServer::start_with_ingest(
             &loaded.config.mqtt,
             Arc::clone(&mqtt_ready),
             pool.clone(),
             Arc::clone(&presence),
+            ingest,
+            limits,
         )
         .await
         .unwrap();
         let mqtt_addr = mqtt.local_addr();
-        let state = AppState::new(pool.clone(), Arc::clone(&loaded), mqtt_ready);
+        let state = AppState::new(
+            pool.clone(),
+            Arc::clone(&loaded),
+            mqtt_ready,
+            telemetry_ready,
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = router::build(state);
@@ -299,6 +324,7 @@ impl TestAppBuilder {
             mqtt_addr,
             presence,
             mqtt,
+            telemetry_task,
             handle,
             _lock: lock,
             _dir: dir,

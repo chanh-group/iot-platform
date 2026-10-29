@@ -78,6 +78,22 @@ fn out_of_range_value_reports_its_path() {
 }
 
 #[test]
+fn telemetry_batch_must_fit_one_maximum_payload() {
+    let dir = TempDir::new().unwrap();
+    let path = write_config(
+        &dir,
+        &format!("{DB}\n[telemetry]\nmax_payload_bytes = 131072\nmax_batch_bytes = 65536\n"),
+    );
+
+    let error = config::load_with_env(&path, |_| None).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("telemetry.max_batch_bytes: must be at least telemetry.max_payload_bytes")
+    );
+}
+
+#[test]
 fn database_outside_data_dir_is_rejected() {
     let dir = TempDir::new().unwrap();
     let path = write_config(&dir, "[database]\nurl = \"sqlite://../outside.db\"\n");

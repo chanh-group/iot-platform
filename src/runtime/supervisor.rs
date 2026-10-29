@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::LoadedConfig;
 use crate::core::presence::Presence;
+use crate::core::telemetry::{self, TelemetryPayload};
 use crate::http::{AppState, router};
 use crate::mqtt::server::MqttServer;
 use crate::observability::logging;
@@ -50,19 +51,42 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
         return ExitCode::from(EXIT_MIGRATION);
     }
 
+    let telemetry_config = &loaded.config.telemetry;
+    let telemetry_ready = Arc::new(AtomicBool::new(true));
+    let limits = match TelemetryPayload::try_from(telemetry_config) {
+        Ok(limits) => limits,
+        Err(error) => {
+            tracing::error!(%error, "invalid telemetry limits");
+            pool.close().await;
+            return ExitCode::from(EXIT_MIGRATION);
+        }
+    };
+    let (ingest, mut ingest_task) = telemetry::spawn_worker(
+        pool.clone(),
+        telemetry_config.queue_capacity as usize,
+        telemetry_config.batch_size as usize,
+        telemetry_config.max_batch_bytes as usize,
+        Duration::from_millis(telemetry_config.flush_interval_ms),
+        Arc::clone(&telemetry_ready),
+    );
+
     let mqtt_ready = Arc::new(AtomicBool::new(false));
     let presence = Arc::new(Presence::new());
-    let mut mqtt = match MqttServer::start(
+    let mut mqtt = match MqttServer::start_with_ingest(
         &loaded.config.mqtt,
         Arc::clone(&mqtt_ready),
         pool.clone(),
         presence,
+        ingest.clone(),
+        limits,
     )
     .await
     {
         Ok(server) => server,
         Err(error) => {
             tracing::error!(%error, "cannot start mqtt listener");
+            drop(ingest);
+            ingest_task.abort();
             pool.close().await;
             return ExitCode::FAILURE;
         }
@@ -73,6 +97,8 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
         Err(error) => {
             tracing::error!(%error, "cannot bind http listener");
             mqtt.abort();
+            drop(ingest);
+            ingest_task.abort();
             pool.close().await;
             return ExitCode::FAILURE;
         }
@@ -82,6 +108,8 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
         Err(error) => {
             tracing::error!(%error, "cannot read http listener address");
             mqtt.abort();
+            drop(ingest);
+            ingest_task.abort();
             pool.close().await;
             return ExitCode::FAILURE;
         }
@@ -90,7 +118,7 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
     logging::startup(config_path, &loaded, listen_addr);
 
     let shutdown_timeout = Duration::from_millis(loaded.config.server.shutdown_timeout_ms);
-    let state = AppState::new(pool.clone(), Arc::new(loaded), mqtt_ready);
+    let state = AppState::new(pool.clone(), Arc::new(loaded), mqtt_ready, telemetry_ready);
     let app = router::build(state.clone());
 
     let cancel = CancellationToken::new();
@@ -110,6 +138,8 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
             tracing::error!(%error, "cannot listen for SIGTERM");
             server.abort();
             mqtt.abort();
+            drop(ingest);
+            ingest_task.abort();
             state.pool.close().await;
             return ExitCode::FAILURE;
         }
@@ -120,6 +150,8 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
             tracing::error!(%error, "cannot listen for SIGINT");
             server.abort();
             mqtt.abort();
+            drop(ingest);
+            ingest_task.abort();
             state.pool.close().await;
             return ExitCode::FAILURE;
         }
@@ -167,6 +199,14 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
     }
 
     mqtt.abort();
+    drop(ingest);
+    if tokio::time::timeout(shutdown_timeout, &mut ingest_task)
+        .await
+        .is_err()
+    {
+        tracing::warn!("telemetry worker did not drain before shutdown deadline");
+        ingest_task.abort();
+    }
     let outcome = shutdown::http(&state.ready, &cancel, server, shutdown_timeout).await;
     state.pool.close().await;
     drop(lock);

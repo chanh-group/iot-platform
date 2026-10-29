@@ -1,5 +1,6 @@
 //! Metric registry skeleton (`02` §4.7). `/metrics` is exposed in P2-13.
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Monotonic counter.
@@ -48,6 +49,7 @@ pub struct Metrics {
     pub ingest_accepted_total: Counter,
     // shortcut: reason label arrives with the `/metrics` exporter in P2-13.
     pub ingest_rejected_total: Counter,
+    pub telemetry_ack_dropped_total: Counter,
     pub telemetry_queue_depth: Gauge,
     // Histogram `iot_telemetry_commit_seconds` as count + micros until P2-13.
     pub telemetry_commit_count: Counter,
@@ -64,6 +66,12 @@ impl Metrics {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Process-wide registry shared by broker hooks and the exporter.
+    pub fn global() -> &'static Self {
+        static METRICS: OnceLock<Metrics> = OnceLock::new();
+        METRICS.get_or_init(Self::new)
     }
 }
 

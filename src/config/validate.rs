@@ -228,6 +228,11 @@ pub fn validate(config: &Config) -> Vec<String> {
         1,
         65_536,
     );
+    if config.telemetry.max_batch_bytes < config.telemetry.max_payload_bytes {
+        errors.push(
+            "telemetry.max_batch_bytes: must be at least telemetry.max_payload_bytes".to_owned(),
+        );
+    }
 
     range(
         &mut errors,

@@ -55,15 +55,15 @@ Nguồn sự thật:
 
 ## 4. Telemetry validate và bounded ingest — P2-05, P2-06
 
-- [ ] Tạo domain payload/validator trong `src/core/telemetry/{mod,payload,validate}.rs`; parse JSON object UTF-8 không trailing data.
-- [ ] Validate: `event_id` 1..128 `[A-Za-z0-9._:-]`; `values` 1..max_keys, key 1..64 hợp lệ/không `$`; value chỉ finite number/bool/string trong limit; payload và timestamp đúng policy.
-- [ ] Ghi `received_at` tại server; khi thiếu `ts`, dùng đúng `received_at`; payload gửi device ID bị bỏ qua.
-- [ ] Tính SHA-256 trên raw payload bytes nhận từ broker; retry chỉ duplicate khi byte-identical.
-- [ ] Bounded ingest queue có capacity `telemetry.queue_capacity`; MQTT hook dùng `try_send`, không `unbounded_channel`, không chờ/block hook. Queue đầy → metric + ACK `retryable/queue_full`, không ACK thành công.
-- [ ] Worker duy nhất gom batch theo `batch_size`, `max_batch_bytes`, `flush_interval_ms`; `BEGIN IMMEDIATE`, transaction ngắn, không giữ transaction khi publish ACK/WS.
-- [ ] Repository telemetry insert `(device_id,event_id)`; unique conflict đọc hash cũ: hash trùng → `duplicate`, khác → `rejected/event_id_conflict`; ACK `stored`/`duplicate` chỉ sau commit.
-- [ ] DB timeout/disk/full lỗi → readiness false, retry/backoff, `retryable/storage_unavailable`, RAM vẫn hữu hạn. Không làm test disk-full/crash gate đầy đủ ở đây (Phase 4), nhưng phải có path xử lý không panic.
-- [ ] Test `tests/telemetry_validation.rs` và `tests/telemetry_{flow,dedup,conflict}.rs` theo T1–T10: row/ACK/status/code/received_at/raw-hash chính xác; không có row cho case rejected.
+- [x] Tạo domain payload/validator trong `src/core/telemetry/{mod,payload,validate}.rs`; parse JSON object UTF-8 không trailing data.
+- [x] Validate: `event_id` 1..128 `[A-Za-z0-9._:-]`; `values` 1..max_keys, key 1..64 hợp lệ/không `$`; value chỉ finite number/bool/string trong limit; payload và timestamp đúng policy.
+- [x] Ghi `received_at` tại server; khi thiếu `ts`, dùng đúng `received_at`; payload gửi device ID bị bỏ qua.
+- [x] Tính SHA-256 trên raw payload bytes nhận từ broker; retry chỉ duplicate khi byte-identical.
+- [x] Bounded ingest queue có capacity `telemetry.queue_capacity`; MQTT hook dùng `try_send`, không `unbounded_channel`, không chờ/block hook. Queue đầy → metric + ACK `retryable/queue_full`, không ACK thành công. ACK publisher có queue bounded 256; queue ACK đầy drop ACK + metric, device retry; reason labels được exporter bổ sung ở P2-13.
+- [x] Worker duy nhất gom batch theo `batch_size`, `max_batch_bytes`, `flush_interval_ms`; `BEGIN IMMEDIATE`, transaction ngắn, không giữ transaction khi publish ACK/WS.
+- [x] Repository telemetry insert `(device_id,event_id)`; unique conflict đọc hash cũ: hash trùng → `duplicate`, khác → `rejected/event_id_conflict`; ACK `stored`/`duplicate` chỉ sau commit.
+- [x] DB timeout/disk/full lỗi → readiness false, retry/backoff, `retryable/storage_unavailable`, RAM vẫn hữu hạn. Không làm test disk-full/crash gate đầy đủ ở đây (Phase 4), nhưng phải có path xử lý không panic.
+- [x] Test T1–T10 trong `tests/telemetry_flow.rs` và validator/unit tests: row/ACK/status/code/received_at/raw-hash; rejected không tạo row.
 
 ## 5. Application ACK, attributes và retained — P2-07, P2-08, P2-09
 
