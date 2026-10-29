@@ -96,7 +96,7 @@ pub fn validate(
     })
 }
 
-fn valid_values(values: &Map<String, Value>, max_string_bytes: usize) -> bool {
+pub(crate) fn valid_values(values: &Map<String, Value>, max_string_bytes: usize) -> bool {
     values.iter().all(|(key, value)| {
         (1..=64).contains(&key.len())
             && !key.starts_with('$')

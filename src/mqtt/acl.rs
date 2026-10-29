@@ -10,15 +10,17 @@ use rmqtt::types::{PublishAclResult, SubscribeAclResult};
 
 use super::server_publish::AckHandle;
 use crate::core::acl;
+use crate::core::attributes;
 use crate::core::auth;
 use crate::core::telemetry::{
     self, IngestHandle, IngestSubmitError, TelemetryError, TelemetryPayload,
 };
+use crate::storage::sqlite::attributes::AttributeHandle;
 
 /// Publish/subscribe ACL handlers for authenticated device sessions.
 #[derive(Clone, Default)]
 pub struct AclHooks {
-    ingest: Option<(IngestHandle, TelemetryPayload, AckHandle)>,
+    ingest: Option<(IngestHandle, AttributeHandle, TelemetryPayload, AckHandle)>,
 }
 
 impl AclHooks {
@@ -32,11 +34,12 @@ impl AclHooks {
     #[must_use]
     pub(crate) fn with_ingest(
         ingest: IngestHandle,
+        attributes: AttributeHandle,
         limits: TelemetryPayload,
         ack: AckHandle,
     ) -> Self {
         Self {
-            ingest: Some((ingest, limits, ack)),
+            ingest: Some((ingest, attributes, limits, ack)),
         }
     }
 }
@@ -49,15 +52,24 @@ impl Handler for AclHooks {
                 let device_id: &str = &session.id.client_id;
                 let topic: &str = &publish.topic;
                 let allowed = acl::can_publish(device_id, topic);
-                let retained_telemetry = allowed
-                    && topic == format!("devices/{device_id}/telemetry")
-                    && publish.inner.retain;
+                let telemetry_topic = format!("devices/{device_id}/telemetry");
+                let attributes_topic = format!("devices/{device_id}/attributes");
+                let retained_telemetry =
+                    allowed && topic == telemetry_topic && publish.inner.retain;
+                let retained_attributes =
+                    allowed && topic == attributes_topic && publish.inner.retain;
                 if !allowed {
                     tracing::warn!(%device_id, %topic, "mqtt publish denied by acl");
                 }
+                if retained_attributes {
+                    crate::observability::metrics::Metrics::global()
+                        .attribute_rejected_total
+                        .inc();
+                    tracing::warn!(%device_id, %topic, "retained attributes publish rejected");
+                }
                 if allowed
-                    && topic == format!("devices/{device_id}/telemetry")
-                    && let Some((ingest, limits, ack)) = &self.ingest
+                    && topic == telemetry_topic
+                    && let Some((ingest, _, limits, ack)) = &self.ingest
                 {
                     let received_at = auth::now_ms();
                     let payload = publish.inner.payload.as_ref();
@@ -116,12 +128,39 @@ impl Handler for AclHooks {
                             }
                         }
                     }
+                } else if allowed
+                    && topic == attributes_topic
+                    && !publish.inner.retain
+                    && let Some((_, attributes_handle, limits, _)) = &self.ingest
+                {
+                    let updated_at = auth::now_ms();
+                    match attributes::validate(publish.inner.payload.as_ref(), updated_at, *limits)
+                    {
+                        Ok(event) => {
+                            if let Err(error) =
+                                attributes_handle.try_submit(device_id.to_owned(), event)
+                            {
+                                crate::observability::metrics::Metrics::global()
+                                    .attribute_rejected_total
+                                    .inc();
+                                tracing::warn!(%device_id, ?error, "attribute update queue rejected payload");
+                            }
+                        }
+                        Err(error) => {
+                            crate::observability::metrics::Metrics::global()
+                                .attribute_rejected_total
+                                .inc();
+                            tracing::debug!(%device_id, ?error, "attribute payload rejected");
+                        }
+                    }
                 }
                 let result = if !allowed {
                     PublishAclResult::rejected(true, None)
                 } else if retained_telemetry {
-                    // Reject before RMQTT reaches retained storage; keep the session for app ACK.
+                    // Keep the session open so the application-level rejection ACK can be delivered.
                     PublishAclResult::rejected(false, None)
+                } else if retained_attributes {
+                    PublishAclResult::rejected(true, None)
                 } else {
                     PublishAclResult::allow()
                 };

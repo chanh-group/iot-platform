@@ -1,5 +1,6 @@
 //! SQLite pool, migrations, and repositories.
 
+pub mod attributes;
 pub mod audit;
 pub mod devices;
 pub mod migrate;

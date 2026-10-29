@@ -55,6 +55,8 @@ pub struct Metrics {
     pub telemetry_commit_count: Counter,
     pub telemetry_commit_micros_total: Counter,
     pub telemetry_commit_errors_total: Counter,
+    pub attribute_rejected_total: Counter,
+    pub retained_cap_rejected_total: Counter,
     pub commands_pending: Gauge,
     pub commands_expired_total: Counter,
     pub ws_clients: Gauge,

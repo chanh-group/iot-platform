@@ -79,6 +79,7 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
         presence,
         ingest.clone(),
         limits,
+        telemetry_config.queue_capacity as usize,
     )
     .await
     {

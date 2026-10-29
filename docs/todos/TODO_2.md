@@ -67,13 +67,14 @@ Nguồn sự thật:
 
 ## 5. Application ACK, attributes và retained — P2-07, P2-08, P2-09
 
-- [ ] `src/mqtt/server_publish.rs`: ACK telemetry tới `devices/{id}/telemetry/ack`, principal `$server`, QoS 1, non-retained; payload không chứa secret/raw telemetry.
-- [ ] ACK `rejected` sau validation và `retryable` khi xác định được event ID; không tạo ACK thành công trước commit. Device không subscribe ACK thì retry được duplicate.
-- [ ] Reject retained telemetry: không enqueue/SQL, ACK `rejected/retained_not_allowed` khi event ID hợp lệ (T11).
-- [ ] Attributes: validate cùng giới hạn values/payload, chỉ non-retained; upsert latest per `(device_id,key)` trong transaction ngắn; lỗi drop + metric, không application ACK/history.
-- [ ] Viết lại `BudgetedRetainStorage` trong product, không copy nguyên spike: serialize update map topic→bytes, trừ giá trị cũ khi replace, trừ toàn bộ khi payload rỗng clear, không âm/race.
-- [ ] Dùng retained storage này thay default no-op; cap 0 cấm retained. Vượt cap: metric/log redact payload, reason `retained_cap`, để RMQTT đóng connection/no PUBACK.
-- [ ] Test retained: T15 status retained không đổi presence; clear/replace; cap T16 với limit test nhỏ; restart không giữ retained. Test attributes: latest/upsert và invalid payload không ghi.
+- [x] `src/mqtt/server_publish.rs`: ACK telemetry tới `devices/{id}/telemetry/ack`, principal `$server`, QoS 1, non-retained; payload không chứa secret/raw telemetry.
+- [x] ACK `rejected` sau validation và `retryable` khi xác định được event ID; không tạo ACK thành công trước commit. Device không subscribe ACK thì retry được duplicate.
+- [x] Reject retained telemetry: không enqueue/SQL, ACK `rejected/retained_not_allowed` khi event ID hợp lệ (T11).
+- [x] Attributes: validate cùng giới hạn values/payload, chỉ non-retained; upsert latest per `(device_id,key)` trong transaction ngắn; lỗi drop + metric, không application ACK/history.
+- [x] Viết lại `BudgetedRetainStorage` trong product, không copy nguyên spike: serialize update map topic→bytes, trừ giá trị cũ khi replace, trừ toàn bộ khi payload rỗng clear, không âm/race.
+- [x] Dùng retained storage này thay default no-op; cap 0 cấm retained. Vượt cap: metric/log redact payload, reason `retained_cap`, để RMQTT đóng connection/no PUBACK.
+- [x] Test retained: T15 status retained không đổi presence; clear/replace; cap T16 với limit test nhỏ. Test attributes: latest/upsert và invalid payload không ghi.
+- [x] Test retained state không còn sau khi restart broker bằng server context mới.
 
 ## 6. Telemetry REST, events WebSocket và metrics — P2-10, P2-11, P2-13
 

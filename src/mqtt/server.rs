@@ -12,11 +12,13 @@ use tokio::task::JoinHandle;
 use crate::config::schema::MqttConfig;
 use crate::core::presence::Presence;
 use crate::core::telemetry::{IngestHandle, TelemetryPayload};
+use crate::storage::sqlite::attributes as attribute_storage;
 
 use super::acl::AclHooks;
 use super::auth::AuthHooks;
 use super::config;
 use super::presence::PresenceHooks;
+use super::retained::BudgetedRetainStorage;
 use super::server_publish::{ServerPublisher, spawn_ack_worker};
 
 /// Running RMQTT listener and the channel used by core services.
@@ -26,6 +28,7 @@ pub struct MqttServer {
     context: ServerContext,
     task: JoinHandle<anyhow::Result<()>>,
     ack_task: Option<JoinHandle<()>>,
+    attributes_task: Option<JoinHandle<()>>,
 }
 
 impl MqttServer {
@@ -49,8 +52,16 @@ impl MqttServer {
         presence: Arc<Presence>,
         ingest: IngestHandle,
         limits: TelemetryPayload,
+        attribute_queue_capacity: usize,
     ) -> anyhow::Result<Self> {
-        Self::start_inner(config, readiness, pool, presence, Some((ingest, limits))).await
+        Self::start_inner(
+            config,
+            readiness,
+            pool,
+            presence,
+            Some((ingest, limits, attribute_queue_capacity)),
+        )
+        .await
     }
 
     async fn start_inner(
@@ -58,11 +69,19 @@ impl MqttServer {
         readiness: Arc<AtomicBool>,
         pool: SqlitePool,
         presence: Arc<Presence>,
-        ingest: Option<(IngestHandle, TelemetryPayload)>,
+        ingest: Option<(IngestHandle, TelemetryPayload, usize)>,
     ) -> anyhow::Result<Self> {
         let listener = config::listener(config)?;
         let address = listener.local_addr()?;
         let context = ServerContext::new().busy_check_enable(false).build().await;
+        let max_retained_messages = usize::try_from(config.max_retained_messages)
+            .map_err(|_| anyhow::anyhow!("mqtt.max_retained_messages does not fit usize"))?;
+        let max_retained_bytes = usize::try_from(config.max_retained_bytes)
+            .map_err(|_| anyhow::anyhow!("mqtt.max_retained_bytes does not fit usize"))?;
+        *context.extends.retain_mut().await = Box::new(BudgetedRetainStorage::new(
+            max_retained_messages,
+            max_retained_bytes,
+        ));
         let retained_context = context.clone();
         let publisher = ServerPublisher::new(context.clone());
 
@@ -74,12 +93,18 @@ impl MqttServer {
                 Box::new(AuthHooks::new(pool.clone())),
             )
             .await;
-        let (acl_hooks, ack_task) = match ingest {
-            Some((ingest, limits)) => {
+        let (acl_hooks, ack_task, attributes_task) = match ingest {
+            Some((ingest, limits, attribute_queue_capacity)) => {
+                let (attributes, attributes_task) =
+                    attribute_storage::spawn_worker(pool.clone(), attribute_queue_capacity);
                 let (ack, task) = spawn_ack_worker(publisher);
-                (AclHooks::with_ingest(ingest, limits, ack), Some(task))
+                (
+                    AclHooks::with_ingest(ingest, attributes, limits, ack),
+                    Some(task),
+                    Some(attributes_task),
+                )
             }
-            None => (AclHooks::new(), None),
+            None => (AclHooks::new(), None, None),
         };
         register
             .add_priority(Type::MessagePublishCheckAcl, 10, Box::new(acl_hooks))
@@ -114,6 +139,7 @@ impl MqttServer {
             context: retained_context,
             task,
             ack_task,
+            attributes_task,
         })
     }
 
@@ -138,6 +164,9 @@ impl MqttServer {
         self.readiness.store(false, Ordering::Release);
         self.task.abort();
         if let Some(task) = &self.ack_task {
+            task.abort();
+        }
+        if let Some(task) = &self.attributes_task {
             task.abort();
         }
     }

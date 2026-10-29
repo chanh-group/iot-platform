@@ -188,6 +188,24 @@ impl TestApp {
     pub async fn retained_count(&self) -> isize {
         self.mqtt.retained_count().await
     }
+
+    /// Restarts the test broker with a fresh in-memory retained store.
+    pub async fn restart_mqtt(&mut self) {
+        self.mqtt.abort();
+        let mut config = self.config.config.mqtt.clone();
+        config.listen = "127.0.0.1:0".parse().expect("valid test MQTT address");
+        let readiness = Arc::new(AtomicBool::new(false));
+        let mqtt = MqttServer::start(
+            &config,
+            readiness,
+            self.pool.clone(),
+            Arc::clone(&self.presence),
+        )
+        .await
+        .expect("restart test MQTT server");
+        self.mqtt_addr = mqtt.local_addr();
+        self.mqtt = mqtt;
+    }
 }
 
 impl Drop for TestApp {
@@ -203,6 +221,8 @@ pub struct TestAppBuilder {
     cookie_secure: bool,
     max_body_bytes: u64,
     login_max_attempts: u64,
+    max_retained_messages: u64,
+    max_retained_bytes: u64,
 }
 
 impl Default for TestAppBuilder {
@@ -212,6 +232,8 @@ impl Default for TestAppBuilder {
             cookie_secure: false,
             max_body_bytes: 262_144,
             login_max_attempts: 5,
+            max_retained_messages: 10_000,
+            max_retained_bytes: 16_777_216,
         }
     }
 }
@@ -237,6 +259,12 @@ impl TestAppBuilder {
         self
     }
 
+    pub fn retained_limits(mut self, messages: u64, bytes: u64) -> Self {
+        self.max_retained_messages = messages;
+        self.max_retained_bytes = bytes;
+        self
+    }
+
     pub async fn start(self) -> TestApp {
         let dir = TempDir::new().unwrap();
         let config_path = dir.path().join("conf.toml");
@@ -254,6 +282,8 @@ impl TestAppBuilder {
                  max_body_bytes = {}\n\
                  [mqtt]\n\
                  listen = \"127.0.0.1:{}\"\n\
+                 max_retained_messages = {}\n\
+                 max_retained_bytes = {}\n\
                  [database]\n\
                  url = \"sqlite://./data/iot.db\"\n\
                  [auth]\n\
@@ -262,6 +292,8 @@ impl TestAppBuilder {
                 self.cookie_secure,
                 self.max_body_bytes,
                 mqtt_port,
+                self.max_retained_messages,
+                self.max_retained_bytes,
                 self.login_max_attempts,
             ),
         )
@@ -292,6 +324,7 @@ impl TestAppBuilder {
             Arc::clone(&presence),
             ingest,
             limits,
+            telemetry.queue_capacity as usize,
         )
         .await
         .unwrap();
