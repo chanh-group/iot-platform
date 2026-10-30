@@ -168,6 +168,11 @@ impl Metrics {
             "iot_ingest_accepted_total",
             self.ingest_accepted_total.get(),
         );
+        counter(
+            &mut output,
+            "iot_retained_cap_rejected_total",
+            self.retained_cap_rejected_total.get(),
+        );
         output.push_str(
             "# HELP iot_ingest_rejected_total Rejected telemetry events by reason.\n# TYPE iot_ingest_rejected_total counter\n",
         );

@@ -1,8 +1,11 @@
 mod common;
 
-use common::TestApp;
+use common::{TestApp, mqtt_connect, mqtt_subscribe, mqtt_wait_closed, mqtt_wait_publish};
+use iot_server::observability::metrics::Metrics;
 use rumqttc::{Event, Packet, QoS};
 use std::time::Duration;
+
+static RETAINED_CAP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn publish_qos1(
     client: &rumqttc::AsyncClient,
@@ -133,6 +136,7 @@ async fn attributes_are_latest_per_key_and_invalid_or_retained_updates_are_dropp
 
 #[tokio::test]
 async fn retained_replace_clear_and_caps_keep_accounting_consistent() {
+    let _guard = RETAINED_CAP_TEST_LOCK.lock().await;
     let app = TestApp::builder().retained_limits(1, 5).start().await;
     let device = app.create_device("retained-cap", true).await;
     let status = format!("devices/{}/status", device.id);
@@ -178,6 +182,42 @@ async fn retained_replace_clear_and_caps_keep_accounting_consistent() {
         1,
         "over-cap publish must not replace or add retained data"
     );
+}
+
+#[tokio::test]
+async fn retained_byte_cap_rejects_oversized_replacement_and_counts_it() {
+    let _guard = RETAINED_CAP_TEST_LOCK.lock().await;
+    let app = TestApp::builder().retained_limits(2, 5).start().await;
+    let rejected_before = Metrics::global().retained_cap_rejected_total.get();
+    let device = app.create_device("retained-byte-cap", true).await;
+    let status = format!("devices/{}/status", device.id);
+    let (client, mut eventloop, _) =
+        mqtt_connect(app.mqtt_addr, &device.id, &device.id, &device.token, true).await;
+
+    publish_qos1(&client, &mut eventloop, &status, true, b"12345").await;
+    client
+        .publish(&status, QoS::AtLeastOnce, true, b"123456")
+        .await
+        .expect("queue retained payload over byte cap");
+    mqtt_wait_closed(&mut eventloop, Duration::from_secs(2)).await;
+
+    assert_eq!(app.retained_count().await, 1);
+    assert!(
+        Metrics::global().retained_cap_rejected_total.get() == rejected_before + 1,
+        "byte-cap rejection must increment the retained rejection metric"
+    );
+    drop(client);
+    drop(eventloop);
+
+    let (client, mut eventloop, _) =
+        mqtt_connect(app.mqtt_addr, &device.id, &device.id, &device.token, true).await;
+    assert_eq!(
+        mqtt_subscribe(&client, &mut eventloop, &status, QoS::AtLeastOnce).await,
+        rumqttc::SubscribeReasonCode::Success(QoS::AtLeastOnce)
+    );
+    let retained = mqtt_wait_publish(&mut eventloop, Duration::from_secs(2)).await;
+    assert_eq!(retained.payload.as_ref(), b"12345");
+    assert!(retained.retain);
 }
 
 #[tokio::test]

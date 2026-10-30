@@ -136,7 +136,7 @@ Mặc định deny. Bảng dưới là toàn bộ quyền của một device:
 
 - Retained chỉ hữu ích cho `status` và `data/#`; retained trên topic nghiệp vụ bị xử lý như §2.4.
 - Retained của cùng topic thay thế bản cũ; payload rỗng xóa retained.
-- Vượt retained cap là broker-level disconnect, không phải application ACK/retry response. Hook product phải increment metric có reason `retained_cap` và log có topic/size đã redact payload trước khi trả reject.
+- Vượt retained cap là broker-level disconnect, không phải application ACK/retry response. Hook product phải increment `iot_retained_cap_rejected_total` và log có topic/size đã redact payload trước khi trả reject.
 - Product dùng `BudgetedRetainStorage` thay `DefaultRetainStorage` (no-op): kiểm tra cap và cập nhật counter trước khi set; replace trừ byte cũ, payload rỗng xóa topic và trừ toàn bộ byte; thao tác phải serialize để tránh race.
 - Retained/session không bền qua process restart. Sau restart, mọi device coi là offline đến khi reconnect.
 - Session offline vẫn có thể nhận message QoS 1 trong giới hạn queue; command không dựa vào queue này (xem §2.8).
@@ -842,7 +842,7 @@ Query: `limit` (mặc định 50, max 200), `cursor`, `status` (một giá trị
 - Mặc định tắt (`[http] metrics = false` → 404).
 - Khi bật, **không** dùng session cookie: bắt buộc `http.metrics_bearer_token_env` trỏ tới environment variable có token ngẫu nhiên tối thiểu 32 byte. Yêu cầu `Authorization: Bearer <token>`; thiếu/sai trả 401. Token không bao giờ xuất hiện trong API, log hay `GET /config`.
 - Production đặt endpoint sau reverse proxy/mTLS hoặc network policy chỉ cho Prometheus. Không bật metrics nếu không có một trong các lớp mạng đó.
-- Tên metric tối thiểu: `iot_mqtt_connections_active`, `iot_ingest_accepted_total`, `iot_ingest_rejected_total{reason}`, `iot_telemetry_queue_depth`, `iot_telemetry_commit_seconds` (histogram), `iot_telemetry_commit_errors_total`, `iot_commands_pending`, `iot_commands_expired_total`, `iot_ws_clients`, `iot_ws_dropped_total`.
+- Tên metric tối thiểu: `iot_mqtt_connections_active`, `iot_ingest_accepted_total`, `iot_ingest_rejected_total{reason}`, `iot_retained_cap_rejected_total`, `iot_telemetry_queue_depth`, `iot_telemetry_commit_seconds` (histogram), `iot_telemetry_commit_errors_total`, `iot_commands_pending`, `iot_commands_expired_total`, `iot_ws_clients`, `iot_ws_dropped_total`.
 - Không dùng device ID làm label.
 
 ### 4.8. WebSocket

@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
-async fn publish(app: &TestApp, device_id: &str, token: &str, event_id: &str, raw: &[u8]) {
+async fn publish(app: &TestApp, device_id: &str, token: &str, event_id: &str, raw: &[u8]) -> Value {
     let (client, mut eventloop, _) =
         mqtt_connect(app.mqtt_addr, device_id, device_id, token, true).await;
     let ack_topic = format!("devices/{device_id}/telemetry/ack");
@@ -47,12 +47,12 @@ async fn publish(app: &TestApp, device_id: &str, token: &str, event_id: &str, ra
             {
                 let ack: Value = serde_json::from_slice(&packet.payload).unwrap();
                 assert_eq!(ack["event_id"], event_id);
-                break;
+                break ack;
             }
         }
     })
     .await
-    .unwrap();
+    .unwrap()
 }
 
 async fn next_json(
@@ -102,7 +102,7 @@ async fn subscribed_clients_receive_only_committed_telemetry_and_refetch_after_r
         .unwrap();
     assert_eq!(next_json(&mut socket).await["type"], "pong");
 
-    publish(
+    let rejected = publish(
         &app,
         &device.id,
         &device.token,
@@ -110,13 +110,15 @@ async fn subscribed_clients_receive_only_committed_telemetry_and_refetch_after_r
         br#"{"event_id":"invalid-ws-event","values":{"x":null}}"#,
     )
     .await;
+    assert_eq!(rejected["status"], "rejected");
+    assert_eq!(rejected["code"], "invalid_payload");
     assert!(
         tokio::time::timeout(Duration::from_millis(150), socket.next())
             .await
             .is_err()
     );
 
-    publish(
+    let stored_ack = publish(
         &app,
         &device.id,
         &device.token,
@@ -124,6 +126,7 @@ async fn subscribed_clients_receive_only_committed_telemetry_and_refetch_after_r
         br#"{"event_id":"committed-ws-event","values":{"temperature":24.5}}"#,
     )
     .await;
+    assert_eq!(stored_ack["status"], "stored");
     let event = next_json(&mut socket).await;
     assert_eq!(event["type"], "telemetry");
     assert_eq!(event["device_id"], device.id);
@@ -216,7 +219,7 @@ async fn failed_telemetry_commit_is_not_broadcast() {
     .execute(&app.pool)
     .await
     .unwrap();
-    publish(
+    let failed_ack = publish(
         &app,
         &device.id,
         &device.token,
@@ -224,6 +227,8 @@ async fn failed_telemetry_commit_is_not_broadcast() {
         br#"{"event_id":"failed-commit-event","values":{"x":1}}"#,
     )
     .await;
+    assert_eq!(failed_ack["status"], "retryable");
+    assert_eq!(failed_ack["code"], "storage_unavailable");
     assert!(
         tokio::time::timeout(Duration::from_millis(200), socket.next())
             .await
@@ -238,6 +243,16 @@ async fn failed_telemetry_commit_is_not_broadcast() {
     .await
     .unwrap();
     assert_eq!(stored, 0);
+
+    let readiness = reqwest::Client::new()
+        .get(format!("{}/readyz", app.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(readiness.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let readiness: Value = readiness.json().await.unwrap();
+    assert_eq!(readiness["checks"]["database"], "ok");
+    assert_eq!(readiness["checks"]["ingest"], "degraded");
 }
 
 #[tokio::test]

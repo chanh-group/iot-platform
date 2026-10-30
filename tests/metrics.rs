@@ -78,6 +78,7 @@ async fn metrics_requires_its_bearer_token_and_exports_core_series() {
         "iot_mqtt_connections_active",
         "iot_ingest_accepted_total",
         "iot_ingest_rejected_total{reason=\"queue_full\"}",
+        "iot_retained_cap_rejected_total",
         "iot_telemetry_queue_depth",
         "iot_telemetry_commit_seconds_bucket",
         "iot_telemetry_commit_errors_total",

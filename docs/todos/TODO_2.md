@@ -41,7 +41,7 @@ Nguồn sự thật:
 - [x] Tạo `src/core/presence.rs` và `src/mqtt/presence.rs`: ghi online/offline trong RAM, connection generation lấy từ session id/create time; disconnect cũ không được ghi đè connection mới khi duplicate client ID.
 - [x] Chỉ cập nhật `devices.last_seen_at` trực tiếp trong hook connect/disconnect để tránh write amplification. Đây là low-volume MVP; DB chậm làm chậm hook/CONNACK của client đó nhưng không chặn listener hay client khác. Lỗi ghi chỉ log + metric, không từ chối connect và không làm readiness false. `shortcut: last_seen_at ghi inline trong hook, chuyển sang presence channel nếu connect/CONNACK p95 hoặc hook backlog xấu dưới tải.`
 - [x] Test `tests/mqtt_auth.rs`: token đúng/sai, unknown, disabled, revoked, client-id mismatch, MQTT 3.1/5 reject, duplicate client ID và generation.
-- [ ] Đánh dấu A03 chỉ pass khi sai token và device disable đều bị từ chối, không thể ghi telemetry. — phần auth đã pass (refused, 0 session/presence); vế "không có row telemetry" chờ ingest ở mục 4.
+- [x] A03: token sai và device disable đều bị từ chối; test gửi raw QoS 1 PUBLISH sau CONNACK bị từ chối, không có PUBACK và không tạo row telemetry (`tests/mqtt_auth.rs::bad_credentials_are_all_refused_with_the_same_code`).
 
 ## 3. ACL deny mặc định — P2-03
 
@@ -59,11 +59,11 @@ Nguồn sự thật:
 - [x] Validate: `event_id` 1..128 `[A-Za-z0-9._:-]`; `values` 1..max_keys, key 1..64 hợp lệ/không `$`; value chỉ finite number/bool/string trong limit; payload và timestamp đúng policy.
 - [x] Ghi `received_at` tại server; khi thiếu `ts`, dùng đúng `received_at`; payload gửi device ID bị bỏ qua.
 - [x] Tính SHA-256 trên raw payload bytes nhận từ broker; retry chỉ duplicate khi byte-identical.
-- [x] Bounded ingest queue có capacity `telemetry.queue_capacity`; MQTT hook dùng `try_send`, không `unbounded_channel`, không chờ/block hook. Queue đầy → metric + ACK `retryable/queue_full`, không ACK thành công. ACK publisher có queue bounded 256; queue ACK đầy drop ACK + metric, device retry; reason labels được exporter bổ sung ở P2-13.
+- [x] Bounded ingest queue có capacity `telemetry.queue_capacity`; MQTT hook dùng `try_send`, không `unbounded_channel`, không chờ/block hook. Queue đầy → metric + ACK `retryable/queue_full`, không ACK thành công. ACK publisher có tổng queue capacity 256, tách immediate rejection khỏi kết quả ingest để DB chậm không chặn ACK queue-full; queue đầy drop ACK + metric, device retry; reason labels được exporter bổ sung ở P2-13.
 - [x] Worker duy nhất gom batch theo `batch_size`, `max_batch_bytes`, `flush_interval_ms`; `BEGIN IMMEDIATE`, transaction ngắn, không giữ transaction khi publish ACK/WS.
 - [x] Repository telemetry insert `(device_id,event_id)`; unique conflict đọc hash cũ: hash trùng → `duplicate`, khác → `rejected/event_id_conflict`; ACK `stored`/`duplicate` chỉ sau commit.
 - [x] DB timeout/disk/full lỗi → readiness false, retry/backoff, `retryable/storage_unavailable`, RAM vẫn hữu hạn. Không làm test disk-full/crash gate đầy đủ ở đây (Phase 4), nhưng phải có path xử lý không panic.
-- [x] Test T1–T10 trong `tests/telemetry_flow.rs` và validator/unit tests: row/ACK/status/code/received_at/raw-hash; rejected không tạo row.
+- [x] Test T1–T10 trong `tests/telemetry_flow.rs` và validator/unit tests: row/ACK/status/code/received_at/raw-hash; rejected không tạo row. Queue saturation được kiểm chứng riêng trong `full_ingest_queue_returns_retryable_without_success_ack_and_exports_metric`.
 
 ## 5. Application ACK, attributes và retained — P2-07, P2-08, P2-09
 
@@ -73,7 +73,7 @@ Nguồn sự thật:
 - [x] Attributes: validate cùng giới hạn values/payload, chỉ non-retained; upsert latest per `(device_id,key)` trong transaction ngắn; lỗi drop + metric, không application ACK/history.
 - [x] Viết lại `BudgetedRetainStorage` trong product, không copy nguyên spike: serialize update map topic→bytes, trừ giá trị cũ khi replace, trừ toàn bộ khi payload rỗng clear, không âm/race.
 - [x] Dùng retained storage này thay default no-op; cap 0 cấm retained. Vượt cap: metric/log redact payload, reason `retained_cap`, để RMQTT đóng connection/no PUBACK.
-- [x] Test retained: T15 status retained không đổi presence; clear/replace; cap T16 với limit test nhỏ. Test attributes: latest/upsert và invalid payload không ghi.
+- [x] Test retained: T15 status retained không đổi presence; clear/replace; message/byte cap với limit test nhỏ và metric rejection. Test attributes: latest/upsert và invalid payload không ghi.
 - [x] Test retained state không còn sau khi restart broker bằng server context mới.
 
 ## 6. Telemetry REST, events WebSocket và metrics — P2-10, P2-11, P2-13
@@ -84,7 +84,7 @@ Nguồn sự thật:
 - [x] Tạo EventBus broadcast best-effort và WS `/api/v1/events`: cookie + Origin validation có sẵn, gửi `hello`, subscribe/unsubscribe/ping theo contract; telemetry chỉ publish event **sau SQL commit**.
 - [x] Bounded broadcast/per-client WS queues; lag/full đóng 1013. Chỉ cần telemetry/hello/subscription trong Phase 2; command/config/system đầy đủ thuộc Phase 3/4.
 - [x] Test `tests/ws_telemetry.rs`: subscribe device đúng nhận committed event, event không phát trước/không có khi validation/commit fail, subscribe sai bị lỗi, reconnect dùng REST history để bù.
-- [x] Hoàn thiện `/metrics` theo contract: mặc định 404; khi bật chỉ Bearer token env riêng (≥32 byte), không cookie/session, token không lộ config/log. Có connection active, ingest accepted/rejected reason, queue depth, commit latency/errors; không label device ID.
+- [x] Hoàn thiện `/metrics` theo contract: mặc định 404; khi bật chỉ Bearer token env riêng (≥32 byte), không cookie/session, token không lộ config/log. Có connection active, ingest accepted/rejected reason, retained-cap rejection, queue depth, commit latency/errors; không label device ID.
 - [x] Test `/metrics` auth/tắt/bật và metric telemetry chính; không thêm Prometheus dependency ngoài stack đã chốt nếu registry skeleton hiện có đáp ứng được.
 
 ## 7. Protocol suite và acceptance — P2-12
@@ -110,14 +110,17 @@ cargo test --all
 
 Checklist gate:
 
-- [ ] A03 pass: token sai/device disabled không kết nối hay ghi telemetry.
-- [ ] A05, A06, A07 pass; không ACK `stored`/`duplicate` trước commit.
-- [ ] A04 pass ở unit + integration, gồm wildcard/cross-device.
-- [ ] A19 matrix MVP pass: QoS 0/1/2, wildcard, retain/LWT, session reconnect/expiry, duplicate client ID, MQTT 3.1/5 reject.
-- [ ] Retained cap hoạt động; restart retained rỗng; counter replace/clear chính xác.
-- [ ] Queue full không làm RAM tăng vô hạn, không ghi/ACK thành công giả, có metric `ingest_rejected_total{reason="queue_full"}`.
-- [ ] `/readyz` phản ánh MQTT listener/telemetry worker/DB; lỗi không lộ secret/payload/DB URL.
-- [ ] `cargo fmt`, clippy `-D warnings`, toàn bộ test sạch; commit `Cargo.lock` nếu dependency Phase 2 được thêm.
+- [x] A03 pass: token sai/device disabled không kết nối hay ghi telemetry; có raw publish attempt sau CONNACK refusal.
+- [x] A05, A06, A07 pass; lỗi commit trả `retryable/storage_unavailable`, không có row/WS event; success ACK chỉ sau repository commit (`tests/telemetry_flow.rs`, `tests/ws_telemetry.rs`).
+- [x] A04 pass ở unit + integration, gồm wildcard/cross-device (`src/core/acl.rs`, `tests/mqtt_acl.rs`).
+- [x] A19 protocol matrix pass: QoS 0/1/2, wildcard, retain/LWT, session reconnect/expiry, duplicate client ID, MQTT 3.1/5 reject (`tests/mqtt_protocol.rs`, `tests/mqtt_auth.rs`).
+- [ ] `mqtt.max_inflight_per_client` chưa có test saturation; QoS smoke tuần tự không chứng minh backpressure khi chạm inflight cap.
+- [x] Retained message/byte cap hoạt động; restart retained rỗng; replace/clear accounting đúng (`tests/attributes_retained.rs`). `iot_retained_cap_rejected_total` được export và có test.
+- [x] Queue full giữ depth đúng capacity; `retryable/queue_full` được publish khi storage vẫn lỗi, không bị head-of-line block bởi ACK đang chờ ingest nếu còn permit; event bị reject không ghi/ACK success và metric `ingest_rejected_total{reason="queue_full"}` tăng (`tests/telemetry_flow.rs::full_ingest_queue_returns_retryable_without_success_ack_and_exports_metric`). Hai lane vẫn chia sẻ tổng 256 permits; nếu tất cả ACK permits đã chiếm, ACK immediate cũng có thể bị drop theo contract, được metric hóa và thiết bị phải retry. Test này không saturation tổng ACK permits.
+- [x] `/readyz` phản ánh MQTT listener, DB và telemetry storage failure; worker exit bất ngờ tắt readiness, MQTT/HTTP dừng và supervisor trả failure. Error response không lộ DB detail (`tests/mqtt_boot.rs`, `tests/http_shell.rs`, `tests/ws_telemetry.rs`, `runtime::supervisor::tests::unexpected_telemetry_worker_exit_stops_services_and_fails`).
+- [x] `cargo fmt --all --check`, clippy `-D warnings`, `cargo test --all` sạch; không thêm dependency nên `Cargo.lock` không đổi.
+
+**Kết luận gate:** Phase 2 chưa PASS toàn bộ cho tới khi có test saturation cho `mqtt.max_inflight_per_client`; checklist protocol matrix ở trên chỉ bao phủ các case đã nêu.
 
 ## 9. Không làm trong Phase 2
 

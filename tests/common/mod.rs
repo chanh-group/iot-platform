@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
-use iot_server::config::schema::MqttConfig;
+use iot_server::config::schema::{MqttConfig, TelemetryConfig};
 use iot_server::config::{self, LoadedConfig};
 use iot_server::core::auth;
 use iot_server::core::events::EventBus;
@@ -251,6 +251,7 @@ pub struct TestAppBuilder {
     max_ws_connections: u64,
     ws_queue_capacity: u64,
     mqtt_config: MqttConfig,
+    telemetry_config: TelemetryConfig,
 }
 
 impl Default for TestAppBuilder {
@@ -264,6 +265,7 @@ impl Default for TestAppBuilder {
             max_ws_connections: 100,
             ws_queue_capacity: 256,
             mqtt_config: MqttConfig::default(),
+            telemetry_config: TelemetryConfig::default(),
         }
     }
 }
@@ -308,6 +310,11 @@ impl TestAppBuilder {
 
     pub fn mqtt_config(mut self, config: MqttConfig) -> Self {
         self.mqtt_config = config;
+        self
+    }
+
+    pub fn telemetry_config(mut self, config: TelemetryConfig) -> Self {
+        self.telemetry_config = config;
         self
     }
 
@@ -357,6 +364,7 @@ impl TestAppBuilder {
                 .flatten()
         })
         .unwrap();
+        loaded.config.telemetry = self.telemetry_config;
         loaded.config.http.max_ws_connections = self.max_ws_connections;
         loaded.config.http.ws_queue_capacity = self.ws_queue_capacity;
         let mut mqtt_config = self.mqtt_config;
@@ -672,6 +680,53 @@ pub async fn raw_connack(
         .unwrap()
         .unwrap();
     buf[..read].to_vec()
+}
+
+/// Attempts a QoS 1 publish on the socket after rejected authentication.
+pub async fn raw_publish_after_refused_connect(
+    addr: SocketAddr,
+    client_id: &str,
+    username: &str,
+    password: &str,
+    topic: &str,
+    payload: &[u8],
+) -> bool {
+    let mut stream =
+        tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(addr))
+            .await
+            .unwrap()
+            .unwrap();
+    stream
+        .write_all(&connect_packet(4, client_id, username, password))
+        .await
+        .unwrap();
+    let mut connack = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut connack))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        connack,
+        [0x20, 0x02, 0x00, 0x04],
+        "raw connect was not refused"
+    );
+
+    let mut body = Vec::new();
+    push_string(&mut body, topic.as_bytes());
+    body.extend_from_slice(&1u16.to_be_bytes());
+    body.extend_from_slice(payload);
+    let remaining_len = u8::try_from(body.len()).expect("test PUBLISH must fit one-byte length");
+    let mut packet = vec![0x32, remaining_len];
+    packet.extend_from_slice(&body);
+    if stream.write_all(&packet).await.is_err() {
+        return false;
+    }
+
+    let mut response = [0u8; 4];
+    matches!(
+        tokio::time::timeout(Duration::from_secs(1), stream.read_exact(&mut response)).await,
+        Ok(Ok(4))
+    ) && response == [0x40, 0x02, 0x00, 0x01]
 }
 
 fn push_string(buf: &mut Vec<u8>, value: &[u8]) {

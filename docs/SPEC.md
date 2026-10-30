@@ -322,7 +322,7 @@ Quy trình update: khóa cập nhật → kiểm tra revision → tạo/validate
 - Tách xác thực node và người dùng; không dùng device token gọi API admin.
 - Không ghi token/password/payload nhạy cảm vào log mặc định. Audit các thay đổi credential, thiết bị và config nhưng redact secret.
 - Readiness false khi DB hoặc task trọng yếu lỗi; health không tiết lộ cấu hình.
-- Metric tối thiểu: active connections, ingest accepted/rejected, queue depth, commit latency/errors, command pending/expired. Không gắn device ID làm label metric toàn cục gây cardinality lớn.
+- Metric tối thiểu: active connections, ingest accepted/rejected, retained-cap rejection (`iot_retained_cap_rejected_total`), queue depth, commit latency/errors, command pending/expired. Không gắn device ID làm label metric toàn cục gây cardinality lớn.
 - Endpoint metrics mặc định tắt; khi bật phải dùng credential máy-đến-máy riêng, không dùng session dashboard, và chỉ mở cho hệ thống giám sát qua network policy hoặc mTLS/reverse proxy. Release phải có alert cho DB/readiness lỗi, disk gần đầy, queue saturation, ingest rejection và backup lỗi.
 
 Shutdown: ngừng nhận kết nối/request mới → dừng producer → drain queue và commit trong deadline → đóng broker/HTTP/DB. Không xác nhận thành công cho item chưa commit. Command chưa kết thúc phục hồi từ SQL; telemetry chưa nhận application ACK do node retry. Hết deadline phải log số lượng còn chờ rồi thoát có kiểm soát.

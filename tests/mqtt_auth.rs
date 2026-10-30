@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use common::{
     TestApp, connack_code, mqtt_connect, mqtt_connect_refused, mqtt_wait_closed, raw_connack,
-    wait_until,
+    raw_publish_after_refused_connect, wait_until,
 };
+use iot_server::config::schema::TelemetryConfig;
 use rumqttc::ConnectReturnCode;
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -47,7 +48,15 @@ async fn valid_token_connects_and_marks_presence() {
 
 #[tokio::test]
 async fn bad_credentials_are_all_refused_with_the_same_code() {
-    let server = TestApp::start().await;
+    let server = TestApp::builder()
+        .telemetry_config(TelemetryConfig {
+            queue_capacity: 16,
+            batch_size: 1,
+            flush_interval_ms: 10,
+            ..TelemetryConfig::default()
+        })
+        .start()
+        .await;
     let device = server.create_device("sensor-refused", true).await;
     let disabled = server.create_device("sensor-disabled", false).await;
     let revoked = server.create_device("sensor-revoked", true).await;
@@ -105,6 +114,39 @@ async fn bad_credentials_are_all_refused_with_the_same_code() {
             mqtt_connect_refused(server.mqtt_addr, client_id, username, token).await,
             ConnectReturnCode::BadUserNamePassword,
             "{label}"
+        );
+    }
+
+    for device_id in [&device.id, &disabled.id] {
+        let token = if device_id == &device.id {
+            "iot_wrong_token"
+        } else {
+            disabled.token.as_str()
+        };
+        assert!(
+            !raw_publish_after_refused_connect(
+                server.mqtt_addr,
+                device_id,
+                device_id,
+                token,
+                &format!("devices/{device_id}/telemetry"),
+                br#"{"event_id":"unauthorized-attempt","values":{"x":1}}"#,
+            )
+            .await,
+            "refused authentication must not receive a PUBACK"
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    for device_id in [&device.id, &disabled.id] {
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM telemetry_events WHERE device_id = ?")
+                .bind(device_id)
+                .fetch_one(&server.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows, 0,
+            "refused MQTT authentication must not store telemetry"
         );
     }
 
