@@ -3,11 +3,14 @@
 //! Deny is the default. A denied publish closes the connection (RMQTT sends
 //! no PUBACK); a denied subscribe returns SUBACK failure and keeps it.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use rmqtt::codec::v5::SubscribeAckReason;
 use rmqtt::hook::{Handler, HookResult, Parameter, ReturnType};
 use rmqtt::types::{PublishAclResult, SubscribeAclResult};
 
+use super::presence::ConnectionLimiter;
 use super::server_publish::AckHandle;
 use crate::core::acl;
 use crate::core::attributes;
@@ -22,21 +25,24 @@ use crate::storage::sqlite::attributes::AttributeHandle;
 pub struct AclHooks {
     ingest: Option<(IngestHandle, AttributeHandle, TelemetryPayload, AckHandle)>,
     max_topic_levels: usize,
+    connections: Arc<ConnectionLimiter>,
 }
 
 impl AclHooks {
     /// Stateless hook; the device identity comes from the session.
     #[must_use]
-    pub(crate) fn new(max_topic_levels: usize) -> Self {
+    pub(crate) fn new(connections: Arc<ConnectionLimiter>, max_topic_levels: usize) -> Self {
         Self {
             ingest: None,
             max_topic_levels,
+            connections,
         }
     }
 
     /// Enables telemetry validation and non-blocking queue submission.
     #[must_use]
     pub(crate) fn with_ingest(
+        connections: Arc<ConnectionLimiter>,
         ingest: IngestHandle,
         attributes: AttributeHandle,
         limits: TelemetryPayload,
@@ -46,7 +52,14 @@ impl AclHooks {
         Self {
             ingest: Some((ingest, attributes, limits, ack)),
             max_topic_levels,
+            connections,
         }
+    }
+
+    fn device_enabled(&self, device_id: &str) -> bool {
+        self.connections
+            .device_can_exchange(device_id)
+            .unwrap_or(false)
     }
 }
 
@@ -57,7 +70,8 @@ impl Handler for AclHooks {
             Parameter::MessagePublishCheckAcl(session, publish) => {
                 let device_id: &str = &session.id.client_id;
                 let topic: &str = &publish.topic;
-                let allowed = acl::can_publish_with_limit(device_id, topic, self.max_topic_levels);
+                let allowed = self.device_enabled(device_id)
+                    && acl::can_publish_with_limit(device_id, topic, self.max_topic_levels);
                 let telemetry_topic = format!("devices/{device_id}/telemetry");
                 let attributes_topic = format!("devices/{device_id}/attributes");
                 let retained_telemetry =
@@ -190,8 +204,8 @@ impl Handler for AclHooks {
             Parameter::ClientSubscribeCheckAcl(session, subscribe) => {
                 let device_id: &str = &session.id.client_id;
                 let filter: &str = &subscribe.topic_filter;
-                let allowed =
-                    acl::can_subscribe_with_limit(device_id, filter, self.max_topic_levels);
+                let allowed = self.device_enabled(device_id)
+                    && acl::can_subscribe_with_limit(device_id, filter, self.max_topic_levels);
                 if !allowed {
                     tracing::warn!(%device_id, %filter, "mqtt subscribe denied by acl");
                 }

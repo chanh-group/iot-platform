@@ -113,6 +113,7 @@ Mặc định deny. Bảng dưới là toàn bộ quyền của một device:
 | SUBSCRIBE | `devices/{self}/data/#` hoặc filter con của nó |
 
 - ACL kiểm tra tại PUBLISH và SUBSCRIBE. RMQTT 0.24 không có hook từ chối lúc giao message (`MessageDelivered` chỉ thay payload), nên quyền đọc được chốt bằng filter đã duyệt: mọi filter được allow đều nằm trong `devices/{self}/`, wildcard không thể match topic của thiết bị khác.
+- Disable đặt RAM deny fence ngay trước commit: ACL từ chối PUBLISH/SUBSCRIBE mới từ session cũ, đồng thời server từ chối publish mới hướng tới device disabled. Traffic ứng dụng mới bị chặn hai chiều kể cả khi kick lỗi; packet đã queue/in-flight trước fence không thể thu hồi qua RMQTT 0.24 và còn tùy thuộc việc đóng connection. Admission gate chỉ chặn kết nối mới trong lúc chờ handshake cũ.
 - Publish vào topic server-only (`telemetry/ack`, `commands`) bị từ chối.
 - Publish retained vào `telemetry` hoặc `attributes`: message **bị từ chối ở broker ACL trước retained storage**, không ingest/xử lý; với telemetry có `event_id` hợp lệ, server gửi ACK `rejected/retained_not_allowed`. Publish retained vào topic server-only (`telemetry/ack`, `commands`, `commands/ack`) bị ACL từ chối.
 - Publish ACL deny: message không được route, RMQTT đóng connection và không gửi PUBACK; không ghi telemetry.
@@ -289,7 +290,7 @@ Device ACK `devices/{id}/commands/ack`, QoS 0/1:
 - Server publish command/ACK bằng `FromType::System` với id `$server`; không phải MQTT login, không qua ACL device.
 - Command/ACK dùng QoS 1 để có ít nhất một lần giao trong session; node phải dedup.
 - Thứ tự publish trên cùng topic/session do broker bảo đảm theo QoS; application không cam kết ordering giữa các device.
-- Khi rotate/disable: commit SQL → kick connection. Nếu kick lỗi, retry có giới hạn, metric + readiness false; token cũ đã không thể reconnect.
+- Khi rotate/disable: chặn auth handshake đang chờ, commit SQL → kick connection qua worker bounded được supervisor theo dõi; tối đa 8 device kick chạy đồng thời, tối đa 32 job chờ. Hủy HTTP request không hủy kick. Nếu kick lỗi, retry có giới hạn rồi thử emergency kick qua broker adapter. Nếu cả hai đường đều lỗi, increment metric, hạ readiness, dừng MQTT listener và để supervisor thoát process; RAM deny fence chặn traffic ứng dụng mới từ device và server tới device disabled trong thời gian này. Session TCP hiện tại có thể còn mở đến khi process thoát; packet đã queue/in-flight trước fence không được thu hồi. Đây là ngoại lệ fail-closed, không tương đương kick thành công. Với HTTP disable, trả `503 device_kick_failed` dù thay đổi SQL đã commit. Token cũ đã không thể reconnect. Khi broker không phản hồi, một đợt 8 kick có thể mất tối đa khoảng 18.3 giây; các đợt sau có thể vượt HTTP timeout, dù job vẫn tiếp tục sau khi request timeout.
 - Shutdown: dừng accept, kick toàn bộ session đang mở, chờ ngắn rồi abort listener. `abort` một mình chỉ nhả port, **không** đóng session; phải kick trước.
 - Duplicate `client_id`: broker đóng connection cũ trước khi nhận connection mới; presence dùng generation để sự kiện disconnect cũ không ghi đè trạng thái mới.
 
@@ -518,8 +519,8 @@ LIMIT ?;
 | `auth.login` | admin | user | `username` |
 | `auth.logout` | admin | session | không có |
 | `device.create` | admin | device | `name`, `enabled` |
-| `device.update` | admin | device | danh sách field đổi; `enabled` from/to |
-| `device.enable` / `device.disable` | admin | device | `enabled` |
+| `device.update` | admin | device | `name`/`metadata` có đổi (`true`/`false`) |
+| `device.enable` / `device.disable` | admin | device | `enabled_from`, `enabled_to` |
 | `credential.rotate` | admin | device | `old_credential_id`, `new_credential_id` |
 | `command.create` | admin | command | `name`, `expires_at` |
 | `config.update` | admin | config | `old_revision`, `new_revision`, danh sách path đổi |
@@ -637,7 +638,7 @@ Query: `limit`, `cursor`, `q` (tùy chọn, 2..64 ký tự, tìm trong name/id),
 
 - Partial; ít nhất một trường; unknown field → 400.
 - `metadata` khi có mặt **thay thế toàn bộ** object, không merge.
-- Disable: commit rồi kick; 200 device mới.
+- Disable: chặn auth handshake đang chờ, commit rồi giao kick cho worker được supervisor theo dõi; 200 device mới sau khi kick xong. HTTP timeout không hủy kick. Nếu kick lỗi sau retry/emergency, trả 503 `device_kick_failed`; thay đổi vẫn đã commit.
 - Enable không tự kết nối lại.
 - 404/409 như trên.
 
@@ -845,7 +846,7 @@ Query: `limit` (mặc định 50, max 200), `cursor`, `status` (một giá trị
 - Mặc định tắt (`[http] metrics = false` → 404).
 - Khi bật, **không** dùng session cookie: bắt buộc `http.metrics_bearer_token_env` trỏ tới environment variable có token ngẫu nhiên tối thiểu 32 byte. Yêu cầu `Authorization: Bearer <token>`; thiếu/sai trả 401. Token không bao giờ xuất hiện trong API, log hay `GET /config`.
 - Production đặt endpoint sau reverse proxy/mTLS hoặc network policy chỉ cho Prometheus. Không bật metrics nếu không có một trong các lớp mạng đó.
-- Tên metric tối thiểu: `iot_mqtt_connections_active`, `iot_ingest_accepted_total`, `iot_ingest_rejected_total{reason}`, `iot_retained_cap_rejected_total`, `iot_telemetry_queue_depth`, `iot_telemetry_commit_seconds` (histogram), `iot_telemetry_commit_errors_total`, `iot_commands_pending`, `iot_commands_expired_total`, `iot_ws_clients`, `iot_ws_dropped_total`.
+- Tên metric tối thiểu: `iot_mqtt_connections_active`, `iot_mqtt_kick_failures_total`, `iot_ingest_accepted_total`, `iot_ingest_rejected_total{reason}`, `iot_retained_cap_rejected_total`, `iot_telemetry_queue_depth`, `iot_telemetry_commit_seconds` (histogram), `iot_telemetry_commit_errors_total`, `iot_commands_pending`, `iot_commands_expired_total`, `iot_ws_clients`, `iot_ws_dropped_total`.
 - Không dùng device ID làm label.
 
 ### 4.8. WebSocket

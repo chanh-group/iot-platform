@@ -132,7 +132,7 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
         telemetry_ready,
         events,
         presence,
-        mqtt.presence_failure(),
+        mqtt.control(),
     );
     let app = router::build(state.clone());
 

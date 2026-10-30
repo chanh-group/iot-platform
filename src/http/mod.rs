@@ -20,7 +20,8 @@ use tokio::sync::Semaphore;
 use crate::config::LoadedConfig;
 use crate::core::events::EventBus;
 use crate::core::presence::Presence;
-use crate::mqtt::server::PresenceFailure;
+use crate::mqtt::presence::DeviceAdmission;
+use crate::mqtt::server::{DeviceKickQueue, MqttControl, MqttFailure};
 use middleware::LoginRateLimiter;
 
 /// Shared handler state: database pool, config, login limiter, and task readiness.
@@ -40,10 +41,14 @@ pub struct AppState {
     pub telemetry_ready: Arc<AtomicBool>,
     /// Best-effort event stream shared with the telemetry worker.
     pub events: EventBus,
+    /// Blocks new MQTT authentication while a committed disable is kicked.
+    pub(crate) device_admission: DeviceAdmission,
+    /// Bounded, server-owned device-kick worker.
+    pub(crate) device_kicks: DeviceKickQueue,
     /// Registry shared with the MQTT listener.
     pub presence: Arc<Presence>,
-    /// Signals a poisoned presence registry to the MQTT supervisor.
-    pub presence_failure: PresenceFailure,
+    /// Signals a fatal MQTT failure to the supervisor.
+    pub mqtt_failure: MqttFailure,
     /// Limits active WebSocket connections before upgrade.
     pub ws_connections: Arc<Semaphore>,
 }
@@ -57,7 +62,7 @@ impl AppState {
         telemetry_ready: Arc<AtomicBool>,
         events: EventBus,
         presence: Arc<Presence>,
-        presence_failure: PresenceFailure,
+        mqtt_control: MqttControl,
     ) -> Self {
         let max_ws_connections =
             usize::try_from(config.config.http.max_ws_connections).unwrap_or(usize::MAX);
@@ -73,8 +78,10 @@ impl AppState {
             mqtt_ready,
             telemetry_ready,
             events,
+            device_admission: mqtt_control.device_admission,
+            device_kicks: mqtt_control.device_kicks,
             presence,
-            presence_failure,
+            mqtt_failure: mqtt_control.failure,
             ws_connections: Arc::new(Semaphore::new(max_ws_connections)),
         }
     }

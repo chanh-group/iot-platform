@@ -25,5 +25,5 @@ pub trait DeviceChannel: Send + Sync {
     async fn kick(&self, device_id: &str) -> Result<(), DeviceChannelError>;
 
     /// Returns whether the device currently has an active session.
-    async fn is_online(&self, device_id: &str) -> bool;
+    async fn is_online(&self, device_id: &str) -> Result<bool, DeviceChannelError>;
 }

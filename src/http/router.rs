@@ -34,8 +34,14 @@ pub fn build(state: AppState) -> Router {
         .route("/api/v1/auth/login", routing::post(auth::login))
         .route("/api/v1/auth/logout", routing::post(auth::logout))
         .route("/api/v1/auth/me", routing::get(auth::me))
-        .route("/api/v1/devices", routing::get(devices::list))
-        .route("/api/v1/devices/{id}", routing::get(devices::get))
+        .route(
+            "/api/v1/devices",
+            routing::get(devices::list).post(devices::create),
+        )
+        .route(
+            "/api/v1/devices/{id}",
+            routing::get(devices::get).patch(devices::patch),
+        )
         .route(
             "/api/v1/devices/{id}/telemetry",
             routing::get(telemetry::history),

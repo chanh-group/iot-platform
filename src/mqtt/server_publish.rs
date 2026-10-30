@@ -7,8 +7,12 @@ use rmqtt::types::{CodecPublish, From, Id, Publish, QoS};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::{Semaphore, mpsc};
 
+use crate::core::device_channel::{DeviceChannel, DeviceChannelError};
+use crate::core::presence::Presence;
 use crate::core::telemetry::IngestResult;
 use crate::observability::metrics::Metrics;
+
+use super::presence::ConnectionLimiter;
 
 const ACK_QUEUE_CAPACITY: usize = 256;
 
@@ -93,11 +97,15 @@ impl AckHandle {
 }
 
 #[derive(Clone)]
-pub(crate) struct ServerPublisher(ServerContext);
+pub(crate) struct ServerPublisher(ServerContext, Arc<Presence>, Arc<ConnectionLimiter>);
 
 impl ServerPublisher {
-    pub(crate) fn new(context: ServerContext) -> Self {
-        Self(context)
+    pub(crate) fn new(
+        context: ServerContext,
+        presence: Arc<Presence>,
+        connections: Arc<ConnectionLimiter>,
+    ) -> Self {
+        Self(context, presence, connections)
     }
 
     pub(crate) async fn telemetry_ack(
@@ -105,9 +113,21 @@ impl ServerPublisher {
         device_id: &str,
         payload: &[u8],
     ) -> anyhow::Result<()> {
+        let topic = format!("devices/{device_id}/telemetry/ack");
+        self.publish_device(device_id, &topic, payload).await
+    }
+
+    async fn publish_device(
+        &self,
+        device_id: &str,
+        topic: &str,
+        payload: &[u8],
+    ) -> anyhow::Result<()> {
+        if !self.2.device_can_exchange(device_id).unwrap_or(false) {
+            anyhow::bail!("device session is disabled");
+        }
         let id = Id::new(self.0.node.id(), 0, None, None, device_id.into(), None);
         let from_id = Id::new(self.0.node.id(), 0, None, None, "$server".into(), None);
-        let topic = format!("devices/{device_id}/telemetry/ack");
         let publish = Publish::new(
             Box::new(CodecPublish {
                 dup: false,
@@ -129,7 +149,40 @@ impl ServerPublisher {
             .entry(id)
             .publish(From::from_system(from_id), publish)
             .await
-            .map_err(|(_, _, reason)| anyhow::anyhow!("telemetry ACK publish failed: {reason:?}"))
+            .map_err(|(_, _, reason)| anyhow::anyhow!("server publish failed: {reason:?}"))
+    }
+
+    async fn kick_device(&self, device_id: &str) -> anyhow::Result<()> {
+        let id = Id::new(self.0.node.id(), 0, None, None, device_id.into(), None);
+        let mut entry = self.0.extends.shared().await.entry(id);
+        entry.kick(true, true, true).await?;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl DeviceChannel for ServerPublisher {
+    async fn publish(
+        &self,
+        device_id: &str,
+        topic: &str,
+        payload: &[u8],
+    ) -> Result<(), DeviceChannelError> {
+        self.publish_device(device_id, topic, payload)
+            .await
+            .map_err(|_| DeviceChannelError::Unavailable)
+    }
+
+    async fn kick(&self, device_id: &str) -> Result<(), DeviceChannelError> {
+        self.kick_device(device_id)
+            .await
+            .map_err(|_| DeviceChannelError::Unavailable)
+    }
+
+    async fn is_online(&self, device_id: &str) -> Result<bool, DeviceChannelError> {
+        self.1
+            .is_online(device_id)
+            .map_err(|_| DeviceChannelError::Unavailable)
     }
 }
 

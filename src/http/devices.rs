@@ -1,20 +1,46 @@
-//! Read-only device administration queries.
+//! Device administration HTTP handlers.
+
+use std::net::SocketAddr;
 
 use axum::Json;
-use axum::extract::{Path, Query, State, rejection::QueryRejection};
+use axum::extract::{ConnectInfo, Path, Query, State, rejection::QueryRejection};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::oneshot;
+use uuid::Uuid;
 
 use crate::core::auth;
-use crate::core::domain_error::DomainError;
+use crate::core::device;
+use crate::core::domain_error::{DomainError, FieldError};
 use crate::observability::request_id::RequestId;
+use crate::storage::sqlite::audit::{self, AuditEvent};
 use crate::storage::sqlite::devices::{self, DeviceRow};
 
 use super::AppState;
 use super::api_error::ApiError;
 use super::auth::AuthSession;
+use super::middleware::ApiJson;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateDeviceRequest {
+    name: String,
+    #[serde(default = "empty_metadata")]
+    metadata: Value,
+    #[serde(default = "enabled_by_default")]
+    enabled: bool,
+}
+
+fn empty_metadata() -> Value {
+    json!({})
+}
+
+const fn enabled_by_default() -> bool {
+    true
+}
 
 #[derive(Deserialize)]
 pub struct ListQuery {
@@ -32,6 +58,286 @@ struct Cursor {
     id: String,
     q: Option<String>,
     enabled: Option<bool>,
+}
+
+/// Creates a device and its first credential atomically.
+pub async fn create(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    AuthSession(session): AuthSession,
+    RequestId(request_id): RequestId,
+    ApiJson(payload): ApiJson<CreateDeviceRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let mut errors = Vec::new();
+    let name = device::validate_name(&payload.name)
+        .map_err(|field| errors.push(field))
+        .ok();
+    let metadata_json = device::validate_metadata(&payload.metadata)
+        .map_err(|field| errors.push(field))
+        .ok();
+    if !errors.is_empty() {
+        return Err(validation_error(errors, &request_id));
+    }
+    let name = name.ok_or_else(|| internal_error("validated device name missing", &request_id))?;
+    let metadata_json = metadata_json
+        .ok_or_else(|| internal_error("validated device metadata missing", &request_id))?;
+
+    let id = Uuid::now_v7().to_string();
+    let credential_id = Uuid::now_v7().to_string();
+    let token = format!(
+        "iot_{}",
+        auth::generate_session_token().map_err(|error| {
+            ApiError::from_domain(DomainError::Internal(error.into()), request_id.clone())
+        })?
+    );
+    let token_hash = auth::hash_token(&token);
+    let now = auth::now_ms();
+    let remote_ip = peer.ip().to_string();
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|error| storage_error(error, &request_id))?;
+    if let Err(db_error) = devices::insert_with_credential(
+        &mut tx,
+        &devices::NewDevice {
+            id: &id,
+            name: &name,
+            metadata_json: &metadata_json,
+            enabled: payload.enabled,
+            created_at: now,
+            credential_id: &credential_id,
+            token_hash: &token_hash,
+        },
+    )
+    .await
+    {
+        if is_device_name_conflict(&db_error) {
+            return Err(error(
+                StatusCode::CONFLICT,
+                "device_name_conflict",
+                "device name already exists",
+                &request_id,
+            ));
+        }
+        return Err(storage_error(db_error, &request_id));
+    }
+    let details = json!({"name": name, "enabled": payload.enabled}).to_string();
+    audit::insert(
+        &mut tx,
+        now,
+        &AuditEvent {
+            actor_type: "admin",
+            actor_id: Some(&session.user_id),
+            action: "device.create",
+            target_type: Some("device"),
+            target_id: Some(&id),
+            request_id: Some(&request_id),
+            remote_ip: Some(&remote_ip),
+            details_json: Some(&details),
+        },
+    )
+    .await
+    .map_err(|error| storage_error(error, &request_id))?;
+    tx.commit()
+        .await
+        .map_err(|error| storage_error(error, &request_id))?;
+
+    let metadata = payload.metadata;
+    let created = json!({
+        "id": id,
+        "name": name,
+        "enabled": payload.enabled,
+        "online": false,
+        "metadata": metadata,
+        "created_at": now,
+        "updated_at": now,
+        "last_seen_at": null,
+        "credential": {"id": credential_id, "created_at": now},
+    });
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "device": created,
+            "credential": {"id": credential_id, "token": token, "created_at": now},
+        })),
+    )
+        .into_response())
+}
+
+/// Partially updates a device; disabling commits before its session is kicked.
+pub async fn patch(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    AuthSession(session): AuthSession,
+    RequestId(request_id): RequestId,
+    Path(id): Path<String>,
+    ApiJson(body): ApiJson<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let patch =
+        device::validate_patch(&body).map_err(|errors| validation_error(errors, &request_id))?;
+    let kick_reservation = if patch.enabled == Some(false) {
+        let permit = state.device_kicks.reserve().await.map_err(|_| {
+            state
+                .mqtt_failure
+                .report_failure("device kick worker is unavailable");
+            error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                "device kick unavailable",
+                &request_id,
+            )
+        })?;
+        let admission = state.device_admission.block(&id).map_err(|failure| {
+            state.mqtt_failure.report_failure(failure);
+            error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                "device admission unavailable",
+                &request_id,
+            )
+        })?;
+        admission.wait_for_pending().await.map_err(|failure| {
+            state.mqtt_failure.report_failure(failure);
+            error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                "device admission unavailable",
+                &request_id,
+            )
+        })?;
+        Some((permit, admission))
+    } else {
+        None
+    };
+    let now = auth::now_ms();
+    let remote_ip = peer.ip().to_string();
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(|error| storage_error(error, &request_id))?;
+    let old_device = devices::get_on_connection(&mut tx, &id)
+        .await
+        .map_err(|error| storage_error(error, &request_id))?
+        .ok_or_else(|| {
+            error(
+                StatusCode::NOT_FOUND,
+                "device_not_found",
+                "device not found",
+                &request_id,
+            )
+        })?;
+    if let Err(db_error) = devices::update(
+        &mut tx,
+        &id,
+        patch.name.as_deref(),
+        patch.metadata_json.as_deref(),
+        patch.enabled,
+        now,
+    )
+    .await
+    {
+        if is_device_name_conflict(&db_error) {
+            return Err(error(
+                StatusCode::CONFLICT,
+                "device_name_conflict",
+                "device name already exists",
+                &request_id,
+            ));
+        }
+        return Err(storage_error(db_error, &request_id));
+    }
+    let enabled_change = patch
+        .enabled
+        .filter(|enabled| *enabled != old_device.enabled);
+    let action = match enabled_change {
+        Some(true) => "device.enable",
+        Some(false) => "device.disable",
+        None => "device.update",
+    };
+    let mut details = json!({
+        "name": patch.name.is_some(),
+        "metadata": patch.metadata_json.is_some(),
+    });
+    if let Some(enabled) = enabled_change {
+        details["enabled_from"] = json!(old_device.enabled);
+        details["enabled_to"] = json!(enabled);
+    }
+    let details = details.to_string();
+    audit::insert(
+        &mut tx,
+        now,
+        &AuditEvent {
+            actor_type: "admin",
+            actor_id: Some(&session.user_id),
+            action,
+            target_type: Some("device"),
+            target_id: Some(&id),
+            request_id: Some(&request_id),
+            remote_ip: Some(&remote_ip),
+            details_json: Some(&details),
+        },
+    )
+    .await
+    .map_err(|error| storage_error(error, &request_id))?;
+    if let Some((_, admission)) = &kick_reservation {
+        admission.set_device_enabled(false).map_err(|failure| {
+            state.mqtt_failure.report_failure(failure);
+            error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                "device admission unavailable",
+                &request_id,
+            )
+        })?;
+    }
+    let (commit_sender, kick_completion) = if let Some((permit, admission)) = kick_reservation {
+        let (commit_sender, committed) = oneshot::channel();
+        let completion = permit.enqueue(id.clone(), admission, committed);
+        (Some(commit_sender), Some(completion))
+    } else {
+        (None, None)
+    };
+    if let Err(error) = tx.commit().await {
+        drop(commit_sender);
+        return Err(storage_error(error, &request_id));
+    }
+    if let Some(commit_sender) = commit_sender {
+        let _ = commit_sender.send(true);
+    }
+    if patch.enabled == Some(true) {
+        state
+            .device_admission
+            .set_device_enabled(&id, true)
+            .map_err(|failure| {
+                state.mqtt_failure.report_failure(failure);
+                error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "service_unavailable",
+                    "device admission unavailable",
+                    &request_id,
+                )
+            })?;
+    }
+    if let Some(kick_completion) = kick_completion {
+        match kick_completion.await {
+            Ok(Ok(())) => {}
+            Ok(Err(())) | Err(_) => {
+                return Err(error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "device_kick_failed",
+                    "device session could not be closed",
+                    &request_id,
+                ));
+            }
+        }
+    }
+    let row = devices::get(&state.pool, &id)
+        .await
+        .map_err(|error| storage_error(error, &request_id))?
+        .ok_or_else(|| internal_error("device disappeared after update", &request_id))?;
+    Ok(Json(render(&state, row, &request_id)?))
 }
 
 /// Lists device summaries in descending creation order.
@@ -151,7 +457,7 @@ pub async fn get(
 
 fn render(state: &AppState, row: DeviceRow, request_id: &str) -> Result<Value, ApiError> {
     let online = state.presence.is_online(&row.id).map_err(|failure| {
-        state.presence_failure.report(failure);
+        state.mqtt_failure.report_failure(failure);
         error(
             StatusCode::SERVICE_UNAVAILABLE,
             "service_unavailable",
@@ -187,4 +493,27 @@ fn storage_error(error: sqlx::Error, request_id: &str) -> ApiError {
 
 fn error(status: StatusCode, code: &'static str, message: &str, request_id: &str) -> ApiError {
     ApiError::new(status, code, message.to_owned(), request_id.to_owned())
+}
+
+fn validation_error(fields: Vec<FieldError>, request_id: &str) -> ApiError {
+    ApiError::from_domain(
+        DomainError::Validation {
+            message: "invalid device fields".to_owned(),
+            details: fields,
+        },
+        request_id.to_owned(),
+    )
+}
+
+fn internal_error(error: impl std::fmt::Display, request_id: &str) -> ApiError {
+    ApiError::from_domain(
+        DomainError::Internal(anyhow::anyhow!("{error}")),
+        request_id.to_owned(),
+    )
+}
+
+fn is_device_name_conflict(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .is_some_and(|error| error.message().contains("devices.name"))
 }

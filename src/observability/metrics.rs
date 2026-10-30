@@ -104,6 +104,7 @@ const COMMIT_BUCKETS_MICROS: [u64; 11] = [
 #[derive(Debug, Default)]
 pub struct Metrics {
     pub mqtt_connections_active: Gauge,
+    pub mqtt_kick_failures_total: Counter,
     pub ingest_accepted_total: Counter,
     pub ingest_rejected_total: Counter,
     pub ingest_rejected_reasons: [Counter; 6],
@@ -167,6 +168,11 @@ impl Metrics {
             &mut output,
             "iot_ingest_accepted_total",
             self.ingest_accepted_total.get(),
+        );
+        counter(
+            &mut output,
+            "iot_mqtt_kick_failures_total",
+            self.mqtt_kick_failures_total.get(),
         );
         counter(
             &mut output,
@@ -262,8 +268,10 @@ mod tests {
         let metrics = Metrics::new();
         metrics.reject_ingest(IngestRejectReason::QueueFull);
         metrics.observe_telemetry_commit(20_000);
+        metrics.mqtt_kick_failures_total.inc();
         let exposition = metrics.render_prometheus();
         assert!(exposition.contains("reason=\"queue_full\"} 1"));
+        assert!(exposition.contains("iot_mqtt_kick_failures_total 1"));
         assert!(exposition.contains("iot_telemetry_commit_seconds_bucket{le=\"0.025\"} 1"));
         assert!(exposition.contains("iot_telemetry_commit_seconds_count 1"));
         assert!(!exposition.contains("device_id"));

@@ -57,17 +57,40 @@ impl AuthHooks {
         match devices::active_credential(&self.pool, username).await {
             Ok(Some(credential))
                 if credential.device_enabled
-                    && auth::token_matches(&credential.token_hash, token) =>
-            {
-                match self.connections.try_reserve(username) {
-                    Ok(true) => AuthResult::Allow(false, None),
-                    Ok(false) | Err(_) => AuthResult::NotAuthorized,
-                }
-            }
+                    && auth::token_matches(&credential.token_hash, token) => {}
             // Unknown, disabled, revoked and wrong-token are indistinguishable.
-            Ok(_) => AuthResult::BadUsernameOrPassword,
+            Ok(_) => return AuthResult::BadUsernameOrPassword,
             Err(error) => {
                 tracing::error!(%error, "device credential lookup failed");
+                return AuthResult::NotAuthorized;
+            }
+        };
+        match self.connections.try_reserve(username) {
+            Ok(true) => {}
+            Ok(false) | Err(_) => return AuthResult::NotAuthorized,
+        }
+
+        // Reserve before the final read so a concurrent disable either sees this
+        // handshake and waits for it to become active, or makes this read fail.
+        match devices::active_credential(&self.pool, username).await {
+            Ok(Some(current))
+                if current.device_enabled && auth::token_matches(&current.token_hash, token) =>
+            {
+                match self.connections.set_device_enabled(username, true) {
+                    Ok(()) => AuthResult::Allow(false, None),
+                    Err(_) => {
+                        let _ = self.connections.cancel_reservation(username);
+                        AuthResult::NotAuthorized
+                    }
+                }
+            }
+            Ok(_) => {
+                let _ = self.connections.cancel_reservation(username);
+                AuthResult::BadUsernameOrPassword
+            }
+            Err(error) => {
+                let _ = self.connections.cancel_reservation(username);
+                tracing::error!(%error, "device credential recheck failed");
                 AuthResult::NotAuthorized
             }
         }

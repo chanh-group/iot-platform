@@ -108,7 +108,7 @@ MVP không cam kết session/retained state sống qua process restart. Session 
 - `client_id` phải khớp quy tắc của thiết bị; MVP dùng một kết nối hoạt động/thiết bị.
 - Kết nối mới cùng client ID thay thế kết nối cũ theo MQTT; cập nhật trạng thái bằng connection generation để tránh sự kiện cũ ghi đè trạng thái mới.
 - Không tin `device_id` do payload tự khai báo; kiểm tra với danh tính kết nối.
-- Thiết bị bị disable hoặc thu hồi credential phải bị ngắt kết nối đang mở và bị từ chối reconnect.
+- Thiết bị bị disable hoặc thu hồi credential phải bị ngắt kết nối đang mở và bị từ chối reconnect khi broker thực hiện được kick. Ngoại lệ fail-closed: nếu cả primary và emergency kick đều thất bại sau retry, deny fence chặn traffic ứng dụng mới, MQTT listener dừng và supervisor thoát process; không bảo đảm socket hiện tại đóng ngay trước khi process thoát, cũng không thu hồi packet đã queue/in-flight trước fence.
 
 | Topic | Node publish | Node subscribe | Ý nghĩa |
 | --- | --- | --- | --- |
@@ -403,6 +403,7 @@ Bắt đầu bằng một Rust crate; chỉ tách workspace khi ranh giới modu
 | A17 | Docker recreate với cùng volume | Giữ thiết bị, credential, telemetry và runtime config |
 | A18 | Mỗi backend SQL được công bố hỗ trợ | Cùng bộ integration test và backup/restore pass |
 | A19 | Broker protocol suite | Kiểm thử QoS, wildcard, retain, LWT, session, duplicate client ID phù hợp ma trận hỗ trợ |
+| A20 | Disable device khi cả primary và emergency kick đều thất bại | Thay đổi SQL vẫn commit và HTTP trả 503; deny fence chặn traffic ứng dụng mới, readiness xuống, MQTT listener dừng và supervisor thoát process. Đây là ngoại lệ fail-closed: không cam kết socket đang mở đóng trước khi process thoát hoặc packet đã queue/in-flight trước fence bị thu hồi. |
 
 Kiểm thử gồm unit test validation/ACL/state machine, integration test MQTT→SQL→REST/WebSocket, crash recovery và backend compatibility. Load test phải ghi rõ hardware, engine, kích thước message, QoS, số connection, tốc độ ingest, p95 latency, RAM và disk growth. Chưa đặt throughput thành cam kết release trước khi có kết quả đo.
 
