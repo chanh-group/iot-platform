@@ -38,13 +38,14 @@ Nguồn sự thật:
 
 ## 2. DeviceChannel, rotate và kick — P3-02
 
-- [ ] Implement adapter `DeviceChannel` cho RMQTT: server publish principal `$server`, QoS 1 non-retained, kick session và online check; không để type RMQTT rò vào core. Tái sử dụng đường server publish đã có, không tạo MQTT client nội bộ.
-- [ ] Nối `PresenceError`/connection limiter failure với readiness và supervisor hiện có; không dùng dữ liệu mutex đã poison. Kiểm tra mọi caller nếu cần điều chỉnh port `DeviceChannel::is_online` để biểu diễn lỗi.
-- [ ] `POST /api/v1/devices/{id}/credentials/rotate`: `BEGIN IMMEDIATE` → revoke active cũ → insert active mới/`rotated_from` → audit → commit → kick. Device disabled vẫn rotate được; không tồn tại → 404.
-- [ ] Token mới chỉ xuất hiện một lần trong response rotate; token cũ bị từ chối reconnect bằng CONNACK `0x04`. Không trả thành công mutation nếu transaction chưa commit.
-- [ ] Disable/rotate không giữ transaction khi chờ broker. Kick lỗi phải retry có giới hạn, metric + readiness false theo `02` §2.10; không rollback credential đã commit hoặc ngầm coi kick thất bại là thành công.
-- [ ] Test A14/H7 trong `tests/credential_rotate.rs`: kết nối thật bị đóng; token cũ không reconnect, token mới hoạt động; disabled vẫn rotate được; rollback khi audit lỗi; inject kick failure kiểm chứng retry/readiness. Kiểm tra reconnect/duplicate client ID không để lại session dùng credential cũ sau thao tác thành công.
-- [ ] Test disable online tương tự: kick connection, từ chối reconnect và không nhận thêm telemetry từ session đã bị ngắt.
+- [x] Implement adapter `DeviceChannel` cho RMQTT: server publish principal `$server`, QoS 1 non-retained, kick session và online check; không để type RMQTT rò vào core. Tái sử dụng đường server publish đã có, không tạo MQTT client nội bộ. Evidence: `src/mqtt/server.rs::device_channel_publishes_server_qos1_non_retained_and_reads_presence`; real kick/token evidence `tests/credential_rotate.rs::rotates_an_online_device_and_rejects_the_previous_token`.
+- [x] Nối `PresenceError`/connection limiter failure với readiness và supervisor hiện có; không dùng dữ liệu mutex đã poison. Kiểm tra mọi caller nếu cần điều chỉnh port `DeviceChannel::is_online` để biểu diễn lỗi. Evidence: `src/mqtt/server.rs::http_presence_failure_stops_mqtt_listener`, `presence_failure_stops_real_rmqtt_listener`; `src/mqtt/presence.rs::poisoned_limiter_fails_closed_and_signals_shutdown`, `fatal_failure_keeps_device_fences_until_shutdown` (fail-closed + concurrent re-enable). Port không đổi.
+- [x] `POST /api/v1/devices/{id}/credentials/rotate`: `BEGIN IMMEDIATE` → revoke active cũ → insert active mới/`rotated_from` → audit → commit → kick. Device disabled vẫn rotate được; không tồn tại → 404. Evidence: `tests/credential_rotate.rs::rotates_an_online_device_and_rejects_the_previous_token`, `rotates_disabled_device_without_enabling_it`, `missing_device_returns_not_found`.
+- [x] Token mới chỉ xuất hiện một lần trong response rotate; token cũ bị từ chối reconnect bằng CONNACK `0x04`. Không trả thành công mutation nếu transaction chưa commit. Evidence: `tests/credential_rotate.rs::rotates_an_online_device_and_rejects_the_previous_token`, `audit_failure_rolls_back_rotation_and_preserves_old_credential`.
+- [x] Disable/rotate không giữ transaction khi chờ broker. Kick lỗi phải retry có giới hạn, metric + readiness false theo `02` §2.10; không rollback credential đã commit hoặc ngầm coi kick thất bại là thành công. Evidence: `src/mqtt/server.rs::rotate_timeout_keeps_kick_running_and_retry_recovers_one_time_token`, `failed_rotate_kicks_leave_sql_enabled_but_fence_the_live_session`.
+- [x] Test A14/H7: real-MQTT integration tests in `tests/credential_rotate.rs` verify kick, old-token rejection, new-token connect, disabled rotation, and audit rollback; `src/mqtt/server.rs::concurrent_rotations_return_tokens_in_serialized_commit_order`, `rotating_an_unrelated_device_does_not_wait_for_a_blocked_kick`, `rotate_waits_for_pre_authorized_handshake_before_commit_and_kick`, `rotate_timeout_keeps_kick_running_and_retry_recovers_one_time_token`, and `failed_rotate_kicks_leave_sql_enabled_but_fence_the_live_session` cover ordering, cross-device independence, handshake race, cancellation, kick failure, retry, and readiness.
+- [x] Test disable online tương tự: kick connection, từ chối reconnect và không nhận thêm telemetry từ session đã bị ngắt. Evidence: `tests/device_api.rs::disabling_a_device_kicks_its_live_session_and_blocks_reconnect`; ACL-after-timeout `src/mqtt/server.rs::http_timeout_does_not_cancel_a_committed_kick_and_acl_blocks_telemetry`.
+- [ ] A20 process-level PASS remains unverified: the listed tests run the broker in-process and do not prove child-process exit.
 
 ## 3. Command domain, SQL và REST — P3-03, P3-05
 
@@ -156,7 +157,7 @@ Checklist gate (ghi tên test/evidence thực tế khi tick):
 - [ ] A11: resend/reconnect giữ command ID; ACK trùng/cross-device/muộn không làm sai terminal; restart recovery đúng.
 - [ ] A12: runtime PATCH đúng revision lưu bền, có hiệu lực nóng và restart giữ giá trị/revision.
 - [ ] A13: revision cũ/schema/range/restart-required/lỗi ghi từ chối nhất quán, không cập nhật nửa file/RAM.
-- [ ] A14: rotate online kick connection cũ, token cũ refused, token mới OK; disable online cũng kick và chặn reconnect.
+- [x] A14: rotate online kick connection cũ, token cũ refused, token mới OK; disable online cũng kick và chặn reconnect. Evidence: `tests/credential_rotate.rs::rotates_an_online_device_and_rejects_the_previous_token`; `tests/device_api.rs::disabling_a_device_kicks_its_live_session_and_blocks_reconnect`.
 - [ ] Dashboard hoàn thành toàn bộ luồng mục 8; numeric chart/REST backfill và WS reconnect có evidence. A15 regression Phase 2 giữ xanh; gate slow-client/release đầy đủ ở Phase 4 không được claim chỉ từ thao tác tay.
 - [ ] Audit đúng transaction/redaction; metrics/config/log/WS không lộ secret; error response không trả SQL/DB URL/stack trace.
 - [ ] Task dispatcher mới được supervise/cancel; readiness không bị báo healthy giả khi task trọng yếu lỗi; queue ACK command và WS hữu hạn.

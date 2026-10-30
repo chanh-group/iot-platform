@@ -281,20 +281,14 @@ pub async fn patch(
     )
     .await
     .map_err(|error| storage_error(error, &request_id))?;
-    if let Some((_, admission)) = &kick_reservation {
-        admission.set_device_enabled(false).map_err(|failure| {
-            state.mqtt_failure.report_failure(failure);
-            error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "service_unavailable",
-                "device admission unavailable",
-                &request_id,
-            )
-        })?;
-    }
     let (commit_sender, kick_completion) = if let Some((permit, admission)) = kick_reservation {
         let (commit_sender, committed) = oneshot::channel();
-        let completion = permit.enqueue(id.clone(), admission, committed);
+        let completion = permit.enqueue(
+            id.clone(),
+            admission,
+            committed,
+            crate::mqtt::server::DeviceKickRecovery::Disable,
+        );
         (Some(commit_sender), Some(completion))
     } else {
         (None, None)
@@ -338,6 +332,144 @@ pub async fn patch(
         .map_err(|error| storage_error(error, &request_id))?
         .ok_or_else(|| internal_error("device disappeared after update", &request_id))?;
     Ok(Json(render(&state, row, &request_id)?))
+}
+
+/// Replaces the active credential atomically, then waits for the old session kick.
+pub async fn rotate(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    AuthSession(session): AuthSession,
+    RequestId(request_id): RequestId,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let _rotation = state.lock_credential_rotation(&id).await;
+    let permit = state.device_kicks.reserve().await.map_err(|_| {
+        state
+            .mqtt_failure
+            .report_failure("device kick worker is unavailable");
+        error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service_unavailable",
+            "device kick unavailable",
+            &request_id,
+        )
+    })?;
+    let admission = state.device_admission.block(&id).map_err(|failure| {
+        state.mqtt_failure.report_failure(failure);
+        error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service_unavailable",
+            "device admission unavailable",
+            &request_id,
+        )
+    })?;
+    admission.wait_for_pending().await.map_err(|failure| {
+        state.mqtt_failure.report_failure(failure);
+        error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service_unavailable",
+            "device admission unavailable",
+            &request_id,
+        )
+    })?;
+
+    let credential_id = Uuid::now_v7().to_string();
+    let token = format!(
+        "iot_{}",
+        auth::generate_session_token().map_err(|error| {
+            ApiError::from_domain(DomainError::Internal(error.into()), request_id.clone())
+        })?
+    );
+    let token_hash = auth::hash_token(&token);
+    let now = auth::now_ms();
+    let remote_ip = peer.ip().to_string();
+    let mut tx = state
+        .pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(|error| storage_error(error, &request_id))?;
+    let device = devices::get_on_connection(&mut tx, &id)
+        .await
+        .map_err(|error| storage_error(error, &request_id))?
+        .ok_or_else(|| {
+            error(
+                StatusCode::NOT_FOUND,
+                "device_not_found",
+                "device not found",
+                &request_id,
+            )
+        })?;
+    let old_credential_id = device
+        .credential_id
+        .as_deref()
+        .ok_or_else(|| internal_error("device has no active credential", &request_id))?;
+    if !devices::rotate_credential(
+        &mut tx,
+        &id,
+        old_credential_id,
+        &credential_id,
+        &token_hash,
+        now,
+    )
+    .await
+    .map_err(|error| storage_error(error, &request_id))?
+    {
+        return Err(internal_error(
+            "active credential changed during rotation",
+            &request_id,
+        ));
+    }
+    let details = json!({
+        "old_credential_id": old_credential_id,
+        "new_credential_id": credential_id,
+    })
+    .to_string();
+    audit::insert(
+        &mut tx,
+        now,
+        &AuditEvent {
+            actor_type: "admin",
+            actor_id: Some(&session.user_id),
+            action: "credential.rotate",
+            target_type: Some("device"),
+            target_id: Some(&id),
+            request_id: Some(&request_id),
+            remote_ip: Some(&remote_ip),
+            details_json: Some(&details),
+        },
+    )
+    .await
+    .map_err(|error| storage_error(error, &request_id))?;
+
+    let (commit_sender, committed) = oneshot::channel();
+    let kick_completion = permit.enqueue(
+        id.clone(),
+        admission,
+        committed,
+        crate::mqtt::server::DeviceKickRecovery::Rotate {
+            previous_credential_id: old_credential_id.to_owned(),
+        },
+    );
+    if let Err(error) = tx.commit().await {
+        drop(commit_sender);
+        return Err(storage_error(error, &request_id));
+    }
+    let _ = commit_sender.send(true);
+    match kick_completion.await {
+        Ok(Ok(())) => {}
+        Ok(Err(())) | Err(_) => {
+            return Err(error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "device_kick_failed",
+                "device session could not be closed",
+                &request_id,
+            ));
+        }
+    }
+    Ok(Json(json!({
+        "device_id": id,
+        "credential": {"id": credential_id, "token": token, "created_at": now},
+    })))
 }
 
 /// Lists device summaries in descending creation order.

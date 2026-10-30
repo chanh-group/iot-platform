@@ -10,12 +10,13 @@ pub mod middleware;
 pub mod router;
 pub mod telemetry;
 
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use sqlx::SqlitePool;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, OwnedMutexGuard, Semaphore};
 
 use crate::config::LoadedConfig;
 use crate::core::events::EventBus;
@@ -45,6 +46,8 @@ pub struct AppState {
     pub(crate) device_admission: DeviceAdmission,
     /// Bounded, server-owned device-kick worker.
     pub(crate) device_kicks: DeviceKickQueue,
+    /// Per-device locks; expired entries are pruned on each acquisition.
+    credential_rotations: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     /// Registry shared with the MQTT listener.
     pub presence: Arc<Presence>,
     /// Signals a fatal MQTT failure to the supervisor.
@@ -80,9 +83,26 @@ impl AppState {
             events,
             device_admission: mqtt_control.device_admission,
             device_kicks: mqtt_control.device_kicks,
+            credential_rotations: Arc::new(Mutex::new(HashMap::new())),
             presence,
             mqtt_failure: mqtt_control.failure,
             ws_connections: Arc::new(Semaphore::new(max_ws_connections)),
         }
+    }
+
+    /// Serializes rotations for one device without retaining locks for inactive devices.
+    pub(crate) async fn lock_credential_rotation(&self, device_id: &str) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut rotations = self.credential_rotations.lock().await;
+            rotations.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = rotations.get(device_id).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(Mutex::new(()));
+                rotations.insert(device_id.to_owned(), Arc::downgrade(&lock));
+                lock
+            }
+        };
+        lock.lock_owned().await
     }
 }

@@ -130,7 +130,9 @@ impl ConnectionLimiter {
     ) -> Result<(), ConnectionLimiterError> {
         let mut state = self.lock()?;
         if enabled {
-            state.disabled.remove(device_id);
+            if !self.failure.is_cancelled() {
+                state.disabled.remove(device_id);
+            }
         } else if state.active.contains_key(device_id) || state.pending.contains_key(device_id) {
             state.disabled.insert(device_id.to_owned());
         } else {
@@ -139,6 +141,32 @@ impl ConnectionLimiter {
         self.state_changed
             .send_modify(|version| *version = version.wrapping_add(1));
         Ok(())
+    }
+
+    /// Fences traffic and signals shutdown under the state lock so re-enable cannot reopen a gap.
+    fn fail_closed_device(
+        &self,
+        device_id: &str,
+        error: impl Display,
+    ) -> Result<(), ConnectionLimiterError> {
+        let _transition = self.readiness_transition.lock();
+        let mut state = self.state.lock();
+        let result = match &mut state {
+            Ok(state) => {
+                state.disabled.insert(device_id.to_owned());
+                self.state_changed
+                    .send_modify(|version| *version = version.wrapping_add(1));
+                Ok(())
+            }
+            Err(_) => Err(ConnectionLimiterError),
+        };
+        self.readiness.store(false, Ordering::Release);
+        if !self.failure.is_cancelled() {
+            tracing::error!(%error, "MQTT is unhealthy; stopping listener");
+            self.failure.cancel();
+        }
+        drop(state);
+        result
     }
 
     pub(crate) fn device_can_exchange(
@@ -290,6 +318,10 @@ impl DeviceAdmissionGuard {
         self.limiter.set_device_enabled(&self.device_id, enabled)
     }
 
+    pub(crate) fn fail_closed(&self, error: impl Display) -> Result<(), ConnectionLimiterError> {
+        self.limiter.fail_closed_device(&self.device_id, error)
+    }
+
     pub(crate) async fn wait_for_pending(&self) -> Result<(), ConnectionLimiterError> {
         let mut changed = self.limiter.state_changed.subscribe();
         loop {
@@ -381,7 +413,12 @@ impl PresenceHooks {
             .map_err(|_| ())?;
         let permit = self.kicks.try_reserve()?;
         let (committed, decision) = oneshot::channel();
-        let completion = permit.enqueue(device_id.to_owned(), admission, decision);
+        let completion = permit.enqueue(
+            device_id.to_owned(),
+            admission,
+            decision,
+            super::server::DeviceKickRecovery::Presence,
+        );
         let _ = committed.send(true);
         drop(completion);
         Ok(())
@@ -560,6 +597,22 @@ mod tests {
         assert!(limiter.try_reserve("device-a").is_err());
         assert!(!readiness.load(Ordering::Acquire));
         assert!(failure.is_cancelled());
+    }
+
+    #[test]
+    fn fatal_failure_keeps_device_fences_until_shutdown() {
+        let readiness = Arc::new(AtomicBool::new(true));
+        let limiter = Arc::new(ConnectionLimiter::new(
+            1,
+            Arc::clone(&readiness),
+            Arc::new(Mutex::new(())),
+            CancellationToken::new(),
+        ));
+        let admission = limiter.admission().block("device-a").unwrap();
+        admission.fail_closed("test kick failure").unwrap();
+        admission.set_device_enabled(true).unwrap();
+        assert!(!limiter.device_can_exchange("device-a").unwrap());
+        assert!(!readiness.load(Ordering::Acquire));
     }
 
     #[test]

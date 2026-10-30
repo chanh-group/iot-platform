@@ -82,10 +82,17 @@ struct QueuedDeviceKick {
     _slot: OwnedSemaphorePermit,
 }
 
+pub(crate) enum DeviceKickRecovery {
+    Disable,
+    Rotate { previous_credential_id: String },
+    Presence,
+}
+
 struct DeviceKickJob {
     device_id: String,
     admission: DeviceAdmissionGuard,
     committed: oneshot::Receiver<bool>,
+    recovery: DeviceKickRecovery,
     completion: oneshot::Sender<Result<(), ()>>,
 }
 
@@ -114,6 +121,7 @@ impl DeviceKickPermit {
         device_id: String,
         admission: DeviceAdmissionGuard,
         committed: oneshot::Receiver<bool>,
+        recovery: DeviceKickRecovery,
     ) -> oneshot::Receiver<Result<(), ()>> {
         let (completion, result) = oneshot::channel();
         self.sender.send(QueuedDeviceKick {
@@ -121,6 +129,7 @@ impl DeviceKickPermit {
                 device_id,
                 admission,
                 committed,
+                recovery,
                 completion,
             },
             _slot: self.slot,
@@ -206,47 +215,41 @@ async fn process_device_kick_job(
         device_id,
         admission,
         committed,
+        recovery,
         completion,
     } = job;
-    let should_kick = match committed.await {
-        Ok(committed) => {
-            if let Err(error) = admission.set_device_enabled(!committed) {
-                failure.report_failure(error);
-            }
-            committed
-        }
-        Err(_) => {
-            match sqlx::query_scalar::<_, bool>("SELECT enabled FROM devices WHERE id = ?")
-                .bind(&device_id)
-                .fetch_optional(&pool)
-                .await
-            {
-                Ok(enabled) => {
-                    let enabled = enabled.unwrap_or(true);
-                    if let Err(error) = admission.set_device_enabled(enabled) {
-                        failure.report_failure(error);
-                    }
-                    !enabled
-                }
-                Err(error) => {
-                    tracing::error!(%error, "cannot determine whether a device disable committed");
-                    if let Err(error) = admission.set_device_enabled(false) {
-                        failure.report_failure(error);
-                    }
-                    true
-                }
-            }
+    let committed = committed.await;
+    let mut fatal_failure = false;
+    let mut state_unknown = false;
+    let (recovered_kick, enabled) = match recover_device_kick(&pool, &device_id, &recovery).await {
+        Ok(state) => state,
+        Err(error) => {
+            tracing::error!(%error, "cannot determine whether a device mutation committed");
+            let _ = admission.fail_closed(error);
+            fatal_failure = true;
+            state_unknown = true;
+            (true, false)
         }
     };
+    if !state_unknown
+        && (!enabled || matches!(recovery, DeviceKickRecovery::Presence))
+        && let Err(error) = admission.set_device_enabled(false)
+    {
+        failure.report_failure(error);
+        fatal_failure = true;
+    }
+    let should_kick = committed.unwrap_or(recovered_kick);
     if !should_kick {
         drop(admission);
-        let _ = completion.send(Ok(()));
+        let result = if fatal_failure { Err(()) } else { Ok(()) };
+        let _ = completion.send(result);
         return;
     }
 
     if kick_with_retries(primary.as_ref(), &device_id).await {
         drop(admission);
-        let _ = completion.send(Ok(()));
+        let result = if fatal_failure { Err(()) } else { Ok(()) };
+        let _ = completion.send(result);
         return;
     }
 
@@ -254,9 +257,36 @@ async fn process_device_kick_job(
     if !kick_with_retries(emergency.as_ref(), &device_id).await {
         tracing::error!("emergency MQTT session kick also failed");
     }
-    failure.report_failure("device session kick failed after retries");
+    let _ = admission.fail_closed("device session kick failed after retries");
     drop(admission);
     let _ = completion.send(Err(()));
+}
+
+async fn recover_device_kick(
+    pool: &SqlitePool,
+    device_id: &str,
+    recovery: &DeviceKickRecovery,
+) -> Result<(bool, bool), sqlx::Error> {
+    let device = sqlx::query_as::<_, (bool, Option<String>)>(
+        "SELECT d.enabled, c.id
+         FROM devices d
+         LEFT JOIN device_credentials c ON c.device_id = d.id AND c.status = 'active'
+         WHERE d.id = ?",
+    )
+    .bind(device_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some((enabled, active_credential_id)) = device else {
+        return Ok((true, false));
+    };
+    let should_kick = match recovery {
+        DeviceKickRecovery::Disable => !enabled,
+        DeviceKickRecovery::Rotate {
+            previous_credential_id,
+        } => active_credential_id.as_deref() != Some(previous_credential_id),
+        DeviceKickRecovery::Presence => true,
+    };
+    Ok((should_kick, enabled))
 }
 
 async fn kick_with_retries(channel: &dyn DeviceChannel, device_id: &str) -> bool {
@@ -580,6 +610,7 @@ mod tests {
         id: String,
         token: String,
         readiness: Arc<AtomicBool>,
+        presence: Arc<Presence>,
         mqtt: MqttServer,
         http: JoinHandle<()>,
     }
@@ -663,7 +694,7 @@ mod tests {
             Arc::clone(&readiness),
             Arc::new(AtomicBool::new(true)),
             EventBus::new(),
-            presence,
+            Arc::clone(&presence),
             mqtt.control(),
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -682,6 +713,7 @@ mod tests {
             id,
             token,
             readiness,
+            presence,
             mqtt,
             http,
         }
@@ -702,6 +734,21 @@ mod tests {
             .json(&serde_json::json!({"enabled":false}))
     }
 
+    fn rotate_request(fixture: &DeviceHttpFixture) -> reqwest::RequestBuilder {
+        rotate_request_for(fixture, &fixture.id)
+    }
+
+    fn rotate_request_for(fixture: &DeviceHttpFixture, device_id: &str) -> reqwest::RequestBuilder {
+        reqwest::Client::new()
+            .post(format!(
+                "{}/api/v1/devices/{device_id}/credentials/rotate",
+                fixture.base
+            ))
+            .header("Cookie", "iot_session=test-session")
+            .header("X-IoT-CSRF", "1")
+            .json(&serde_json::json!({}))
+    }
+
     fn enqueue_test_kick(
         fixture: &DeviceHttpFixture,
         device_id: &str,
@@ -714,7 +761,12 @@ mod tests {
             .unwrap();
         let permit = fixture.mqtt.device_kicks.try_reserve().unwrap();
         let (committed, decision) = oneshot::channel();
-        let completion = permit.enqueue(device_id.to_owned(), admission, decision);
+        let completion = permit.enqueue(
+            device_id.to_owned(),
+            admission,
+            decision,
+            DeviceKickRecovery::Disable,
+        );
         committed.send(true).unwrap();
         completion
     }
@@ -866,6 +918,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rotate_waits_for_pre_authorized_handshake_before_commit_and_kick() {
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        let kicker = Arc::new(RecordingKick(Arc::clone(&order)));
+        let fixture = start_device_http(5_000, kicker, None).await;
+        assert!(fixture.mqtt.connections.try_reserve(&fixture.id).unwrap());
+
+        let response_task = tokio::spawn(rotate_request(&fixture).send());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !fixture
+                .mqtt
+                .connections
+                .device_is_blocked_for_test(&fixture.id)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("rotation must close admission before its transaction");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM device_credentials WHERE id = 'credential'",
+            )
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap(),
+            "active",
+            "SQL must remain unchanged until an authorized handshake resolves"
+        );
+        assert!(!fixture.mqtt.connections.try_reserve(&fixture.id).unwrap());
+
+        fixture
+            .mqtt
+            .connections
+            .connected(&fixture.id, "controlled-session")
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(3), response_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(*order.lock().unwrap(), ["kick"]);
+        assert_eq!(
+            refused_test_device(fixture.mqtt.local_addr(), &fixture.id, &fixture.token).await,
+            ConnectReturnCode::BadUserNamePassword
+        );
+    }
+
+    #[tokio::test]
+    async fn device_channel_publishes_server_qos1_non_retained_and_reads_presence() {
+        let kicker = Arc::new(RecordingKick(Arc::new(StdMutex::new(Vec::new()))));
+        let fixture = start_device_http(5_000, kicker, None).await;
+        let publisher = ServerPublisher::new(
+            fixture.mqtt.context.clone(),
+            Arc::clone(&fixture.presence),
+            Arc::clone(&fixture.mqtt.connections),
+        );
+        assert!(
+            !DeviceChannel::is_online(&publisher, &fixture.id)
+                .await
+                .unwrap()
+        );
+        let (client, mut eventloop) =
+            connect_test_device(fixture.mqtt.local_addr(), &fixture.id, &fixture.token).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !fixture.presence.is_online(&fixture.id).unwrap() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            DeviceChannel::is_online(&publisher, &fixture.id)
+                .await
+                .unwrap()
+        );
+
+        let topic = format!("devices/{}/data/server-channel", fixture.id);
+        subscribe_test_device(&client, &mut eventloop, &topic).await;
+        DeviceChannel::publish(&publisher, &fixture.id, &topic, b"server-message")
+            .await
+            .unwrap();
+        let publish = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let MqttEvent::Incoming(Packet::Publish(publish)) =
+                    eventloop.poll().await.unwrap()
+                {
+                    break publish;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(publish.payload.as_ref(), b"server-message");
+        assert_eq!(publish.qos, QoS::AtLeastOnce);
+        assert!(!publish.retain);
+    }
+
+    #[tokio::test]
     async fn http_timeout_does_not_cancel_a_committed_kick_and_acl_blocks_telemetry() {
         let started = Arc::new(Notify::new());
         let (release, receiver) = watch::channel(false);
@@ -924,6 +1075,315 @@ mod tests {
             .unwrap(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn rotate_timeout_keeps_kick_running_and_retry_recovers_one_time_token() {
+        let started = Arc::new(Notify::new());
+        let (release, receiver) = watch::channel(false);
+        let kicker = Arc::new(BlockingOnceKick {
+            started: Arc::clone(&started),
+            release: StdMutex::new(receiver),
+            first: AtomicBool::new(true),
+        });
+        let fixture = start_device_http(1_000, kicker, None).await;
+        let (old_client, mut old_eventloop) =
+            connect_test_device(fixture.mqtt.local_addr(), &fixture.id, &fixture.token).await;
+        let request = rotate_request(&fixture);
+        let response_task = tokio::spawn(async move { request.send().await.unwrap() });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("committed rotation must reach the supervised kick worker");
+
+        let response = tokio::time::timeout(Duration::from_secs(3), response_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM device_credentials WHERE id = 'credential'",
+            )
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap(),
+            "revoked"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM device_credentials WHERE device_id = ? AND status = 'active'",
+            )
+            .bind(&fixture.id)
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            refused_test_device(fixture.mqtt.local_addr(), &fixture.id, &fixture.token).await,
+            ConnectReturnCode::BadUserNamePassword
+        );
+        let publisher = ServerPublisher::new(
+            fixture.mqtt.context.clone(),
+            Arc::new(Presence::new()),
+            Arc::clone(&fixture.mqtt.connections),
+        );
+        assert!(
+            publisher
+                .publish(
+                    &fixture.id,
+                    &format!("devices/{}/commands", fixture.id),
+                    b"fenced"
+                )
+                .await
+                .is_err()
+        );
+
+        let retry = rotate_request(&fixture);
+        let retry_task = tokio::spawn(async move { retry.send().await.unwrap() });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let audits: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM audit_events
+                     WHERE target_id = ? AND action = 'credential.rotate'",
+                )
+                .bind(&fixture.id)
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
+                if audits == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a second rotation must commit while the first broker kick is blocked");
+        assert!(!retry_task.is_finished());
+        release.send(true).unwrap();
+        let response = retry_task.await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        let recovered_token = body["credential"]["token"].as_str().unwrap();
+        assert_eq!(
+            refused_test_device(fixture.mqtt.local_addr(), &fixture.id, &fixture.token).await,
+            ConnectReturnCode::BadUserNamePassword
+        );
+        let (_new_client, _new_eventloop) =
+            connect_test_device(fixture.mqtt.local_addr(), &fixture.id, recovered_token).await;
+        wait_test_device_closed(&mut old_eventloop).await;
+        assert!(fixture.readiness.load(Ordering::Acquire));
+        drop(old_client);
+    }
+
+    #[tokio::test]
+    async fn concurrent_rotations_return_tokens_in_serialized_commit_order() {
+        let started = Arc::new(Notify::new());
+        let (release, receiver) = watch::channel(false);
+        let kicker = Arc::new(BlockingOnceKick {
+            started: Arc::clone(&started),
+            release: StdMutex::new(receiver),
+            first: AtomicBool::new(true),
+        });
+        let fixture = start_device_http(5_000, kicker, None).await;
+        let first = tokio::spawn(rotate_request(&fixture).send());
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("first rotation must be waiting in its broker kick");
+
+        let second = tokio::spawn(rotate_request(&fixture).send());
+        let second_committed = tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                let audits: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM audit_events
+                     WHERE target_id = ? AND action = 'credential.rotate'",
+                )
+                .bind(&fixture.id)
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
+                if audits == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            second_committed.is_err(),
+            "second rotation must not commit while the first request awaits kick"
+        );
+        assert!(!second.is_finished());
+
+        release.send(true).unwrap();
+        let first_response = first.await.unwrap().unwrap();
+        assert_eq!(first_response.status(), axum::http::StatusCode::OK);
+        let first_body: serde_json::Value = first_response.json().await.unwrap();
+        let first_id = first_body["credential"]["id"].as_str().unwrap().to_owned();
+        let first_token = first_body["credential"]["token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let second_response = second.await.unwrap().unwrap();
+        assert_eq!(second_response.status(), axum::http::StatusCode::OK);
+        let second_body: serde_json::Value = second_response.json().await.unwrap();
+        let second_id = second_body["credential"]["id"].as_str().unwrap();
+        let second_token = second_body["credential"]["token"].as_str().unwrap();
+        assert_ne!(first_token, second_token);
+
+        let first_record: (String, Vec<u8>) =
+            sqlx::query_as("SELECT status, token_hash FROM device_credentials WHERE id = ?")
+                .bind(&first_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
+        assert_eq!(first_record.0, "revoked");
+        assert_eq!(first_record.1, auth::hash_token(&first_token));
+        let second_record: (String, Vec<u8>, Option<String>) = sqlx::query_as(
+            "SELECT status, token_hash, rotated_from FROM device_credentials WHERE id = ?",
+        )
+        .bind(second_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(second_record.0, "active");
+        assert_eq!(second_record.1, auth::hash_token(second_token));
+        assert_eq!(second_record.2.as_deref(), Some(first_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn rotating_an_unrelated_device_does_not_wait_for_a_blocked_kick() {
+        let started = Arc::new(Notify::new());
+        let (release, receiver) = watch::channel(false);
+        let kicker = Arc::new(BlockingOnceKick {
+            started: Arc::clone(&started),
+            release: StdMutex::new(receiver),
+            first: AtomicBool::new(true),
+        });
+        let fixture = start_device_http(5_000, kicker, None).await;
+        let device_b = uuid::Uuid::now_v7().to_string();
+        let token_b = format!("iot_{}", auth::generate_session_token().unwrap());
+        let now = auth::now_ms();
+        sqlx::query(
+            "INSERT INTO devices (id, name, metadata_json, enabled, created_at, updated_at)
+             VALUES (?, 'other-device', '{}', 1, ?, ?)",
+        )
+        .bind(&device_b)
+        .bind(now)
+        .bind(now)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO device_credentials (id, device_id, token_hash, status, created_at)
+             VALUES ('credential-b', ?, ?, 'active', ?)",
+        )
+        .bind(&device_b)
+        .bind(auth::hash_token(&token_b).as_slice())
+        .bind(now)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+
+        let device_a_request = rotate_request_for(&fixture, &fixture.id);
+        let device_a = tokio::spawn(async move { device_a_request.send().await.unwrap() });
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("device A kick must block");
+
+        let device_b_request = rotate_request_for(&fixture, &device_b);
+        let device_b_response =
+            tokio::time::timeout(Duration::from_secs(2), device_b_request.send())
+                .await
+                .expect("device B rotation must not wait for device A")
+                .unwrap();
+        assert_eq!(device_b_response.status(), axum::http::StatusCode::OK);
+        let device_b_body: serde_json::Value = device_b_response.json().await.unwrap();
+        let new_token_b = device_b_body["credential"]["token"].as_str().unwrap();
+        assert_ne!(new_token_b, token_b);
+        assert!(!device_a.is_finished());
+
+        release.send(true).unwrap();
+        let device_a_response = device_a.await.unwrap();
+        assert_eq!(device_a_response.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn failed_rotate_kicks_leave_sql_enabled_but_fence_the_live_session() {
+        let primary = Arc::new(FailingKick(AtomicUsize::new(0)));
+        let emergency = Arc::new(FailingKick(AtomicUsize::new(0)));
+        let mut fixture = start_device_http(
+            5_000,
+            Arc::clone(&primary) as Arc<dyn DeviceChannel>,
+            Some(Arc::clone(&emergency) as Arc<dyn DeviceChannel>),
+        )
+        .await;
+        let (client, mut eventloop) =
+            connect_test_device(fixture.mqtt.local_addr(), &fixture.id, &fixture.token).await;
+
+        let response = rotate_request(&fixture).send().await.unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap()["code"],
+            "device_kick_failed"
+        );
+        assert_eq!(
+            primary.0.load(AtomicOrdering::Relaxed),
+            DEVICE_KICK_ATTEMPTS
+        );
+        assert_eq!(
+            emergency.0.load(AtomicOrdering::Relaxed),
+            DEVICE_KICK_ATTEMPTS
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM device_credentials WHERE id = 'credential'",
+            )
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap(),
+            "revoked"
+        );
+        assert!(
+            sqlx::query_scalar::<_, bool>("SELECT enabled FROM devices WHERE id = ?")
+                .bind(&fixture.id)
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap(),
+            "SQL enabled state must not change on a failed rotate kick"
+        );
+        assert!(!fixture.readiness.load(Ordering::Acquire));
+        let publisher = ServerPublisher::new(
+            fixture.mqtt.context.clone(),
+            Arc::new(Presence::new()),
+            Arc::clone(&fixture.mqtt.connections),
+        );
+        assert!(
+            publisher
+                .publish(
+                    &fixture.id,
+                    &format!("devices/{}/commands", fixture.id),
+                    b"fenced"
+                )
+                .await
+                .is_err()
+        );
+        client
+            .publish(
+                format!("devices/{}/status", fixture.id),
+                QoS::AtLeastOnce,
+                false,
+                b"after-rotate-failure".as_slice(),
+            )
+            .await
+            .unwrap();
+        wait_test_device_closed(&mut eventloop).await;
+        assert!(fixture.mqtt.wait().await.is_err());
+        drop(client);
     }
 
     #[tokio::test]
@@ -1063,6 +1523,41 @@ mod tests {
     struct BlockingKick {
         started: Arc<Notify>,
         release: StdMutex<watch::Receiver<bool>>,
+    }
+
+    struct BlockingOnceKick {
+        started: Arc<Notify>,
+        release: StdMutex<watch::Receiver<bool>>,
+        first: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl DeviceChannel for BlockingOnceKick {
+        async fn publish(
+            &self,
+            _device_id: &str,
+            _topic: &str,
+            _payload: &[u8],
+        ) -> Result<(), DeviceChannelError> {
+            Err(DeviceChannelError::Unavailable)
+        }
+
+        async fn kick(&self, _device_id: &str) -> Result<(), DeviceChannelError> {
+            if self.first.swap(false, AtomicOrdering::Relaxed) {
+                self.started.notify_one();
+                let mut release = self.release.lock().unwrap().clone();
+                while !*release.borrow() {
+                    if release.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        async fn is_online(&self, _device_id: &str) -> Result<bool, DeviceChannelError> {
+            Ok(true)
+        }
     }
 
     #[async_trait::async_trait]

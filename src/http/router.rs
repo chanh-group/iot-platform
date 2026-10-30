@@ -43,6 +43,10 @@ pub fn build(state: AppState) -> Router {
             routing::get(devices::get).patch(devices::patch),
         )
         .route(
+            "/api/v1/devices/{id}/credentials/rotate",
+            routing::post(devices::rotate),
+        )
+        .route(
             "/api/v1/devices/{id}/telemetry",
             routing::get(telemetry::history),
         )

@@ -97,6 +97,44 @@ pub async fn update(
     Ok(())
 }
 
+/// Revokes the active credential and inserts its replacement in the caller's transaction.
+pub async fn rotate_credential(
+    connection: &mut SqliteConnection,
+    device_id: &str,
+    old_credential_id: &str,
+    new_credential_id: &str,
+    token_hash: &[u8],
+    now: i64,
+) -> Result<bool, sqlx::Error> {
+    let revoked = sqlx::query(
+        "UPDATE device_credentials
+         SET status = 'revoked', revoked_at = ?
+         WHERE id = ? AND device_id = ? AND status = 'active'",
+    )
+    .bind(now)
+    .bind(old_credential_id)
+    .bind(device_id)
+    .execute(&mut *connection)
+    .await?
+    .rows_affected();
+    if revoked != 1 {
+        return Ok(false);
+    }
+    sqlx::query(
+        "INSERT INTO device_credentials
+         (id, device_id, token_hash, status, created_at, rotated_from)
+         VALUES (?, ?, ?, 'active', ?, ?)",
+    )
+    .bind(new_credential_id)
+    .bind(device_id)
+    .bind(token_hash)
+    .bind(now)
+    .bind(old_credential_id)
+    .execute(&mut *connection)
+    .await?;
+    Ok(true)
+}
+
 /// Lists devices using a stable descending keyset.
 pub async fn list(
     pool: &SqlitePool,
