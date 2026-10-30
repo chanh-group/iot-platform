@@ -13,6 +13,51 @@ use rumqttc::{
 
 const WAIT: Duration = Duration::from_secs(5);
 
+async fn next_telemetry_ack(
+    eventloop: &mut rumqttc::EventLoop,
+    ack_topic: &str,
+    timeout: Duration,
+) -> rumqttc::Publish {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if let MqttEvent::Incoming(Packet::Publish(publish)) = eventloop.poll().await.unwrap()
+                && publish.topic == ack_topic
+            {
+                return publish;
+            }
+        }
+    })
+    .await
+    .expect("receive telemetry ACK before timeout")
+}
+
+async fn publish_telemetry_and_wait_for_puback(
+    client: &AsyncClient,
+    eventloop: &mut rumqttc::EventLoop,
+    topic: &str,
+    ack_topic: &str,
+    payload: &[u8],
+    acknowledgements: &mut Vec<rumqttc::Publish>,
+) {
+    client
+        .publish(topic, QoS::AtLeastOnce, false, payload)
+        .await
+        .unwrap();
+    tokio::time::timeout(WAIT, async {
+        loop {
+            match eventloop.poll().await.unwrap() {
+                MqttEvent::Incoming(Packet::PubAck(_)) => return,
+                MqttEvent::Incoming(Packet::Publish(publish)) if publish.topic == ack_topic => {
+                    acknowledgements.push(publish);
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("receive telemetry publish PUBACK before timeout");
+}
+
 #[tokio::test]
 async fn qos_levels_and_own_device_wildcard_round_trip() {
     let app = TestApp::start().await;
@@ -38,6 +83,101 @@ async fn qos_levels_and_own_device_wildcard_round_trip() {
         assert_eq!(received.payload.as_ref(), payload);
         assert_eq!(received.qos, qos);
     }
+}
+
+#[tokio::test]
+async fn max_inflight_per_client_limits_unacknowledged_qos1_deliveries() {
+    let config = MqttConfig {
+        max_inflight_per_client: 1,
+        ..MqttConfig::default()
+    };
+    let app = TestApp::builder().mqtt_config(config).start().await;
+    assert_eq!(app.config.config.mqtt.max_inflight_per_client, 1);
+    let device = app.create_device("protocol-inflight", true).await;
+    let ack_topic = format!("devices/{}/telemetry/ack", device.id);
+    let telemetry_topic = format!("devices/{}/telemetry", device.id);
+
+    let mut options = mqtt_options(app.mqtt_addr, &device.id, &device.id, &device.token, true);
+    options.set_manual_acks(true);
+    let (client, mut eventloop) = AsyncClient::new(options, 32);
+    assert!(matches!(
+        mqtt_next(&mut eventloop, WAIT).await.unwrap(),
+        MqttEvent::Incoming(Packet::ConnAck(ack)) if ack.code == ConnectReturnCode::Success
+    ));
+    assert_eq!(
+        mqtt_subscribe(&client, &mut eventloop, &ack_topic, QoS::AtLeastOnce).await,
+        SubscribeReasonCode::Success(QoS::AtLeastOnce)
+    );
+
+    let mut acknowledgements = Vec::new();
+    for index in 0..3 {
+        let payload = format!(r#"{{"event_id":"inflight-{index}","values":{{"x":{index}}}}}"#);
+        publish_telemetry_and_wait_for_puback(
+            &client,
+            &mut eventloop,
+            &telemetry_topic,
+            &ack_topic,
+            payload.as_bytes(),
+            &mut acknowledgements,
+        )
+        .await;
+    }
+
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM telemetry_events WHERE device_id = ?")
+                    .bind(&device.id)
+                    .fetch_one(&app.pool)
+                    .await
+                    .unwrap();
+            if count == 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("all three telemetry events should commit");
+
+    if acknowledgements.is_empty() {
+        acknowledgements.push(next_telemetry_ack(&mut eventloop, &ack_topic, WAIT).await);
+    }
+    assert_eq!(
+        acknowledgements.len(),
+        1,
+        "only one QoS 1 delivery may remain unacknowledged"
+    );
+    let first = acknowledgements.pop().unwrap();
+    assert_eq!(first.qos, QoS::AtLeastOnce);
+
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            next_telemetry_ack(&mut eventloop, &ack_topic, WAIT),
+        )
+        .await
+        .is_err(),
+        "broker must wait for PUBACK before sending another QoS 1 message"
+    );
+
+    client.ack(&first).await.unwrap();
+    let second = next_telemetry_ack(&mut eventloop, &ack_topic, WAIT).await;
+    assert_ne!(second.pkid, first.pkid);
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            next_telemetry_ack(&mut eventloop, &ack_topic, WAIT),
+        )
+        .await
+        .is_err(),
+        "the next inflight slot must remain occupied until its PUBACK"
+    );
+
+    client.ack(&second).await.unwrap();
+    let third = next_telemetry_ack(&mut eventloop, &ack_topic, WAIT).await;
+    assert_ne!(third.pkid, second.pkid);
+    client.ack(&third).await.unwrap();
 }
 
 #[tokio::test]

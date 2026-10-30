@@ -21,7 +21,7 @@ Nguồn sự thật:
   - `MessagePublish` chạy trước `MessagePublishCheckAcl`; tuyệt đối không enqueue/ghi SQL trong hook `MessagePublish`.
   - `entry.publish` dùng principal `$server`, QoS 1; shutdown về sau phải kick session trước khi abort listener.
   - Retained cap dùng `BudgetedRetainStorage`; replace/clear phải cập nhật byte/topic đúng, vượt cap ghi metric/log `retained_cap` rồi RMQTT đóng connection.
-- [ ] Không đổi broker/version/feature, protocol MQTT, SQLite durability hoặc contract nếu chưa cập nhật ADR/contract trước.
+- [x] Không đổi broker/version/feature, protocol MQTT, SQLite durability hoặc contract nếu chưa cập nhật ADR/contract trước; mục này là quy tắc đã tuân thủ, không phải tính năng.
 
 ## 1. MQTT adapter và lifecycle — P2-01
 
@@ -92,7 +92,7 @@ Nguồn sự thật:
 - [x] Mở rộng `tests/common/mod.rs`: fixture device/credential, `rumqttc` connect/subscribe/publish/PUBACK/application ACK và WS client dùng chung; mỗi `TestApp` có DB tạm, HTTP/MQTT bind port `0` độc lập để tránh race port.
 - [x] A19 protocol matrix: QoS 0/1/2, wildcard hợp lệ, retained/LWT, clean-session reconnect/expiry và restart trong `tests/mqtt_protocol.rs` + `tests/attributes_retained.rs`; duplicate client ID và MQTT 3.1/5 reject trong `tests/mqtt_auth.rs`.
 - [x] Kiểm chứng limit qua listener: packet, connection, subscription, client ID, topic level và offline queue cap trong `tests/mqtt_protocol.rs`; retained cap trong `tests/attributes_retained.rs`.
-- [ ] Chưa có test tái lập saturation cho `max_inflight_per_client`; QoS smoke không chứng minh giới hạn này.
+- [x] Saturation `max_inflight_per_client=1`: test giữ PUBACK của telemetry ACK QoS 1, chứng minh broker chỉ giao một ACK chưa hoàn tất, rồi giao message kế tiếp sau PUBACK (`tests/mqtt_protocol.rs::max_inflight_per_client_limits_unacknowledged_qos1_deliveries`).
 - [x] A05: `tests/telemetry_flow.rs` xác nhận commit + ACK `stored`; `tests/telemetry_api.rs` và `tests/ws_telemetry.rs` xác nhận REST/WS thấy dữ liệu đã commit.
 - [x] A06: `tests/telemetry_flow.rs` retry byte-identical giữ một row và ACK `duplicate`.
 - [x] A07: `tests/telemetry_flow.rs` payload khác cùng event ID giữ row cũ và ACK `rejected/event_id_conflict`.
@@ -114,13 +114,13 @@ Checklist gate:
 - [x] A05, A06, A07 pass; lỗi commit trả `retryable/storage_unavailable`, không có row/WS event; success ACK chỉ sau repository commit (`tests/telemetry_flow.rs`, `tests/ws_telemetry.rs`).
 - [x] A04 pass ở unit + integration, gồm wildcard/cross-device (`src/core/acl.rs`, `tests/mqtt_acl.rs`).
 - [x] A19 protocol matrix pass: QoS 0/1/2, wildcard, retain/LWT, session reconnect/expiry, duplicate client ID, MQTT 3.1/5 reject (`tests/mqtt_protocol.rs`, `tests/mqtt_auth.rs`).
-- [ ] `mqtt.max_inflight_per_client` chưa có test saturation; QoS smoke tuần tự không chứng minh backpressure khi chạm inflight cap.
+- [x] `mqtt.max_inflight_per_client` saturation/backpressure được chứng minh với nhiều QoS 1 ACK chưa hoàn tất (`tests/mqtt_protocol.rs::max_inflight_per_client_limits_unacknowledged_qos1_deliveries`).
 - [x] Retained message/byte cap hoạt động; restart retained rỗng; replace/clear accounting đúng (`tests/attributes_retained.rs`). `iot_retained_cap_rejected_total` được export và có test.
 - [x] Queue full giữ depth đúng capacity; `retryable/queue_full` được publish khi storage vẫn lỗi, không bị head-of-line block bởi ACK đang chờ ingest nếu còn permit; event bị reject không ghi/ACK success và metric `ingest_rejected_total{reason="queue_full"}` tăng (`tests/telemetry_flow.rs::full_ingest_queue_returns_retryable_without_success_ack_and_exports_metric`). Hai lane vẫn chia sẻ tổng 256 permits; nếu tất cả ACK permits đã chiếm, ACK immediate cũng có thể bị drop theo contract, được metric hóa và thiết bị phải retry. Test này không saturation tổng ACK permits.
 - [x] `/readyz` phản ánh MQTT listener, DB và telemetry storage failure; worker exit bất ngờ tắt readiness, MQTT/HTTP dừng và supervisor trả failure. Error response không lộ DB detail (`tests/mqtt_boot.rs`, `tests/http_shell.rs`, `tests/ws_telemetry.rs`, `runtime::supervisor::tests::unexpected_telemetry_worker_exit_stops_services_and_fails`).
 - [x] `cargo fmt --all --check`, clippy `-D warnings`, `cargo test --all` sạch; không thêm dependency nên `Cargo.lock` không đổi.
 
-**Kết luận gate:** Phase 2 chưa PASS toàn bộ cho tới khi có test saturation cho `mqtt.max_inflight_per_client`; checklist protocol matrix ở trên chỉ bao phủ các case đã nêu.
+**Kết luận gate:** Section 8 PASS theo các gate đã liệt kê; Phase 4/release evidence nằm ngoài phạm vi Section 9.
 
 ## 9. Không làm trong Phase 2
 
@@ -133,6 +133,6 @@ Checklist gate:
 
 ## 10. Commit
 
-- [ ] Commit nhỏ, mỗi commit build/test được; gợi ý: `feat(mqtt): adapter auth and acl`, `feat(telemetry): ingest dedup and ack`, `feat(http): telemetry history and events`, `test: phase 2 protocol suite`.
-- [ ] Không commit `target/`, `data/`, `web/dist/`, log hoặc token/credential fixture thật.
-- [ ] Nếu một contract/RMQTT behavior khác spike: dừng task liên quan, cập nhật `02` và ADR trước; không tự điều chỉnh ngầm trong code.
+- [x] Commit nhỏ, mỗi commit build/test được; lần này chỉ thêm test inflight và cập nhật checklist Section 8/10.
+- [x] Rà diff: chỉ có `tests/mqtt_protocol.rs` và tài liệu; không có `target/`, `data/`, `web/dist/`, log hay credential thật.
+- [x] Xác nhận RMQTT 0.24 `.max_inflight`/out-inflight credit khớp contract; không phát sinh khác biệt cần sửa `02`/ADR.
