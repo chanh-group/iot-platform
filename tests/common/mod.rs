@@ -252,6 +252,7 @@ pub struct TestAppBuilder {
     ws_queue_capacity: u64,
     mqtt_config: MqttConfig,
     telemetry_config: TelemetryConfig,
+    command_max_ttl_ms: u64,
 }
 
 impl Default for TestAppBuilder {
@@ -266,6 +267,7 @@ impl Default for TestAppBuilder {
             ws_queue_capacity: 256,
             mqtt_config: MqttConfig::default(),
             telemetry_config: TelemetryConfig::default(),
+            command_max_ttl_ms: 86_400_000,
         }
     }
 }
@@ -318,6 +320,11 @@ impl TestAppBuilder {
         self
     }
 
+    pub fn command_max_ttl_ms(mut self, max_ttl_ms: u64) -> Self {
+        self.command_max_ttl_ms = max_ttl_ms;
+        self
+    }
+
     pub async fn start(self) -> TestApp {
         let dir = TempDir::new().unwrap();
         let config_path = dir.path().join("conf.toml");
@@ -344,7 +351,9 @@ impl TestAppBuilder {
                  [database]\n\
                  url = \"sqlite://./data/iot.db\"\n\
                  [auth]\n\
-                 login_max_attempts = {}\n",
+                 login_max_attempts = {}\n\
+                 [commands]\n\
+                 max_ttl_ms = {}\n",
                 self.dashboard,
                 self.cookie_secure,
                 self.metrics_token.is_some(),
@@ -353,6 +362,7 @@ impl TestAppBuilder {
                 self.mqtt_config.max_retained_messages,
                 self.mqtt_config.max_retained_bytes,
                 self.login_max_attempts,
+                self.command_max_ttl_ms,
             ),
         )
         .unwrap();

@@ -37,6 +37,12 @@ impl ApiError {
         }
     }
 
+    /// Adds contract-defined details to an error response.
+    pub fn with_details(mut self, details: Value) -> Self {
+        self.details = Some(details);
+        self
+    }
+
     /// Maps a domain error onto its contract status and code.
     pub fn from_domain(error: DomainError, request_id: String) -> Self {
         match error {

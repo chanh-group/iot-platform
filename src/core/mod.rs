@@ -3,6 +3,7 @@
 pub mod acl;
 pub mod attributes;
 pub mod auth;
+pub mod command;
 pub mod device;
 pub mod device_channel;
 pub mod domain_error;

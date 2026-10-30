@@ -2,6 +2,7 @@
 
 pub mod attributes;
 pub mod audit;
+pub mod commands;
 pub mod devices;
 pub mod migrate;
 pub mod pool;

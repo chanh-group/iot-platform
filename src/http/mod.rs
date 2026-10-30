@@ -3,6 +3,7 @@
 pub mod api_error;
 pub mod assets;
 pub mod auth;
+pub mod commands;
 pub mod devices;
 pub mod events;
 pub mod metrics;
@@ -19,10 +20,12 @@ use sqlx::SqlitePool;
 use tokio::sync::{Mutex, OwnedMutexGuard, Semaphore};
 
 use crate::config::LoadedConfig;
+use crate::core::command::CommandRepository;
 use crate::core::events::EventBus;
 use crate::core::presence::Presence;
 use crate::mqtt::presence::DeviceAdmission;
 use crate::mqtt::server::{DeviceKickQueue, MqttControl, MqttFailure};
+use crate::storage::sqlite::commands::SqliteCommandRepository;
 use middleware::LoginRateLimiter;
 
 /// Shared handler state: database pool, config, login limiter, and task readiness.
@@ -46,6 +49,8 @@ pub struct AppState {
     pub(crate) device_admission: DeviceAdmission,
     /// Bounded, server-owned device-kick worker.
     pub(crate) device_kicks: DeviceKickQueue,
+    /// Command domain persistence port.
+    pub(crate) command_repository: Arc<dyn CommandRepository>,
     /// Per-device locks; expired entries are pruned on each acquisition.
     credential_rotations: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     /// Registry shared with the MQTT listener.
@@ -73,6 +78,7 @@ impl AppState {
             config.config.auth.login_max_attempts,
             Duration::from_millis(config.config.auth.login_window_ms),
         );
+        let command_repository = Arc::new(SqliteCommandRepository::new(pool.clone()));
         Self {
             pool,
             config,
@@ -83,6 +89,7 @@ impl AppState {
             events,
             device_admission: mqtt_control.device_admission,
             device_kicks: mqtt_control.device_kicks,
+            command_repository,
             credential_rotations: Arc::new(Mutex::new(HashMap::new())),
             presence,
             mqtt_failure: mqtt_control.failure,

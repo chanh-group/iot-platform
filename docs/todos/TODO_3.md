@@ -49,14 +49,14 @@ Nguồn sự thật:
 
 ## 3. Command domain, SQL và REST — P3-03, P3-05
 
-- [ ] Domain state enum `pending|dispatched|succeeded|failed|expired`; dùng domain types/error và repository port tối thiểu trong `src/core/command/`, SQLite adapter trong `src/storage/sqlite/commands.rs`.
-- [ ] Validate create: name `^[a-z][a-z0-9_.-]{0,63}$`; params object ≤16 384 byte, mặc định `{}`; TTL 1 000..`commands.max_ttl_ms`, mặc định `default_ttl_ms`; idempotency key tùy chọn 1..128 printable ASCII.
-- [ ] Lưu hash **raw HTTP body bytes**, không hash JSON đã serialize/chuẩn hóa. Key unique theo device: cùng key + raw hash → command cũ, 202 + `Idempotent-Replayed: true`; khác hash → `409 idempotency_conflict`.
-- [ ] Kiểm tra device enabled, số command `pending` + `dispatched`, insert command và audit trong cùng transaction; không check limit ngoài transaction rồi insert. Device thiếu → 404; disabled → `409 device_disabled`; quá limit → `409 command_queue_full`, `details.limit`.
-- [ ] `POST /api/v1/devices/{id}/commands`: chỉ trả 202 sau commit, có `Location: /api/v1/commands/{id}` và body đúng `02` §4.5.
-- [ ] `GET /api/v1/commands/{id}` và `GET /api/v1/devices/{id}/commands`: đúng field/status, 404, filter status, limit 50/max 200, cursor và sort `(created_at DESC, id DESC)`.
-- [ ] Persist đầy đủ TTL, attempts, timestamps, next_attempt_at, result/error, idempotency và late ACK bằng schema hiện có; không tạo bảng history/projection command ngoài contract.
-- [ ] `tests/command_domain.rs`, `tests/command_api.rs`: C1/C7–C9, malformed/oversize input, auth/CSRF, cursor, raw-byte conflict kể cả JSON tương đương nhưng khác bytes, concurrent create không vượt queue cap, replay không tạo command/audit trùng và audit failure rollback.
+- [x] Domain state enum `pending|dispatched|succeeded|failed|expired`; domain types/error và repository port tối thiểu trong `src/core/command/`, SQLite adapter trong `src/storage/sqlite/commands.rs`. Evidence: `core::command::state::tests::parses_only_contract_command_states`, repository port và SQLite adapter được dùng bởi các handler command.
+- [x] Validate create: name `^[a-z][a-z0-9_.-]{0,63}$`; params object ≤16 384 byte, mặc định `{}`; TTL 1 000..`commands.max_ttl_ms`, mặc định `default_ttl_ms`; idempotency key tùy chọn 1..128 printable ASCII. Evidence: `core::command::create::tests` và `tests/command_api.rs::create_validates_fields_and_device_state`.
+- [x] Lưu hash **raw HTTP body bytes**, không hash JSON đã serialize/chuẩn hóa. Key unique theo device: cùng key + raw hash → command cũ, 202 + `Idempotent-Replayed: true`; khác hash → `409 idempotency_conflict`. Lookup/conflict precedes current TTL validation in the same immediate transaction. Evidence: `tests/command_api.rs::idempotency_uses_raw_request_bytes_and_does_not_audit_replays`, `idempotency_replay_precedes_current_ttl_validation`.
+- [x] Kiểm tra device enabled, số command `pending` + `dispatched`, insert command và audit trong cùng transaction; dùng `BEGIN IMMEDIATE` để serialize kiểm tra limit với insert. Device thiếu → 404; disabled → `409 device_disabled`; quá limit → `409 command_queue_full`, `details.limit`. Evidence: `tests/command_api.rs::concurrent_creates_do_not_exceed_pending_queue_limit`, `create_validates_fields_and_device_state`, `audit_failure_rolls_back_command_and_returns_storage_error`.
+- [x] `POST /api/v1/devices/{id}/commands`: chỉ trả 202 sau commit, có `Location: /api/v1/commands/{id}` và body đúng `02` §4.5. Evidence: `tests/command_api.rs::create_commits_command_and_redacted_audit_before_returning_202`.
+- [x] `GET /api/v1/commands/{id}` và `GET /api/v1/devices/{id}/commands`: đúng field/status, 404, filter status, limit 50/max 200, cursor và sort `(created_at DESC, id DESC)`. Evidence: `tests/command_api.rs::command_list_paginates_filters_and_detail_is_scoped_to_contract_fields`.
+- [ ] ACK/dispatcher state writes for `result`, `error`, and late-ACK columns remain in Section 4. Command creation initializes `attempts`, `next_attempt_at`, timestamps and idempotency using the existing schema; no new command schema/table was added.
+- [x] `tests/command_api.rs`: malformed/oversize input, auth/CSRF, cursor, raw-byte conflict including semantically equal JSON with different bytes, replay after config TTL max drops, concurrent create versus queue cap (including a dispatched row), replay without duplicate command/audit, audit rollback, pagination/filter and redaction; domain validation/state unit tests also pass.
 
 ## 4. Dispatcher, command ACK, expiry và recovery — P3-04
 

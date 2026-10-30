@@ -133,6 +133,61 @@ where
     }
 }
 
+/// JSON extractor that also preserves the original bytes for idempotency hashes.
+pub struct ApiJsonBytes<T>(pub T, pub axum::body::Bytes);
+
+impl<T, S> FromRequest<S> for ApiJsonBytes<T>
+where
+    T: DeserializeOwned,
+    axum::body::Bytes: FromRequest<S>,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let request_id = request_id(&request);
+        let bytes = axum::body::Bytes::from_request(request, state)
+            .await
+            .map_err(|rejection| {
+                let status = rejection.into_response().status();
+                if status == StatusCode::PAYLOAD_TOO_LARGE {
+                    ApiError::new(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "payload_too_large",
+                        "request body too large".to_owned(),
+                        request_id.clone(),
+                    )
+                } else {
+                    ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_json",
+                        "invalid JSON body".to_owned(),
+                        request_id.clone(),
+                    )
+                }
+            })?;
+        let value = serde_json::from_slice(&bytes).map_err(|error| {
+            let code = match error.classify() {
+                serde_json::error::Category::Data => "validation_error",
+                serde_json::error::Category::Syntax
+                | serde_json::error::Category::Eof
+                | serde_json::error::Category::Io => "invalid_json",
+            };
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                code,
+                if code == "invalid_json" {
+                    "invalid JSON body".to_owned()
+                } else {
+                    "invalid request body".to_owned()
+                },
+                request_id,
+            )
+        })?;
+        Ok(Self(value, bytes))
+    }
+}
+
 struct Inner {
     failures: HashMap<(IpAddr, String), VecDeque<Instant>>,
 }
