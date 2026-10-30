@@ -698,6 +698,8 @@ Query tùy chọn `keys` (tối đa 16).
 
 #### `GET /api/v1/devices/{id}/attributes`
 
+Query: `limit` mặc định 50, từ 1 đến 200; `cursor` tùy chọn. Sort `key` tăng dần. Cursor opaque base64url JSON phiên bản 1 gắn với device; cursor sai hoặc không khớp device trả `400 invalid_cursor`.
+
 ```json
 {
   "items": [{
@@ -705,11 +707,12 @@ Query tùy chọn `keys` (tối đa 16).
     "value": "1.4.2",
     "device_ts": 1793149200000,
     "updated_at": 1793149200123
-  }]
+  }],
+  "next_cursor": null
 }
 ```
 
-- Chỉ đọc; admin không ghi attribute trong MVP.
+- Chỉ đọc; admin không ghi attribute trong MVP. Khi còn dữ liệu, `next_cursor` trỏ sau key cuối trang; `null` khi hết. Phân trang không tạo snapshot: cập nhật đồng thời có thể xuất hiện hoặc bị bỏ qua giữa các trang.
 
 ### 4.5. Commands
 

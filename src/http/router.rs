@@ -42,6 +42,10 @@ pub fn build(state: AppState) -> Router {
             "/api/v1/devices/{id}/telemetry/latest",
             routing::get(telemetry::latest),
         )
+        .route(
+            "/api/v1/devices/{id}/attributes",
+            routing::get(telemetry::attributes),
+        )
         .route("/api/v1/events", routing::get(events::upgrade))
         .route("/metrics", routing::get(metrics::export))
         .fallback(fallback)

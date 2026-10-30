@@ -17,7 +17,7 @@ Nguồn sự thật:
 ## 0. Điều kiện vào và quy tắc thực thi
 
 - [x] Phase 2 §8 PASS; inflight saturation được thêm ở `261601d`; sửa presence poison/readiness đã commit ở `d338dd7`.
-- [ ] Chạy lại baseline fmt/Clippy/test trước khi bắt đầu; kiểm tra git status, giữ nguyên công việc chưa commit của người khác.
+- [x] Chạy lại baseline fmt/Clippy/test trước khi bắt đầu; kiểm tra git status, giữ nguyên công việc chưa commit của người khác. Evidence 2026-10-30: `git status --short --branch` sạch trên `master`; `cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings` và `cargo test --all` đều PASS.
 - [ ] Đọc lại contract liên quan trước mỗi task; cập nhật `02` trước khi đổi hành vi, thêm ADR trong `01` nếu đổi version/broker/frontend/TLS. Không lấy các dòng trạng thái cũ trong `AGENTS.md`/báo cáo spike làm bằng chứng phủ định gate đã có trong `TODO_2.md`.
 - [ ] Dùng mã lỗi theo `02` §4.6: field không tồn tại → **400 `validation_error`**; field tồn tại nhưng không hot-reload → **422 `restart_required`**. Gate tóm tắt trong `03` §6 ghi field lạ 422 không khớp contract; không viết test/code theo dòng tóm tắt đó.
 - [ ] Giữ MQTT 3.1.1, SQLite WAL/FULL, một telemetry writer và queue hữu hạn. Không thêm generic framework, projection/cache hoặc dependency ngoài `01` nếu chưa có lý do được ghi nhận.
@@ -33,7 +33,7 @@ Nguồn sự thật:
 - [ ] `GET /api/v1/devices/{id}` và list trả active credential summary, không hash/token; online lấy từ presence RAM, không từ status/LWT. Lỗi presence được xử lý, không fallback im lặng thành offline.
 - [ ] `PATCH /api/v1/devices/{id}` partial có ít nhất một field; unknown field → 400; metadata thay toàn bộ, không merge; tên trùng → `409 device_name_conflict`, device thiếu → `404 device_not_found`.
 - [ ] Disable update + audit → commit → kick theo mục 2; enable không tự reconnect. Không thêm DELETE device vì contract MVP không có endpoint này.
-- [ ] Bổ sung `GET /api/v1/devices/{id}/attributes`: admin chỉ đọc latest key/value/device_ts/updated_at; không thêm API ghi attributes.
+- [x] Bổ sung `GET /api/v1/devices/{id}/attributes`: admin chỉ đọc latest key/value/device_ts/updated_at; không thêm API ghi attributes. Evidence: `attributes_are_latest_per_key_and_invalid_or_retained_updates_are_dropped` gửi attributes qua MQTT và kiểm tra REST, timestamp, phân trang >128 key, auth, device thiếu và lỗi storage.
 - [ ] `tests/device_api.rs`: auth/CSRF, create/get/list/PATCH, boundary validation, unknown/empty PATCH, metadata replace/depth/size, name conflict, pagination/filter, summary redaction và audit failure rollback. Test attributes đọc dữ liệu thực đã ingest.
 
 ## 2. DeviceChannel, rotate và kick — P3-02

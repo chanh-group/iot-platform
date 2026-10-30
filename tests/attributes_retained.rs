@@ -65,14 +65,9 @@ async fn attributes_are_latest_per_key_and_invalid_or_retained_updates_are_dropp
     .await
     .expect("initial attributes should be stored before timeout");
 
-    publish_qos1(
-        &client,
-        &mut eventloop,
-        &topic,
-        false,
-        br#"{"values":{"firmware":"2.0"}}"#,
-    )
-    .await;
+    let device_ts = iot_server::core::auth::now_ms();
+    let update = serde_json::json!({"ts": device_ts, "values": {"firmware": "2.0"}}).to_string();
+    publish_qos1(&client, &mut eventloop, &topic, false, update.as_bytes()).await;
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let value: Option<String> = sqlx::query_scalar(
@@ -106,6 +101,49 @@ async fn attributes_are_latest_per_key_and_invalid_or_retained_updates_are_dropp
         "updating one attribute must preserve the latest value of other keys"
     );
 
+    let url = format!("{}/api/v1/devices/{}/attributes", app.base, device.id);
+    assert_eq!(
+        reqwest::Client::new()
+            .get(&url)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    app.create_admin("attributes-admin", "attributes-test-password")
+        .await;
+    let http = app.client();
+    let login = http
+        .post(format!("{}/api/v1/auth/login", app.base))
+        .header("X-IoT-CSRF", "1")
+        .json(&serde_json::json!({"username": "attributes-admin", "password": "attributes-test-password"}))
+        .send().await.unwrap();
+    assert!(login.status().is_success());
+    let response = http.get(&url).send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["items"].as_array().unwrap().len(), 2);
+    assert_eq!(body["items"][0]["key"], "firmware");
+    assert_eq!(body["items"][0]["value"], "2.0");
+    assert_eq!(body["items"][0]["device_ts"], device_ts);
+    assert!(body["items"][0]["updated_at"].is_i64());
+    assert_eq!(body["items"][1]["value"], 30);
+    assert_eq!(
+        body["items"][1].get("device_ts"),
+        Some(&serde_json::Value::Null)
+    );
+    let missing = http
+        .get(format!("{}/api/v1/devices/missing/attributes", app.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(
+        missing.json::<serde_json::Value>().await.unwrap()["code"],
+        "device_not_found"
+    );
+
     publish_qos1(
         &client,
         &mut eventloop,
@@ -122,6 +160,75 @@ async fn attributes_are_latest_per_key_and_invalid_or_retained_updates_are_dropp
             .expect("query attributes after invalid update");
     assert_eq!(count, 2, "invalid attribute payload must not add a row");
 
+    for start in [0, 100] {
+        let values: serde_json::Map<String, serde_json::Value> = (start..start + 100)
+            .map(|i| (format!("key{i:03}"), serde_json::json!(i)))
+            .collect();
+        let payload = serde_json::json!({"values": values}).to_string();
+        publish_qos1(&client, &mut eventloop, &topic, false, payload.as_bytes()).await;
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM device_attributes WHERE device_id = ?")
+                    .bind(&device.id)
+                    .fetch_one(&app.pool)
+                    .await
+                    .unwrap();
+            if count == 202 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("all attribute payloads should be stored");
+    let first: serde_json::Value = http.get(&url).send().await.unwrap().json().await.unwrap();
+    assert_eq!(first["items"].as_array().unwrap().len(), 50);
+    let cursor = first["next_cursor"].as_str().unwrap();
+    let second: serde_json::Value = http
+        .get(&url)
+        .query(&[("cursor", cursor), ("limit", "200")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(second["items"].as_array().unwrap().len(), 152);
+    assert!(second["next_cursor"].is_null());
+    assert_eq!(first["items"][49]["key"], "key047");
+    assert_eq!(second["items"][0]["key"], "key048");
+    let invalid = http
+        .get(&url)
+        .query(&[("cursor", "bad")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        invalid.json::<serde_json::Value>().await.unwrap()["code"],
+        "invalid_cursor"
+    );
+    let other = app.create_device("other-attributes", true).await;
+    let wrong_device = http
+        .get(format!(
+            "{}/api/v1/devices/{}/attributes",
+            app.base, other.id
+        ))
+        .query(&[("cursor", cursor)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_device.status(), reqwest::StatusCode::BAD_REQUEST);
+    let invalid_limit = http
+        .get(&url)
+        .query(&[("limit", "201")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid_limit.status(), reqwest::StatusCode::BAD_REQUEST);
+
     client
         .publish(&topic, QoS::AtLeastOnce, true, br#"{"values":{"x":1}}"#)
         .await
@@ -132,6 +239,45 @@ async fn attributes_are_latest_per_key_and_invalid_or_retained_updates_are_dropp
         0,
         "retained attributes must be rejected before storage"
     );
+
+    sqlx::query("ALTER TABLE device_attributes RENAME TO unavailable_attributes")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let unavailable = http.get(&url).send().await.unwrap();
+    assert_eq!(
+        unavailable.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        unavailable.json::<serde_json::Value>().await.unwrap()["code"],
+        "storage_unavailable"
+    );
+    sqlx::query("ALTER TABLE devices RENAME TO unavailable_devices")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let unavailable = http.get(&url).send().await.unwrap();
+    assert_eq!(
+        unavailable.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        unavailable.json::<serde_json::Value>().await.unwrap()["code"],
+        "storage_unavailable"
+    );
+    sqlx::query("ALTER TABLE sessions RENAME TO unavailable_sessions")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let unavailable = http.get(&url).send().await.unwrap();
+    assert_eq!(
+        unavailable.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let body = unavailable.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(body["code"], "storage_unavailable");
+    assert!(!body.to_string().contains("unavailable_sessions"));
 }
 
 #[tokio::test]

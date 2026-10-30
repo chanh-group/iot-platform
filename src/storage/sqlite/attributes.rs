@@ -91,6 +91,32 @@ pub async fn upsert(
     }
 }
 
+const FIRST_PAGE: &str = "SELECT key, value_json, device_ts, updated_at FROM device_attributes
+    WHERE device_id = ? ORDER BY key LIMIT ?";
+const NEXT_PAGE: &str = "SELECT key, value_json, device_ts, updated_at FROM device_attributes
+    WHERE device_id = ? AND key > ? ORDER BY key LIMIT ?";
+
+/// Returns the latest stored attributes for one device, ordered by key.
+pub async fn latest(
+    pool: &SqlitePool,
+    device_id: &str,
+    after: Option<&str>,
+    limit: i64,
+) -> Result<Vec<(String, String, Option<i64>, i64)>, sqlx::Error> {
+    let query = sqlx::query_as(if after.is_some() {
+        NEXT_PAGE
+    } else {
+        FIRST_PAGE
+    })
+    .bind(device_id);
+    let query = if let Some(key) = after {
+        query.bind(key)
+    } else {
+        query
+    };
+    query.bind(limit).fetch_all(pool).await
+}
+
 async fn upsert_in_transaction(
     conn: &mut SqliteConnection,
     device_id: &str,
@@ -120,6 +146,29 @@ async fn upsert_in_transaction(
 #[cfg(test)]
 mod tests {
     use serde_json::Value;
+    use sqlx::SqlitePool;
+
+    #[tokio::test]
+    async fn cursor_query_seeks_by_device_and_key() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE device_attributes (device_id TEXT NOT NULL, key TEXT NOT NULL, value_json TEXT, device_ts INTEGER, updated_at INTEGER, PRIMARY KEY (device_id, key))")
+            .execute(&pool).await.unwrap();
+        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {}",
+            super::NEXT_PAGE
+        )))
+        .bind("device")
+        .bind("key")
+        .bind(51_i64)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(
+            plan.iter()
+                .any(|row| row.3.contains("device_id=? AND key>?")),
+            "{plan:?}"
+        );
+    }
 
     fn json_is_serializable(value: &Value) -> bool {
         serde_json::to_string(value).is_ok()

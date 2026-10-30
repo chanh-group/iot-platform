@@ -59,7 +59,13 @@ impl FromRequestParts<AppState> for AuthSession {
         let token_hash = auth::hash_token(&token);
         let session = sessions::verify(&state.pool, &token_hash, auth::now_ms())
             .await
-            .map_err(|error| internal(error, &request_id))?;
+            .map_err(|error| {
+                tracing::warn!(%error, "session storage unavailable");
+                ApiError::from_domain(
+                    DomainError::Unavailable("storage unavailable".to_owned()),
+                    request_id.clone(),
+                )
+            })?;
         session
             .map(AuthSession)
             .ok_or_else(|| ApiError::from_domain(DomainError::Unauthorized, request_id))
