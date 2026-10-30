@@ -147,7 +147,9 @@ async fn retained_replace_clear_and_caps_keep_accounting_consistent() {
     publish_qos1(&client, &mut eventloop, &status, true, b"1234").await;
     assert_eq!(app.retained_count().await, 1, "status should be retained");
     assert!(
-        app.presence.is_online(&device.id),
+        app.presence
+            .is_online(&device.id)
+            .expect("presence state should remain healthy"),
         "retaining status must not change MQTT presence"
     );
 

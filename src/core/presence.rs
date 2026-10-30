@@ -5,7 +5,11 @@
 //! when it still owns the registry entry.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Mutex, MutexGuard};
+
+#[derive(Debug, thiserror::Error)]
+#[error("presence state mutex is poisoned")]
+pub struct PresenceError;
 
 /// Online devices keyed by device id, valued by the current session generation.
 #[derive(Debug, Default)]
@@ -21,41 +25,40 @@ impl Presence {
     }
 
     /// Records the connection generation; returns `true` when it was offline.
-    pub fn connect(&self, device_id: &str, generation: &str) -> bool {
-        self.lock()
+    pub fn connect(&self, device_id: &str, generation: &str) -> Result<bool, PresenceError> {
+        Ok(self
+            .lock()?
             .insert(device_id.to_owned(), generation.to_owned())
-            .is_none()
+            .is_none())
     }
 
     /// Clears presence only when `generation` is still the current connection.
     ///
     /// Returns `true` when this disconnect was the live one.
-    pub fn disconnect(&self, device_id: &str, generation: &str) -> bool {
-        let mut sessions = self.lock();
+    pub fn disconnect(&self, device_id: &str, generation: &str) -> Result<bool, PresenceError> {
+        let mut sessions = self.lock()?;
         if sessions
             .get(device_id)
             .is_none_or(|current| current != generation)
         {
-            return false;
+            return Ok(false);
         }
         sessions.remove(device_id);
-        true
+        Ok(true)
     }
 
     /// Whether the device currently holds a session.
-    #[must_use]
-    pub fn is_online(&self, device_id: &str) -> bool {
-        self.lock().contains_key(device_id)
+    pub fn is_online(&self, device_id: &str) -> Result<bool, PresenceError> {
+        Ok(self.lock()?.contains_key(device_id))
     }
 
     /// Number of online devices.
-    #[must_use]
-    pub fn online_count(&self) -> usize {
-        self.lock().len()
+    pub fn online_count(&self) -> Result<usize, PresenceError> {
+        Ok(self.lock()?.len())
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
-        self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock(&self) -> Result<MutexGuard<'_, HashMap<String, String>>, PresenceError> {
+        self.sessions.lock().map_err(|_| PresenceError)
     }
 }
 
@@ -66,31 +69,48 @@ mod tests {
     #[test]
     fn connect_disconnect_updates_state() {
         let presence = Presence::new();
-        assert!(!presence.is_online("a"));
+        assert!(!presence.is_online("a").unwrap());
 
-        assert!(presence.connect("a", "session-1"));
-        assert!(!presence.connect("a", "session-2"));
-        assert!(presence.is_online("a"));
-        assert_eq!(presence.online_count(), 1);
+        assert!(presence.connect("a", "session-1").unwrap());
+        assert!(!presence.connect("a", "session-2").unwrap());
+        assert!(presence.is_online("a").unwrap());
+        assert_eq!(presence.online_count().unwrap(), 1);
 
-        assert!(presence.disconnect("a", "session-2"));
-        assert!(!presence.is_online("a"));
-        assert_eq!(presence.online_count(), 0);
+        assert!(presence.disconnect("a", "session-2").unwrap());
+        assert!(!presence.is_online("a").unwrap());
+        assert_eq!(presence.online_count().unwrap(), 0);
     }
 
     #[test]
     fn stale_generation_cannot_clear_a_newer_connection() {
         let presence = Presence::new();
-        presence.connect("a", "session-1");
-        presence.connect("a", "session-2");
+        presence.connect("a", "session-1").unwrap();
+        presence.connect("a", "session-2").unwrap();
 
         assert!(
-            !presence.disconnect("a", "session-1"),
+            !presence.disconnect("a", "session-1").unwrap(),
             "disconnect from the replaced session must be ignored"
         );
-        assert!(presence.is_online("a"));
+        assert!(presence.is_online("a").unwrap());
 
-        assert!(presence.disconnect("a", "session-2"));
-        assert!(!presence.is_online("a"));
+        assert!(presence.disconnect("a", "session-2").unwrap());
+        assert!(!presence.is_online("a").unwrap());
+    }
+
+    #[test]
+    fn poisoned_mutex_returns_errors_without_recovering_state() {
+        let presence = std::sync::Arc::new(Presence::new());
+        let to_poison = std::sync::Arc::clone(&presence);
+        let join = std::thread::spawn(move || {
+            let _guard = to_poison.sessions.lock().unwrap();
+            panic!("poison presence mutex for test");
+        })
+        .join();
+        assert!(join.is_err());
+
+        assert!(presence.connect("a", "session").is_err());
+        assert!(presence.disconnect("a", "session").is_err());
+        assert!(presence.is_online("a").is_err());
+        assert!(presence.online_count().is_err());
     }
 }

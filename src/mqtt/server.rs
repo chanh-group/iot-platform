@@ -1,6 +1,7 @@
 //! Lifecycle wrapper around RMQTT's in-process broker.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rmqtt::context::ServerContext;
@@ -8,6 +9,7 @@ use rmqtt::hook::Type;
 use rmqtt::server::MqttServer as RmqttServer;
 use sqlx::SqlitePool;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::schema::MqttConfig;
 use crate::core::presence::Presence;
@@ -25,10 +27,19 @@ use super::server_publish::{ServerPublisher, spawn_ack_worker};
 pub struct MqttServer {
     address: std::net::SocketAddr,
     readiness: Arc<AtomicBool>,
+    connections: Arc<ConnectionLimiter>,
     context: ServerContext,
     task: JoinHandle<anyhow::Result<()>>,
     ack_task: Option<JoinHandle<()>>,
     attributes_task: Option<JoinHandle<()>>,
+}
+
+struct ListenerStoppedGuard(Arc<ConnectionLimiter>);
+
+impl Drop for ListenerStoppedGuard {
+    fn drop(&mut self) {
+        self.0.listener_stopped();
+    }
 }
 
 impl MqttServer {
@@ -77,7 +88,14 @@ impl MqttServer {
             .map_err(|_| anyhow::anyhow!("mqtt.max_connections does not fit usize"))?;
         let max_topic_levels = usize::try_from(config.max_topic_levels)
             .map_err(|_| anyhow::anyhow!("mqtt.max_topic_levels does not fit usize"))?;
-        let connections = Arc::new(ConnectionLimiter::new(max_connections));
+        let presence_failure = CancellationToken::new();
+        let readiness_transition = Arc::new(Mutex::new(()));
+        let connections = Arc::new(ConnectionLimiter::new(
+            max_connections,
+            Arc::clone(&readiness),
+            readiness_transition,
+            presence_failure.clone(),
+        ));
         let context = ServerContext::new().busy_check_enable(false).build().await;
         let max_retained_messages = usize::try_from(config.max_retained_messages)
             .map_err(|_| anyhow::anyhow!("mqtt.max_retained_messages does not fit usize"))?;
@@ -121,7 +139,7 @@ impl MqttServer {
                 Box::new(AclHooks::new(max_topic_levels)),
             )
             .await;
-        let presence_hooks = PresenceHooks::new(pool, presence, connections);
+        let presence_hooks = PresenceHooks::new(pool, presence, Arc::clone(&connections));
         register
             .add_priority(Type::ClientConnected, 10, Box::new(presence_hooks.clone()))
             .await;
@@ -130,21 +148,21 @@ impl MqttServer {
             .await;
         register.start().await;
 
-        let task_readiness = Arc::clone(&readiness);
+        let task_connections = Arc::clone(&connections);
         let task = tokio::spawn(async move {
-            let result = RmqttServer::new(context)
+            let _stopped = ListenerStoppedGuard(task_connections);
+            RmqttServer::new(context)
                 .listener(listener)
                 .build()
                 .run()
-                .await;
-            task_readiness.store(false, Ordering::Release);
-            result
+                .await
         });
 
-        readiness.store(true, Ordering::Release);
+        connections.publish_ready();
         Ok(Self {
             address,
             readiness,
+            connections,
             context: retained_context,
             task,
             ack_task,
@@ -164,8 +182,12 @@ impl MqttServer {
 
     /// Waits for an unexpected broker stop.
     pub async fn wait(&mut self) -> anyhow::Result<()> {
-        (&mut self.task).await.map_err(anyhow::Error::from)??;
-        Ok(())
+        let result =
+            wait_for_task_or_presence_failure(&mut self.task, self.connections.failure()).await;
+        if result.is_err() {
+            self.abort();
+        }
+        result
     }
 
     /// Stops accepting MQTT connections. Session kicking is added with auth/presence.
@@ -181,8 +203,125 @@ impl MqttServer {
     }
 }
 
+async fn wait_for_task_or_presence_failure(
+    task: &mut JoinHandle<anyhow::Result<()>>,
+    presence_failure: &CancellationToken,
+) -> anyhow::Result<()> {
+    let result = tokio::select! {
+        biased;
+        _ = presence_failure.cancelled() => None,
+        result = &mut *task => Some(result),
+    };
+    match result {
+        None => {
+            task.abort();
+            let _ = task.await;
+            anyhow::bail!("MQTT presence state mutex poisoned; stopping listener")
+        }
+        Some(result) => result.map_err(anyhow::Error::from)??,
+    }
+    Ok(())
+}
+
 impl Drop for MqttServer {
     fn drop(&mut self) {
         self.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpStream;
+
+    fn spawn_panicking_listener(connections: Arc<ConnectionLimiter>) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let _stopped = ListenerStoppedGuard(connections);
+            panic!("simulated RMQTT listener panic");
+        })
+    }
+
+    #[tokio::test]
+    async fn unit_test_presence_failure_aborts_a_pending_task() {
+        // Isolate the select branch; a real RMQTT listener is covered below.
+        let mut task = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
+        let presence_failure = CancellationToken::new();
+        presence_failure.cancel();
+
+        let result = wait_for_task_or_presence_failure(&mut task, &presence_failure).await;
+
+        assert!(result.is_err());
+        assert!(task.is_finished());
+    }
+
+    #[tokio::test]
+    async fn listener_panic_before_startup_publish_keeps_readiness_down() {
+        let readiness = Arc::new(AtomicBool::new(false));
+        let connections = Arc::new(ConnectionLimiter::new(
+            1,
+            Arc::clone(&readiness),
+            Arc::new(Mutex::new(())),
+            CancellationToken::new(),
+        ));
+
+        assert!(
+            spawn_panicking_listener(Arc::clone(&connections))
+                .await
+                .unwrap_err()
+                .is_panic()
+        );
+        connections.publish_ready();
+
+        assert!(!readiness.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn listener_panic_after_startup_publish_drops_readiness() {
+        let readiness = Arc::new(AtomicBool::new(false));
+        let connections = Arc::new(ConnectionLimiter::new(
+            1,
+            Arc::clone(&readiness),
+            Arc::new(Mutex::new(())),
+            CancellationToken::new(),
+        ));
+        connections.publish_ready();
+        assert!(readiness.load(Ordering::Acquire));
+
+        assert!(
+            spawn_panicking_listener(connections)
+                .await
+                .unwrap_err()
+                .is_panic()
+        );
+
+        assert!(!readiness.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn presence_failure_stops_real_rmqtt_listener() {
+        let config = MqttConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            ..MqttConfig::default()
+        };
+        let readiness = Arc::new(AtomicBool::new(false));
+        let pool = SqlitePool::connect_lazy("sqlite::memory:").unwrap();
+        let mut server = MqttServer::start(
+            &config,
+            Arc::clone(&readiness),
+            pool,
+            Arc::new(Presence::new()),
+        )
+        .await
+        .unwrap();
+        let address = server.local_addr();
+
+        let probe = TcpStream::connect(address).await.unwrap();
+        drop(probe);
+        server.connections.poison_state_for_test();
+        assert!(server.connections.try_reserve("device-a").is_err());
+
+        assert!(!readiness.load(Ordering::Acquire));
+        assert!(server.wait().await.is_err());
+        assert!(TcpStream::connect(address).await.is_err());
     }
 }

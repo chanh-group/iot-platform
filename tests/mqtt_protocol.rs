@@ -196,7 +196,11 @@ async fn retained_last_will_is_replayed_after_ungraceful_disconnect() {
     drop(client);
     drop(eventloop);
     wait_until(
-        || !app.presence.is_online(&device.id),
+        || {
+            !app.presence
+                .is_online(&device.id)
+                .expect("presence state should remain healthy")
+        },
         WAIT,
         "device disconnect",
     )
@@ -241,7 +245,11 @@ async fn persistent_session_reconnects_then_expires() {
     drop(client);
     drop(eventloop);
     wait_until(
-        || !app.presence.is_online(&device.id),
+        || {
+            !app.presence
+                .is_online(&device.id)
+                .expect("presence state should remain healthy")
+        },
         WAIT,
         "session disconnect",
     )
@@ -265,7 +273,11 @@ async fn persistent_session_reconnects_then_expires() {
     drop(client);
     drop(eventloop);
     wait_until(
-        || !app.presence.is_online(&device.id),
+        || {
+            !app.presence
+                .is_online(&device.id)
+                .expect("presence state should remain healthy")
+        },
         WAIT,
         "second session disconnect",
     )
@@ -288,7 +300,11 @@ async fn broker_restart_discards_persistent_sessions() {
     drop(client);
     drop(eventloop);
     wait_until(
-        || !app.presence.is_online(&device.id),
+        || {
+            !app.presence
+                .is_online(&device.id)
+                .expect("presence state should remain healthy")
+        },
         WAIT,
         "session disconnect",
     )
@@ -450,7 +466,11 @@ async fn offline_session_queue_obeys_its_configured_cap() {
     drop(client);
     drop(eventloop);
     wait_until(
-        || !app.presence.is_online(&device.id),
+        || {
+            !app.presence
+                .is_online(&device.id)
+                .expect("presence state should remain healthy")
+        },
         WAIT,
         "session disconnect before commit",
     )

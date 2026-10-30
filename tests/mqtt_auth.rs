@@ -29,7 +29,12 @@ async fn valid_token_connects_and_marks_presence() {
     assert!(!session_present);
 
     wait_until(
-        || server.presence.is_online(&device.id),
+        || {
+            server
+                .presence
+                .is_online(&device.id)
+                .expect("presence state should remain healthy")
+        },
         WAIT,
         "device to become online",
     )
@@ -39,7 +44,12 @@ async fn valid_token_connects_and_marks_presence() {
     drop(client);
     drop(eventloop);
     wait_until(
-        || !server.presence.is_online(&device.id),
+        || {
+            !server
+                .presence
+                .is_online(&device.id)
+                .expect("presence state should remain healthy")
+        },
         WAIT,
         "device to become offline",
     )
@@ -161,7 +171,13 @@ async fn bad_credentials_are_all_refused_with_the_same_code() {
     drop(client);
     drop(eventloop);
     wait_until(
-        || server.presence.online_count() == 0,
+        || {
+            server
+                .presence
+                .online_count()
+                .expect("presence state should remain healthy")
+                == 0
+        },
         WAIT,
         "presence to drain",
     )
@@ -178,7 +194,7 @@ async fn mqtt_31_and_mqtt_5_are_refused_at_the_wire() {
 
     let v5 = raw_connack(server.mqtt_addr, 5, &device.id, &device.id, &device.token).await;
     assert_eq!(connack_code(&v5, 5), 0x87);
-    assert_eq!(server.presence.online_count(), 0);
+    assert_eq!(server.presence.online_count().unwrap(), 0);
 }
 
 #[tokio::test]
@@ -195,7 +211,12 @@ async fn duplicate_client_id_uses_session_generation() {
     )
     .await;
     wait_until(
-        || server.presence.is_online(&device.id),
+        || {
+            server
+                .presence
+                .is_online(&device.id)
+                .expect("presence state should remain healthy")
+        },
         WAIT,
         "first connection online",
     )
@@ -214,14 +235,22 @@ async fn duplicate_client_id_uses_session_generation() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
-        server.presence.is_online(&device.id),
+        server
+            .presence
+            .is_online(&device.id)
+            .expect("presence state should remain healthy"),
         "disconnect of the replaced session must not clear the new one"
     );
 
     drop(client2);
     drop(eventloop2);
     wait_until(
-        || !server.presence.is_online(&device.id),
+        || {
+            !server
+                .presence
+                .is_online(&device.id)
+                .expect("presence state should remain healthy")
+        },
         WAIT,
         "second connection offline",
     )

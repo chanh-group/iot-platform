@@ -59,10 +59,9 @@ impl AuthHooks {
                 if credential.device_enabled
                     && auth::token_matches(&credential.token_hash, token) =>
             {
-                if self.connections.try_reserve(username) {
-                    AuthResult::Allow(false, None)
-                } else {
-                    AuthResult::NotAuthorized
+                match self.connections.try_reserve(username) {
+                    Ok(true) => AuthResult::Allow(false, None),
+                    Ok(false) | Err(_) => AuthResult::NotAuthorized,
                 }
             }
             // Unknown, disabled, revoked and wrong-token are indistinguishable.
