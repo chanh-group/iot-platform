@@ -34,6 +34,17 @@ pub struct MqttServer {
     attributes_task: Option<JoinHandle<()>>,
 }
 
+/// Reports presence failures through the listener's synchronized failure path.
+#[derive(Clone)]
+pub struct PresenceFailure(Arc<ConnectionLimiter>);
+
+impl PresenceFailure {
+    /// Marks MQTT unavailable and signals the supervisor to stop the listener.
+    pub fn report(&self, error: impl std::fmt::Display) {
+        self.0.report_poisoned_state(error);
+    }
+}
+
 struct ListenerStoppedGuard(Arc<ConnectionLimiter>);
 
 impl Drop for ListenerStoppedGuard {
@@ -43,6 +54,12 @@ impl Drop for ListenerStoppedGuard {
 }
 
 impl MqttServer {
+    /// Returns the failure signal shared with the MQTT hooks.
+    #[must_use]
+    pub fn presence_failure(&self) -> PresenceFailure {
+        PresenceFailure(Arc::clone(&self.connections))
+    }
+
     /// Starts RMQTT in the current process and reports its bound address.
     ///
     /// Auth and presence hooks are registered before the listener runs.
@@ -232,7 +249,74 @@ impl Drop for MqttServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::TcpStream;
+    use std::time::Duration;
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[tokio::test]
+    async fn http_presence_failure_stops_mqtt_listener() {
+        use crate::core::{auth, events::EventBus};
+        use crate::http::{AppState, router};
+        use axum::http::StatusCode;
+
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        crate::storage::sqlite::migrate::run(&pool).await.unwrap();
+        let now = auth::now_ms();
+        sqlx::query("INSERT INTO users (id, username, password_hash, enabled, created_at, updated_at) VALUES ('user', 'admin', 'hash', 1, ?, ?)")
+            .bind(now).bind(now).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO sessions (id, user_id, token_hash, created_at, last_seen_at, expires_at) VALUES ('session', 'user', ?, ?, ?, ?)")
+            .bind(auth::hash_token("test-session").as_slice()).bind(now).bind(now).bind(now + 60_000).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO devices (id, name, enabled, created_at, updated_at) VALUES ('device', 'test', 1, ?, ?)")
+            .bind(now).bind(now).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO device_credentials (id, device_id, token_hash, status, created_at) VALUES ('credential', 'device', ?, 'active', ?)")
+            .bind([0_u8; 32].as_slice()).bind(now).execute(&pool).await.unwrap();
+
+        let readiness = Arc::new(AtomicBool::new(false));
+        let presence = Arc::new(Presence::new());
+        let config = MqttConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            ..MqttConfig::default()
+        };
+        let mut mqtt = MqttServer::start(
+            &config,
+            Arc::clone(&readiness),
+            pool.clone(),
+            Arc::clone(&presence),
+        )
+        .await
+        .unwrap();
+        let address = mqtt.local_addr();
+        let loaded = crate::config::load(std::path::Path::new("conf.toml")).unwrap();
+        let state = AppState::new(
+            pool,
+            Arc::new(loaded),
+            Arc::clone(&readiness),
+            Arc::new(AtomicBool::new(true)),
+            EventBus::new(),
+            Arc::clone(&presence),
+            mqtt.presence_failure(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_addr = listener.local_addr().unwrap();
+        let http =
+            tokio::spawn(async move { axum::serve(listener, router::build(state)).await.unwrap() });
+        presence.poison_for_test();
+        let response = reqwest::Client::new()
+            .get(format!("http://{http_addr}/api/v1/devices/device"))
+            .header("Cookie", "iot_session=test-session")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!readiness.load(Ordering::Acquire));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), mqtt.wait())
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert!(TcpStream::connect(address).await.is_err());
+        http.abort();
+    }
 
     fn spawn_panicking_listener(connections: Arc<ConnectionLimiter>) -> JoinHandle<()> {
         tokio::spawn(async move {

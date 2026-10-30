@@ -3,6 +3,7 @@
 pub mod api_error;
 pub mod assets;
 pub mod auth;
+pub mod devices;
 pub mod events;
 pub mod metrics;
 pub mod middleware;
@@ -18,6 +19,8 @@ use tokio::sync::Semaphore;
 
 use crate::config::LoadedConfig;
 use crate::core::events::EventBus;
+use crate::core::presence::Presence;
+use crate::mqtt::server::PresenceFailure;
 use middleware::LoginRateLimiter;
 
 /// Shared handler state: database pool, config, login limiter, and task readiness.
@@ -37,6 +40,10 @@ pub struct AppState {
     pub telemetry_ready: Arc<AtomicBool>,
     /// Best-effort event stream shared with the telemetry worker.
     pub events: EventBus,
+    /// Registry shared with the MQTT listener.
+    pub presence: Arc<Presence>,
+    /// Signals a poisoned presence registry to the MQTT supervisor.
+    pub presence_failure: PresenceFailure,
     /// Limits active WebSocket connections before upgrade.
     pub ws_connections: Arc<Semaphore>,
 }
@@ -49,6 +56,8 @@ impl AppState {
         mqtt_ready: Arc<AtomicBool>,
         telemetry_ready: Arc<AtomicBool>,
         events: EventBus,
+        presence: Arc<Presence>,
+        presence_failure: PresenceFailure,
     ) -> Self {
         let max_ws_connections =
             usize::try_from(config.config.http.max_ws_connections).unwrap_or(usize::MAX);
@@ -64,6 +73,8 @@ impl AppState {
             mqtt_ready,
             telemetry_ready,
             events,
+            presence,
+            presence_failure,
             ws_connections: Arc::new(Semaphore::new(max_ws_connections)),
         }
     }

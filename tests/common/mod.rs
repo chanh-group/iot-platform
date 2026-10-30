@@ -408,6 +408,8 @@ impl TestAppBuilder {
             mqtt_ready,
             telemetry_ready,
             events.clone(),
+            Arc::clone(&presence),
+            mqtt.presence_failure(),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

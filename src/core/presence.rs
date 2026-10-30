@@ -60,6 +60,19 @@ impl Presence {
     fn lock(&self) -> Result<MutexGuard<'_, HashMap<String, String>>, PresenceError> {
         self.sessions.lock().map_err(|_| PresenceError)
     }
+
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(&self) {
+        let result = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _guard = self.sessions.lock().unwrap();
+                    panic!("poison presence for test");
+                })
+                .join()
+        });
+        assert!(result.is_err());
+    }
 }
 
 #[cfg(test)]

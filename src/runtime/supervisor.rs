@@ -82,7 +82,7 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
         &loaded.config.mqtt,
         Arc::clone(&mqtt_ready),
         pool.clone(),
-        presence,
+        Arc::clone(&presence),
         ingest.clone(),
         limits,
         telemetry_config.queue_capacity as usize,
@@ -131,6 +131,8 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
         mqtt_ready,
         telemetry_ready,
         events,
+        presence,
+        mqtt.presence_failure(),
     );
     let app = router::build(state.clone());
 

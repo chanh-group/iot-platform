@@ -27,10 +27,10 @@ Nguồn sự thật:
 ## 1. Device admin và attributes REST — P3-01
 
 - [ ] Nối domain/repository/HTTP trong `src/core/device.rs`, `src/storage/sqlite/devices.rs`, `src/http/devices.rs`; giữ lookup auth Phase 2 hoạt động. Dùng bảng và index đã có trong migration; không sửa migration đã áp dụng để thêm tính năng.
-- [ ] `GET /api/v1/devices`: `limit` mặc định 50, 1..200; cursor opaque, sort `(created_at DESC, id DESC)`; `q` 2..64 ký tự tìm name/id và filter `enabled` đúng contract. Cursor sai/không khớp truy vấn → `400 invalid_cursor`; không dùng offset.
+- [x] `GET /api/v1/devices`: `limit` mặc định 50, 1..200; cursor opaque, sort `(created_at DESC, id DESC)`; `q` 2..64 ký tự tìm name/id và filter `enabled` đúng contract. Cursor sai/không khớp truy vấn → `400 invalid_cursor`; không dùng offset. Evidence: `tests/device_api.rs` kiểm tra filter, cursor không khớp và phân trang cùng timestamp theo ID giảm dần.
 - [ ] `POST /api/v1/devices`: UUID v7 canonical; name trim, 1..64 ký tự Unicode, không control char, unique ASCII case-insensitive; metadata object ≤8 192 byte, depth ≤8, mặc định `{}`; enabled mặc định true.
 - [ ] Tạo device + credential active + audit trong một transaction ngắn; chỉ trả 201 và token sau commit. Token `iot_` + 43 ký tự base64url từ 32 byte ngẫu nhiên; DB chỉ lưu SHA-256 BLOB, đúng một credential active/device.
-- [ ] `GET /api/v1/devices/{id}` và list trả active credential summary, không hash/token; online lấy từ presence RAM, không từ status/LWT. Lỗi presence được xử lý, không fallback im lặng thành offline.
+- [x] `GET /api/v1/devices/{id}` và list trả active credential summary, không hash/token; online lấy từ presence RAM, không từ status/LWT. Lỗi presence được xử lý, không fallback im lặng thành offline. Evidence: `device_reads_use_live_presence_and_bound_pagination` và `http_presence_failure_stops_mqtt_listener`.
 - [ ] `PATCH /api/v1/devices/{id}` partial có ít nhất một field; unknown field → 400; metadata thay toàn bộ, không merge; tên trùng → `409 device_name_conflict`, device thiếu → `404 device_not_found`.
 - [ ] Disable update + audit → commit → kick theo mục 2; enable không tự reconnect. Không thêm DELETE device vì contract MVP không có endpoint này.
 - [x] Bổ sung `GET /api/v1/devices/{id}/attributes`: admin chỉ đọc latest key/value/device_ts/updated_at; không thêm API ghi attributes. Evidence: `attributes_are_latest_per_key_and_invalid_or_retained_updates_are_dropped` gửi attributes qua MQTT và kiểm tra REST, timestamp, phân trang >128 key, auth, device thiếu và lỗi storage.
