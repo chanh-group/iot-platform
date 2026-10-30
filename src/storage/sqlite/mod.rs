@@ -7,4 +7,5 @@ pub mod migrate;
 pub mod pool;
 pub mod sessions;
 pub mod telemetry;
+pub mod telemetry_query;
 pub mod users;

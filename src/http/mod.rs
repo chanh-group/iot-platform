@@ -3,16 +3,21 @@
 pub mod api_error;
 pub mod assets;
 pub mod auth;
+pub mod events;
+pub mod metrics;
 pub mod middleware;
 pub mod router;
+pub mod telemetry;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use sqlx::SqlitePool;
+use tokio::sync::Semaphore;
 
 use crate::config::LoadedConfig;
+use crate::core::events::EventBus;
 use middleware::LoginRateLimiter;
 
 /// Shared handler state: database pool, config, login limiter, and task readiness.
@@ -30,6 +35,10 @@ pub struct AppState {
     pub mqtt_ready: Arc<AtomicBool>,
     /// Cleared while telemetry commits are failing and retried.
     pub telemetry_ready: Arc<AtomicBool>,
+    /// Best-effort event stream shared with the telemetry worker.
+    pub events: EventBus,
+    /// Limits active WebSocket connections before upgrade.
+    pub ws_connections: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -39,7 +48,10 @@ impl AppState {
         config: Arc<LoadedConfig>,
         mqtt_ready: Arc<AtomicBool>,
         telemetry_ready: Arc<AtomicBool>,
+        events: EventBus,
     ) -> Self {
+        let max_ws_connections =
+            usize::try_from(config.config.http.max_ws_connections).unwrap_or(usize::MAX);
         let limiter = LoginRateLimiter::new(
             config.config.auth.login_max_attempts,
             Duration::from_millis(config.config.auth.login_window_ms),
@@ -51,6 +63,8 @@ impl AppState {
             ready: Arc::new(AtomicBool::new(true)),
             mqtt_ready,
             telemetry_ready,
+            events,
+            ws_connections: Arc::new(Semaphore::new(max_ws_connections)),
         }
     }
 }

@@ -8,6 +8,7 @@ use sqlx::SqlitePool;
 
 use crate::core::auth;
 use crate::core::presence::Presence;
+use crate::observability::metrics::Metrics;
 use crate::storage::sqlite::devices;
 
 /// Keeps online state in RAM and `devices.last_seen_at` at connect/disconnect.
@@ -25,8 +26,7 @@ impl PresenceHooks {
     }
 
     async fn record_last_seen(&self, device_id: &str) {
-        // shortcut: failures are logged only; metric/readiness wiring lands with the
-        // `/metrics` exporter in P2-13.
+        // Last-seen persistence is advisory and must not affect broker readiness.
         if let Err(error) = devices::update_last_seen(&self.pool, device_id, auth::now_ms()).await {
             tracing::warn!(%error, %device_id, "cannot update devices.last_seen_at");
         }
@@ -39,12 +39,16 @@ impl Handler for PresenceHooks {
         match param {
             Parameter::ClientConnected(session) => {
                 let device_id: &str = &session.id.client_id;
-                self.presence.connect(device_id, &session.id.to_string());
+                if self.presence.connect(device_id, &session.id.to_string()) {
+                    Metrics::global().mqtt_connections_active.inc();
+                }
                 self.record_last_seen(device_id).await;
             }
             Parameter::ClientDisconnected(session, _reason) => {
                 let device_id: &str = &session.id.client_id;
-                self.presence.disconnect(device_id, &session.id.to_string());
+                if self.presence.disconnect(device_id, &session.id.to_string()) {
+                    Metrics::global().mqtt_connections_active.dec();
+                }
                 self.record_last_seen(device_id).await;
             }
             _ => {}

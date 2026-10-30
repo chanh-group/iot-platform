@@ -1,4 +1,4 @@
-//! Metric registry skeleton (`02` §4.7). `/metrics` is exposed in P2-13.
+//! Process-wide metrics registry and Prometheus exposition (`02` §4.7).
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,6 +35,16 @@ impl Gauge {
         self.0.store(value, Ordering::Relaxed);
     }
 
+    /// Increments an active-resource gauge.
+    pub fn inc(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Decrements an active-resource gauge.
+    pub fn dec(&self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+
     /// Returns the current value.
     #[must_use]
     pub fn get(&self) -> u64 {
@@ -42,18 +52,66 @@ impl Gauge {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum IngestRejectReason {
+    PayloadTooLarge,
+    InvalidPayload,
+    MissingEventId,
+    InvalidEventId,
+    InvalidTimestamp,
+    QueueFull,
+}
+
+impl IngestRejectReason {
+    const ALL: [Self; 6] = [
+        Self::PayloadTooLarge,
+        Self::InvalidPayload,
+        Self::MissingEventId,
+        Self::InvalidEventId,
+        Self::InvalidTimestamp,
+        Self::QueueFull,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::PayloadTooLarge => "payload_too_large",
+            Self::InvalidPayload => "invalid_payload",
+            Self::MissingEventId => "missing_event_id",
+            Self::InvalidEventId => "invalid_event_id",
+            Self::InvalidTimestamp => "invalid_timestamp",
+            Self::QueueFull => "queue_full",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::PayloadTooLarge => 0,
+            Self::InvalidPayload => 1,
+            Self::MissingEventId => 2,
+            Self::InvalidEventId => 3,
+            Self::InvalidTimestamp => 4,
+            Self::QueueFull => 5,
+        }
+    }
+}
+
+const COMMIT_BUCKETS_MICROS: [u64; 11] = [
+    5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_500_000, 5_000_000,
+    10_000_000,
+];
+
 /// Process-wide metrics named after `02` §4.7.
 #[derive(Debug, Default)]
 pub struct Metrics {
     pub mqtt_connections_active: Gauge,
     pub ingest_accepted_total: Counter,
-    // shortcut: reason label arrives with the `/metrics` exporter in P2-13.
     pub ingest_rejected_total: Counter,
+    pub ingest_rejected_reasons: [Counter; 6],
     pub telemetry_ack_dropped_total: Counter,
     pub telemetry_queue_depth: Gauge,
-    // Histogram `iot_telemetry_commit_seconds` as count + micros until P2-13.
     pub telemetry_commit_count: Counter,
     pub telemetry_commit_micros_total: Counter,
+    pub telemetry_commit_buckets: [Counter; 11],
     pub telemetry_commit_errors_total: Counter,
     pub attribute_rejected_total: Counter,
     pub retained_cap_rejected_total: Counter,
@@ -75,6 +133,108 @@ impl Metrics {
         static METRICS: OnceLock<Metrics> = OnceLock::new();
         METRICS.get_or_init(Self::new)
     }
+
+    pub fn reject_ingest(&self, reason: IngestRejectReason) {
+        self.ingest_rejected_total.inc();
+        self.ingest_rejected_reasons[reason.index()].inc();
+    }
+
+    pub fn observe_telemetry_commit(&self, micros: u64) {
+        self.telemetry_commit_count.inc();
+        self.telemetry_commit_micros_total.add(micros);
+        for (bucket, bound) in self
+            .telemetry_commit_buckets
+            .iter()
+            .zip(COMMIT_BUCKETS_MICROS)
+        {
+            if micros <= bound {
+                bucket.inc();
+                break;
+            }
+        }
+    }
+
+    /// Renders the bounded registry as Prometheus text without device labels.
+    #[must_use]
+    pub fn render_prometheus(&self) -> String {
+        let mut output = String::new();
+        gauge(
+            &mut output,
+            "iot_mqtt_connections_active",
+            self.mqtt_connections_active.get(),
+        );
+        counter(
+            &mut output,
+            "iot_ingest_accepted_total",
+            self.ingest_accepted_total.get(),
+        );
+        output.push_str(
+            "# HELP iot_ingest_rejected_total Rejected telemetry events by reason.\n# TYPE iot_ingest_rejected_total counter\n",
+        );
+        for reason in IngestRejectReason::ALL {
+            let count = self.ingest_rejected_reasons[reason.index()].get();
+            output.push_str(&format!(
+                "iot_ingest_rejected_total{{reason=\"{}\"}} {count}\n",
+                reason.label()
+            ));
+        }
+        gauge(
+            &mut output,
+            "iot_telemetry_queue_depth",
+            self.telemetry_queue_depth.get(),
+        );
+        output.push_str(
+            "# HELP iot_telemetry_commit_seconds Duration of telemetry batch commits.\n# TYPE iot_telemetry_commit_seconds histogram\n",
+        );
+        let mut cumulative = 0;
+        for (bucket, micros) in self
+            .telemetry_commit_buckets
+            .iter()
+            .zip(COMMIT_BUCKETS_MICROS)
+        {
+            cumulative += bucket.get();
+            output.push_str(&format!(
+                "iot_telemetry_commit_seconds_bucket{{le=\"{}\"}} {cumulative}\n",
+                micros as f64 / 1_000_000.0
+            ));
+        }
+        output.push_str(&format!(
+            "iot_telemetry_commit_seconds_bucket{{le=\"+Inf\"}} {}\niot_telemetry_commit_seconds_sum {}\niot_telemetry_commit_seconds_count {}\n",
+            self.telemetry_commit_count.get(),
+            self.telemetry_commit_micros_total.get() as f64 / 1_000_000.0,
+            self.telemetry_commit_count.get()
+        ));
+        counter(
+            &mut output,
+            "iot_telemetry_commit_errors_total",
+            self.telemetry_commit_errors_total.get(),
+        );
+        gauge(
+            &mut output,
+            "iot_commands_pending",
+            self.commands_pending.get(),
+        );
+        counter(
+            &mut output,
+            "iot_commands_expired_total",
+            self.commands_expired_total.get(),
+        );
+        gauge(&mut output, "iot_ws_clients", self.ws_clients.get());
+        counter(
+            &mut output,
+            "iot_ws_dropped_total",
+            self.ws_dropped_total.get(),
+        );
+        output
+    }
+}
+
+fn gauge(output: &mut String, name: &str, value: u64) {
+    output.push_str(&format!("# TYPE {name} gauge\n{name} {value}\n"));
+}
+
+fn counter(output: &mut String, name: &str, value: u64) {
+    output.push_str(&format!("# TYPE {name} counter\n{name} {value}\n"));
 }
 
 #[cfg(test)]
@@ -90,5 +250,17 @@ mod tests {
 
         metrics.telemetry_queue_depth.set(7);
         assert_eq!(metrics.telemetry_queue_depth.get(), 7);
+    }
+
+    #[test]
+    fn exposition_has_reason_labels_and_commit_histogram() {
+        let metrics = Metrics::new();
+        metrics.reject_ingest(IngestRejectReason::QueueFull);
+        metrics.observe_telemetry_commit(20_000);
+        let exposition = metrics.render_prometheus();
+        assert!(exposition.contains("reason=\"queue_full\"} 1"));
+        assert!(exposition.contains("iot_telemetry_commit_seconds_bucket{le=\"0.025\"} 1"));
+        assert!(exposition.contains("iot_telemetry_commit_seconds_count 1"));
+        assert!(!exposition.contains("device_id"));
     }
 }

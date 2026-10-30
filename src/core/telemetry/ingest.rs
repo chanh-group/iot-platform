@@ -5,7 +5,8 @@ use std::time::Duration;
 use sqlx::SqlitePool;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::observability::metrics::Metrics;
+use crate::core::events::{EventBus, TelemetryCommitted};
+use crate::observability::metrics::{IngestRejectReason, Metrics};
 use crate::storage::sqlite::telemetry::{self, InsertResult};
 
 use super::ValidatedTelemetry;
@@ -48,7 +49,7 @@ impl IngestHandle {
             })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => {
-                    Metrics::global().ingest_rejected_total.inc();
+                    Metrics::global().reject_ingest(IngestRejectReason::QueueFull);
                     IngestSubmitError::Full
                 }
                 mpsc::error::TrySendError::Closed(_) => IngestSubmitError::Closed,
@@ -64,6 +65,7 @@ impl IngestHandle {
 /// Starts one bounded queue and its single SQLite batch writer.
 pub fn spawn_worker(
     pool: SqlitePool,
+    events: EventBus,
     capacity: usize,
     batch_size: usize,
     max_batch_bytes: usize,
@@ -74,6 +76,7 @@ pub fn spawn_worker(
     let handle = IngestHandle(sender);
     let task = tokio::spawn(run_worker(
         pool,
+        events,
         receiver,
         batch_size,
         max_batch_bytes,
@@ -85,6 +88,7 @@ pub fn spawn_worker(
 
 async fn run_worker(
     pool: SqlitePool,
+    events: EventBus,
     mut receiver: mpsc::Receiver<Work>,
     batch_size: usize,
     max_batch_bytes: usize,
@@ -158,11 +162,16 @@ async fn run_worker(
             }
         };
         readiness.store(true, Ordering::Release);
-        Metrics::global().telemetry_commit_count.inc();
-        Metrics::global()
-            .telemetry_commit_micros_total
-            .add(started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
+        Metrics::global().observe_telemetry_commit(
+            started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+        );
         for (work, result) in batch.into_iter().zip(results) {
+            if result == InsertResult::Stored {
+                events.publish(TelemetryCommitted::from_telemetry(
+                    &work.device_id,
+                    &work.event,
+                ));
+            }
             if let Some(response) = work.response {
                 let _ = response.send(Ok(result));
             }

@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::LoadedConfig;
+use crate::core::events::EventBus;
 use crate::core::presence::Presence;
 use crate::core::telemetry::{self, TelemetryPayload};
 use crate::http::{AppState, router};
@@ -52,6 +53,7 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
     }
 
     let telemetry_config = &loaded.config.telemetry;
+    let events = EventBus::new();
     let telemetry_ready = Arc::new(AtomicBool::new(true));
     let limits = match TelemetryPayload::try_from(telemetry_config) {
         Ok(limits) => limits,
@@ -63,6 +65,7 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
     };
     let (ingest, mut ingest_task) = telemetry::spawn_worker(
         pool.clone(),
+        events.clone(),
         telemetry_config.queue_capacity as usize,
         telemetry_config.batch_size as usize,
         telemetry_config.max_batch_bytes as usize,
@@ -119,7 +122,13 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
     logging::startup(config_path, &loaded, listen_addr);
 
     let shutdown_timeout = Duration::from_millis(loaded.config.server.shutdown_timeout_ms);
-    let state = AppState::new(pool.clone(), Arc::new(loaded), mqtt_ready, telemetry_ready);
+    let state = AppState::new(
+        pool.clone(),
+        Arc::new(loaded),
+        mqtt_ready,
+        telemetry_ready,
+        events,
+    );
     let app = router::build(state.clone());
 
     let cancel = CancellationToken::new();

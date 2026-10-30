@@ -36,7 +36,7 @@ uuid = { version = "1.29.0", features = ["serde", "v7"] }
 [dev-dependencies]
 assert_cmd = "2.2.2"
 predicates = "3.1.4"
-reqwest = { version = "0.13.5", features = ["cookies", "json"] }
+reqwest = { version = "0.13.5", features = ["cookies", "json", "query"] }
 rumqttc = "0.25.1"
 tempfile = "3.27.0"
 tokio-tungstenite = "0.30.0"

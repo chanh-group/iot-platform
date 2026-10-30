@@ -219,6 +219,7 @@ pub async fn logout(
     tx.commit()
         .await
         .map_err(|error| internal(error, &request_id))?;
+    state.events.publish_session_revocation(&session.id);
 
     let mut response = StatusCode::NO_CONTENT.into_response();
     response.headers_mut().insert(

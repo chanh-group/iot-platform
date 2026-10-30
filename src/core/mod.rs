@@ -5,5 +5,6 @@ pub mod attributes;
 pub mod auth;
 pub mod device_channel;
 pub mod domain_error;
+pub mod events;
 pub mod presence;
 pub mod telemetry;

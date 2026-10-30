@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use iot_server::config::{self, LoadedConfig};
 use iot_server::core::auth;
+use iot_server::core::events::EventBus;
 use iot_server::core::presence::Presence;
 use iot_server::core::telemetry::{self as telemetry_core, TelemetryPayload};
 use iot_server::http::{AppState, router};
@@ -219,6 +220,7 @@ impl Drop for TestApp {
 pub struct TestAppBuilder {
     dashboard: bool,
     cookie_secure: bool,
+    metrics_token: Option<String>,
     max_body_bytes: u64,
     login_max_attempts: u64,
     max_retained_messages: u64,
@@ -230,6 +232,7 @@ impl Default for TestAppBuilder {
         Self {
             dashboard: true,
             cookie_secure: false,
+            metrics_token: None,
             max_body_bytes: 262_144,
             login_max_attempts: 5,
             max_retained_messages: 10_000,
@@ -246,6 +249,11 @@ impl TestAppBuilder {
 
     pub fn cookie_secure(mut self, secure: bool) -> Self {
         self.cookie_secure = secure;
+        self
+    }
+
+    pub fn metrics_token(mut self, token: &str) -> Self {
+        self.metrics_token = Some(token.to_owned());
         self
     }
 
@@ -269,6 +277,9 @@ impl TestAppBuilder {
         let dir = TempDir::new().unwrap();
         let config_path = dir.path().join("conf.toml");
         let mqtt_port = free_port();
+        let metrics_token_env = self.metrics_token.as_ref().map_or(String::new(), |_| {
+            "metrics_bearer_token_env = \"TEST_METRICS_BEARER_TOKEN\"\n".to_owned()
+        });
         fs::write(
             &config_path,
             format!(
@@ -279,6 +290,8 @@ impl TestAppBuilder {
                  listen = \"127.0.0.1:0\"\n\
                  dashboard = {}\n\
                  cookie_secure = {}\n\
+                 metrics = {}\n\
+                 {}\
                  max_body_bytes = {}\n\
                  [mqtt]\n\
                  listen = \"127.0.0.1:{}\"\n\
@@ -290,6 +303,8 @@ impl TestAppBuilder {
                  login_max_attempts = {}\n",
                 self.dashboard,
                 self.cookie_secure,
+                self.metrics_token.is_some(),
+                metrics_token_env,
                 self.max_body_bytes,
                 mqtt_port,
                 self.max_retained_messages,
@@ -299,7 +314,15 @@ impl TestAppBuilder {
         )
         .unwrap();
 
-        let loaded = Arc::new(config::load_with_env(&config_path, |_| None).unwrap());
+        let metrics_token = self.metrics_token.clone();
+        let loaded = Arc::new(
+            config::load_with_env(&config_path, move |name| {
+                (name == "TEST_METRICS_BEARER_TOKEN")
+                    .then(|| metrics_token.clone())
+                    .flatten()
+            })
+            .unwrap(),
+        );
         let lock = DataDirLock::try_new(&loaded.data_dir).unwrap();
         let pool = pool::connect(&loaded).await.unwrap();
         migrate::run(&pool).await.unwrap();
@@ -307,10 +330,12 @@ impl TestAppBuilder {
         let mqtt_ready = Arc::new(AtomicBool::new(false));
         let presence = Arc::new(Presence::new());
         let telemetry = &loaded.config.telemetry;
+        let events = EventBus::new();
         let limits = TelemetryPayload::try_from(telemetry).unwrap();
         let telemetry_ready = Arc::new(AtomicBool::new(true));
         let (ingest, telemetry_task) = telemetry_core::spawn_worker(
             pool.clone(),
+            events.clone(),
             telemetry.queue_capacity as usize,
             telemetry.batch_size as usize,
             telemetry.max_batch_bytes as usize,
@@ -334,6 +359,7 @@ impl TestAppBuilder {
             Arc::clone(&loaded),
             mqtt_ready,
             telemetry_ready,
+            events,
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

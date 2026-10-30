@@ -115,8 +115,23 @@ impl Handler for AclHooks {
                             }
                             Err(error) => {
                                 crate::observability::metrics::Metrics::global()
-                                    .ingest_rejected_total
-                                    .inc();
+                                    .reject_ingest(match error {
+                                        telemetry::TelemetryError::PayloadTooLarge => {
+                                            crate::observability::metrics::IngestRejectReason::PayloadTooLarge
+                                        }
+                                        telemetry::TelemetryError::InvalidPayload => {
+                                            crate::observability::metrics::IngestRejectReason::InvalidPayload
+                                        }
+                                        telemetry::TelemetryError::MissingEventId => {
+                                            crate::observability::metrics::IngestRejectReason::MissingEventId
+                                        }
+                                        telemetry::TelemetryError::InvalidEventId => {
+                                            crate::observability::metrics::IngestRejectReason::InvalidEventId
+                                        }
+                                        telemetry::TelemetryError::InvalidTimestamp => {
+                                            crate::observability::metrics::IngestRejectReason::InvalidTimestamp
+                                        }
+                                    });
                                 ack.send(
                                     device_id.to_owned(),
                                     telemetry::event_id_from_raw(payload),

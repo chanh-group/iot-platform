@@ -78,14 +78,14 @@ Nguồn sự thật:
 
 ## 6. Telemetry REST, events WebSocket và metrics — P2-10, P2-11, P2-13
 
-- [ ] `GET /api/v1/devices/{id}/telemetry`: auth admin, `from`/`to` bắt buộc `[from,to)`, range ≤31 ngày, limit/cursor opaque đúng contract; filter `keys` tối đa 16 và chỉ trả event có ít nhất một key khớp.
-- [ ] `GET /api/v1/devices/{id}/telemetry/latest`: latest xác định theo `(ts, received_at, internal_id)`, sort key tăng; không thêm projection/cache trước benchmark.
-- [ ] Test `tests/telemetry_api.rs`: history ordering/cursor, key filter, latest tie-break, missing device, cursor/range invalid (H9/H10), không lộ SQL/error nội bộ.
-- [ ] Tạo EventBus broadcast best-effort và WS `/api/v1/events`: cookie + Origin validation có sẵn, gửi `hello`, subscribe/unsubscribe/ping theo contract; telemetry chỉ publish event **sau SQL commit**.
-- [ ] Bounded broadcast/per-client WS queues; lag/full đóng 1013. Chỉ cần telemetry/hello/subscription trong Phase 2; command/config/system đầy đủ thuộc Phase 3/4.
-- [ ] Test `tests/ws_telemetry.rs`: subscribe device đúng nhận committed event, event không phát trước/không có khi validation/commit fail, subscribe sai bị lỗi, reconnect dùng REST history để bù.
-- [ ] Hoàn thiện `/metrics` theo contract: mặc định 404; khi bật chỉ Bearer token env riêng (≥32 byte), không cookie/session, token không lộ config/log. Có connection active, ingest accepted/rejected reason, queue depth, commit latency/errors; không label device ID.
-- [ ] Test `/metrics` auth/tắt/bật và metric telemetry chính; không thêm Prometheus dependency ngoài stack đã chốt nếu registry skeleton hiện có đáp ứng được.
+- [x] `GET /api/v1/devices/{id}/telemetry`: auth admin, `from`/`to` bắt buộc `[from,to)`, range ≤31 ngày, limit/cursor opaque đúng contract; filter `keys` tối đa 16 và chỉ trả event có ít nhất một key khớp.
+- [x] `GET /api/v1/devices/{id}/telemetry/latest`: latest xác định theo `(ts, received_at, internal_id)`, sort key tăng; không thêm projection/cache trước benchmark.
+- [x] Test `tests/telemetry_api.rs`: history ordering/cursor, key filter, latest tie-break, missing device, cursor/range invalid (H9/H10), không lộ SQL/error nội bộ.
+- [x] Tạo EventBus broadcast best-effort và WS `/api/v1/events`: cookie + Origin validation có sẵn, gửi `hello`, subscribe/unsubscribe/ping theo contract; telemetry chỉ publish event **sau SQL commit**.
+- [x] Bounded broadcast/per-client WS queues; lag/full đóng 1013. Chỉ cần telemetry/hello/subscription trong Phase 2; command/config/system đầy đủ thuộc Phase 3/4.
+- [x] Test `tests/ws_telemetry.rs`: subscribe device đúng nhận committed event, event không phát trước/không có khi validation/commit fail, subscribe sai bị lỗi, reconnect dùng REST history để bù.
+- [x] Hoàn thiện `/metrics` theo contract: mặc định 404; khi bật chỉ Bearer token env riêng (≥32 byte), không cookie/session, token không lộ config/log. Có connection active, ingest accepted/rejected reason, queue depth, commit latency/errors; không label device ID.
+- [x] Test `/metrics` auth/tắt/bật và metric telemetry chính; không thêm Prometheus dependency ngoài stack đã chốt nếu registry skeleton hiện có đáp ứng được.
 
 ## 7. Protocol suite và acceptance — P2-12
 
