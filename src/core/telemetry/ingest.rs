@@ -2,19 +2,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use sqlx::SqlitePool;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::core::events::{EventBus, TelemetryCommitted};
 use crate::observability::metrics::{IngestRejectReason, Metrics};
-use crate::storage::sqlite::telemetry::{self, InsertResult};
 
-use super::ValidatedTelemetry;
+use super::{TelemetryInsertResult, TelemetryRepository, ValidatedTelemetry};
 
 struct Work {
     device_id: String,
     event: ValidatedTelemetry,
-    response: Option<oneshot::Sender<Result<InsertResult, ()>>>,
+    response: Option<oneshot::Sender<Result<TelemetryInsertResult, ()>>>,
 }
 
 /// Handle used to submit validated telemetry to the bounded ingest queue.
@@ -22,7 +20,7 @@ struct Work {
 pub struct IngestHandle(mpsc::Sender<Work>);
 
 /// Completion receiver for a submitted telemetry event.
-pub type IngestResult = oneshot::Receiver<Result<InsertResult, ()>>;
+pub type IngestResult = oneshot::Receiver<Result<TelemetryInsertResult, ()>>;
 
 /// Why a telemetry event could not be submitted to the ingest queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,9 +60,9 @@ impl IngestHandle {
     }
 }
 
-/// Starts one bounded queue and its single SQLite batch writer.
+/// Starts one bounded queue and its single batch writer.
 pub fn spawn_worker(
-    pool: SqlitePool,
+    repository: Arc<dyn TelemetryRepository>,
     events: EventBus,
     capacity: usize,
     batch_size: usize,
@@ -75,7 +73,7 @@ pub fn spawn_worker(
     let (sender, receiver) = mpsc::channel(capacity);
     let handle = IngestHandle(sender);
     let task = tokio::spawn(run_worker(
-        pool,
+        repository,
         events,
         receiver,
         batch_size,
@@ -87,7 +85,7 @@ pub fn spawn_worker(
 }
 
 async fn run_worker(
-    pool: SqlitePool,
+    repository: Arc<dyn TelemetryRepository>,
     events: EventBus,
     mut receiver: mpsc::Receiver<Work>,
     batch_size: usize,
@@ -142,7 +140,7 @@ async fn run_worker(
         let mut backoff = Duration::from_millis(100);
         let mut notified_storage_error = false;
         let results = loop {
-            match telemetry::insert_batch(&pool, &rows).await {
+            match repository.insert_batch(&rows).await {
                 Ok(results) => break results,
                 Err(error) => {
                     readiness.store(false, Ordering::Release);
@@ -166,7 +164,7 @@ async fn run_worker(
             started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
         );
         for (work, result) in batch.into_iter().zip(results) {
-            if result == InsertResult::Stored {
+            if result == TelemetryInsertResult::Stored {
                 events.publish(TelemetryCommitted::from_telemetry(
                     &work.device_id,
                     &work.event,

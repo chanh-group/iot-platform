@@ -21,6 +21,7 @@ use crate::mqtt::server::MqttServer;
 use crate::observability::logging;
 use crate::runtime::data_dir_lock::DataDirLock;
 use crate::runtime::{EXIT_LOCK, EXIT_MIGRATION, EXIT_RUNTIME, shutdown};
+use crate::storage::sqlite::telemetry::SqliteTelemetryRepository;
 use crate::storage::sqlite::{migrate, pool};
 
 /// Runs the server until SIGINT/SIGTERM, then drains HTTP within the deadline.
@@ -64,7 +65,7 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
         }
     };
     let (ingest, mut ingest_task) = telemetry::spawn_worker(
-        pool.clone(),
+        Arc::new(SqliteTelemetryRepository::new(pool.clone())),
         events.clone(),
         telemetry_config.queue_capacity as usize,
         telemetry_config.batch_size as usize,

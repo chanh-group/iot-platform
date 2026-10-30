@@ -119,13 +119,13 @@ pub(crate) fn spawn_ack_worker(
             let (status, code) = match ack.outcome {
                 AckOutcome::Immediate { status, code } => (status, code),
                 AckOutcome::Ingest(result) => match result.await {
-                    Ok(Ok(crate::storage::sqlite::telemetry::InsertResult::Stored)) => {
+                    Ok(Ok(crate::core::telemetry::TelemetryInsertResult::Stored)) => {
                         ("stored", None)
                     }
-                    Ok(Ok(crate::storage::sqlite::telemetry::InsertResult::Duplicate)) => {
+                    Ok(Ok(crate::core::telemetry::TelemetryInsertResult::Duplicate)) => {
                         ("duplicate", None)
                     }
-                    Ok(Ok(crate::storage::sqlite::telemetry::InsertResult::Conflict)) => {
+                    Ok(Ok(crate::core::telemetry::TelemetryInsertResult::Conflict)) => {
                         ("rejected", Some("event_id_conflict"))
                     }
                     Ok(Err(())) | Err(_) => ("retryable", Some("storage_unavailable")),

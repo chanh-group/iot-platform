@@ -3,14 +3,29 @@
 use serde_json::Value;
 use sqlx::{SqliteConnection, SqlitePool};
 
-use crate::core::telemetry::ValidatedTelemetry;
+use crate::core::telemetry::{
+    TelemetryInsertResult as InsertResult, TelemetryRepository, ValidatedTelemetry,
+};
 
-/// Outcome of inserting one event, including event-id retry resolution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InsertResult {
-    Stored,
-    Duplicate,
-    Conflict,
+/// SQLite-backed implementation of the telemetry persistence port.
+pub struct SqliteTelemetryRepository {
+    pool: SqlitePool,
+}
+
+impl SqliteTelemetryRepository {
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait::async_trait]
+impl TelemetryRepository for SqliteTelemetryRepository {
+    async fn insert_batch(
+        &self,
+        events: &[(String, ValidatedTelemetry)],
+    ) -> anyhow::Result<Vec<InsertResult>> {
+        Ok(insert_batch(&self.pool, events).await?)
+    }
 }
 
 /// Inserts one batch atomically; identical retries deduplicate, changed bytes conflict.

@@ -16,6 +16,7 @@ use iot_server::core::telemetry::{self as telemetry_core, TelemetryPayload};
 use iot_server::http::{AppState, router};
 use iot_server::mqtt::server::MqttServer;
 use iot_server::runtime::data_dir_lock::DataDirLock;
+use iot_server::storage::sqlite::telemetry::SqliteTelemetryRepository;
 use iot_server::storage::sqlite::users;
 use iot_server::storage::sqlite::{migrate, pool};
 use reqwest::StatusCode;
@@ -334,7 +335,7 @@ impl TestAppBuilder {
         let limits = TelemetryPayload::try_from(telemetry).unwrap();
         let telemetry_ready = Arc::new(AtomicBool::new(true));
         let (ingest, telemetry_task) = telemetry_core::spawn_worker(
-            pool.clone(),
+            Arc::new(SqliteTelemetryRepository::new(pool.clone())),
             events.clone(),
             telemetry.queue_capacity as usize,
             telemetry.batch_size as usize,

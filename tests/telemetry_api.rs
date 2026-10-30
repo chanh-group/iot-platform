@@ -42,7 +42,7 @@ async fn insert_event(
         telemetry_storage::insert_batch(&app.pool, &[(device_id.to_owned(), event)])
             .await
             .unwrap(),
-        [iot_server::storage::sqlite::telemetry::InsertResult::Stored]
+        [iot_server::core::telemetry::TelemetryInsertResult::Stored]
     );
 }
 
