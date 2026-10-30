@@ -22,7 +22,16 @@ fn topic_levels(topic: &str) -> usize {
 /// A device may publish only to its own concrete business topics.
 #[must_use]
 pub fn can_publish(device_id: &str, topic: &str) -> bool {
-    if topic.contains('+') || topic.contains('#') || topic_levels(topic) > MAX_TOPIC_LEVELS {
+    can_publish_with_limit(device_id, topic, MAX_TOPIC_LEVELS)
+}
+
+/// Applies the configured level limit without exceeding the contract ceiling.
+#[must_use]
+pub fn can_publish_with_limit(device_id: &str, topic: &str, max_topic_levels: usize) -> bool {
+    if topic.contains('+')
+        || topic.contains('#')
+        || topic_levels(topic) > max_topic_levels.min(MAX_TOPIC_LEVELS)
+    {
         return false;
     }
     let Some(suffix) = device_suffix(device_id, topic) else {
@@ -39,7 +48,13 @@ pub fn can_publish(device_id: &str, topic: &str) -> bool {
 /// A device may read only its own server topics and its `data/` subtree.
 #[must_use]
 pub fn can_subscribe(device_id: &str, filter: &str) -> bool {
-    if filter.starts_with('$') || topic_levels(filter) > MAX_TOPIC_LEVELS {
+    can_subscribe_with_limit(device_id, filter, MAX_TOPIC_LEVELS)
+}
+
+/// Applies the configured filter-level limit without exceeding the contract ceiling.
+#[must_use]
+pub fn can_subscribe_with_limit(device_id: &str, filter: &str, max_topic_levels: usize) -> bool {
+    if filter.starts_with('$') || topic_levels(filter) > max_topic_levels.min(MAX_TOPIC_LEVELS) {
         return false;
     }
     let Some(suffix) = device_suffix(device_id, filter) else {
@@ -176,5 +191,18 @@ mod tests {
         assert!(!can_publish("", "/telemetry"));
         assert!(!can_subscribe("", "devices//data/#"));
         assert!(!can_subscribe("", "$SYS/#"));
+    }
+
+    #[test]
+    fn configured_topic_level_limit_applies_to_publish_and_subscribe() {
+        let publish = own(A, "data/x/y");
+        let filter = own(A, "data/x/y/#");
+        assert!(can_publish_with_limit(A, &publish, 5));
+        assert!(!can_publish_with_limit(A, &publish, 4));
+        assert!(can_subscribe_with_limit(A, &filter, 6));
+        assert!(!can_subscribe_with_limit(A, &filter, 5));
+        assert!(can_publish_with_limit(A, &publish, usize::MAX));
+        let beyond_contract = own(A, &format!("data/{}", vec!["x"; 14].join("/")));
+        assert!(!can_publish_with_limit(A, &beyond_contract, usize::MAX));
     }
 }

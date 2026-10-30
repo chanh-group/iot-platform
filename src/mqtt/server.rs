@@ -17,7 +17,7 @@ use crate::storage::sqlite::attributes as attribute_storage;
 use super::acl::AclHooks;
 use super::auth::AuthHooks;
 use super::config;
-use super::presence::PresenceHooks;
+use super::presence::{ConnectionLimiter, PresenceHooks};
 use super::retained::BudgetedRetainStorage;
 use super::server_publish::{ServerPublisher, spawn_ack_worker};
 
@@ -73,6 +73,11 @@ impl MqttServer {
     ) -> anyhow::Result<Self> {
         let listener = config::listener(config)?;
         let address = listener.local_addr()?;
+        let max_connections = usize::try_from(config.max_connections)
+            .map_err(|_| anyhow::anyhow!("mqtt.max_connections does not fit usize"))?;
+        let max_topic_levels = usize::try_from(config.max_topic_levels)
+            .map_err(|_| anyhow::anyhow!("mqtt.max_topic_levels does not fit usize"))?;
+        let connections = Arc::new(ConnectionLimiter::new(max_connections));
         let context = ServerContext::new().busy_check_enable(false).build().await;
         let max_retained_messages = usize::try_from(config.max_retained_messages)
             .map_err(|_| anyhow::anyhow!("mqtt.max_retained_messages does not fit usize"))?;
@@ -90,7 +95,7 @@ impl MqttServer {
             .add_priority(
                 Type::ClientAuthenticate,
                 10,
-                Box::new(AuthHooks::new(pool.clone())),
+                Box::new(AuthHooks::new(pool.clone(), Arc::clone(&connections))),
             )
             .await;
         let (acl_hooks, ack_task, attributes_task) = match ingest {
@@ -99,20 +104,24 @@ impl MqttServer {
                     attribute_storage::spawn_worker(pool.clone(), attribute_queue_capacity);
                 let (ack, task) = spawn_ack_worker(publisher);
                 (
-                    AclHooks::with_ingest(ingest, attributes, limits, ack),
+                    AclHooks::with_ingest(ingest, attributes, limits, ack, max_topic_levels),
                     Some(task),
                     Some(attributes_task),
                 )
             }
-            None => (AclHooks::new(), None, None),
+            None => (AclHooks::new(max_topic_levels), None, None),
         };
         register
             .add_priority(Type::MessagePublishCheckAcl, 10, Box::new(acl_hooks))
             .await;
         register
-            .add_priority(Type::ClientSubscribeCheckAcl, 10, Box::new(AclHooks::new()))
+            .add_priority(
+                Type::ClientSubscribeCheckAcl,
+                10,
+                Box::new(AclHooks::new(max_topic_levels)),
+            )
             .await;
-        let presence_hooks = PresenceHooks::new(pool, presence);
+        let presence_hooks = PresenceHooks::new(pool, presence, connections);
         register
             .add_priority(Type::ClientConnected, 10, Box::new(presence_hooks.clone()))
             .await;

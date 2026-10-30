@@ -5,6 +5,8 @@
 //! `NotAuthorized` to CONNACK `0x05` for level 3 and `0x87` for level 5, and
 //! `BadUsernameOrPassword` to `0x04`.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use rmqtt::hook::{Handler, HookResult, Parameter, ReturnType};
 use rmqtt::types::{AuthResult, ConnectInfo};
@@ -13,18 +15,21 @@ use sqlx::SqlitePool;
 use crate::core::auth;
 use crate::storage::sqlite::devices;
 
+use super::presence::ConnectionLimiter;
+
 /// Authenticates devices: MQTT 3.1.1 only, `client_id = username = device_id`,
 /// active credential matching the presented token.
 #[derive(Clone)]
 pub struct AuthHooks {
     pool: SqlitePool,
+    connections: Arc<ConnectionLimiter>,
 }
 
 impl AuthHooks {
     /// Hooks read credentials through this pool.
     #[must_use]
-    pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+    pub(crate) fn new(pool: SqlitePool, connections: Arc<ConnectionLimiter>) -> Self {
+        Self { pool, connections }
     }
 
     async fn authenticate(&self, connect: &ConnectInfo) -> AuthResult {
@@ -54,7 +59,11 @@ impl AuthHooks {
                 if credential.device_enabled
                     && auth::token_matches(&credential.token_hash, token) =>
             {
-                AuthResult::Allow(false, None)
+                if self.connections.try_reserve(username) {
+                    AuthResult::Allow(false, None)
+                } else {
+                    AuthResult::NotAuthorized
+                }
             }
             // Unknown, disabled, revoked and wrong-token are indistinguishable.
             Ok(_) => AuthResult::BadUsernameOrPassword,

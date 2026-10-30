@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
+use iot_server::config::schema::MqttConfig;
 use iot_server::config::{self, LoadedConfig};
 use iot_server::core::auth;
 use iot_server::core::events::EventBus;
@@ -20,19 +21,23 @@ use iot_server::storage::sqlite::telemetry::SqliteTelemetryRepository;
 use iot_server::storage::sqlite::users;
 use iot_server::storage::sqlite::{migrate, pool};
 use reqwest::StatusCode;
+use reqwest::header::{COOKIE, ORIGIN, SET_COOKIE};
 use rumqttc::{
     AsyncClient, ConnectReturnCode, ConnectionError, Event as MqttEvent, EventLoop, MqttOptions,
-    Packet,
+    Packet, QoS, SubscribeReasonCode,
 };
+use serde_json::Value;
 use sqlx::SqlitePool;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 use uuid::Uuid;
 
 pub const PASSWORD: &str = "correct horse battery staple";
 
-/// Reserves a free loopback port, retrying up to three times.
+/// Reserves a loopback port, retrying up to three times.
 pub fn free_port() -> u16 {
     for _ in 0..3 {
         if let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0") {
@@ -106,12 +111,23 @@ impl TestApp {
     pub async fn create_device(&self, name: &str, enabled: bool) -> TestDevice {
         let id = Uuid::now_v7().to_string();
         let token = format!("iot_{}", auth::generate_session_token().unwrap());
+        self.create_device_with_identity(&id, &token, name, enabled)
+            .await
+    }
+
+    pub async fn create_device_with_identity(
+        &self,
+        id: &str,
+        token: &str,
+        name: &str,
+        enabled: bool,
+    ) -> TestDevice {
         let now = auth::now_ms();
         sqlx::query(
             "INSERT INTO devices (id, name, metadata_json, enabled, created_at, updated_at)
              VALUES (?, ?, '{}', ?, ?, ?)",
         )
-        .bind(&id)
+        .bind(id)
         .bind(name)
         .bind(enabled)
         .bind(now)
@@ -124,13 +140,16 @@ impl TestApp {
              VALUES (?, ?, ?, 'active', ?)",
         )
         .bind(Uuid::now_v7().to_string())
-        .bind(&id)
-        .bind(auth::hash_token(&token).to_vec())
+        .bind(id)
+        .bind(auth::hash_token(token).to_vec())
         .bind(now)
         .execute(&self.pool)
         .await
         .unwrap();
-        TestDevice { id, token }
+        TestDevice {
+            id: id.to_owned(),
+            token: token.to_owned(),
+        }
     }
 
     /// Revokes the device's active credential without issuing a replacement.
@@ -193,8 +212,12 @@ impl TestApp {
 
     /// Restarts the test broker with a fresh in-memory retained store.
     pub async fn restart_mqtt(&mut self) {
+        self.restart_mqtt_with_config(self.config.config.mqtt.clone())
+            .await;
+    }
+
+    pub async fn restart_mqtt_with_config(&mut self, mut config: MqttConfig) {
         self.mqtt.abort();
-        let mut config = self.config.config.mqtt.clone();
         config.listen = "127.0.0.1:0".parse().expect("valid test MQTT address");
         let readiness = Arc::new(AtomicBool::new(false));
         let mqtt = MqttServer::start(
@@ -224,8 +247,7 @@ pub struct TestAppBuilder {
     metrics_token: Option<String>,
     max_body_bytes: u64,
     login_max_attempts: u64,
-    max_retained_messages: u64,
-    max_retained_bytes: u64,
+    mqtt_config: MqttConfig,
 }
 
 impl Default for TestAppBuilder {
@@ -236,8 +258,7 @@ impl Default for TestAppBuilder {
             metrics_token: None,
             max_body_bytes: 262_144,
             login_max_attempts: 5,
-            max_retained_messages: 10_000,
-            max_retained_bytes: 16_777_216,
+            mqtt_config: MqttConfig::default(),
         }
     }
 }
@@ -269,15 +290,19 @@ impl TestAppBuilder {
     }
 
     pub fn retained_limits(mut self, messages: u64, bytes: u64) -> Self {
-        self.max_retained_messages = messages;
-        self.max_retained_bytes = bytes;
+        self.mqtt_config.max_retained_messages = messages;
+        self.mqtt_config.max_retained_bytes = bytes;
+        self
+    }
+
+    pub fn mqtt_config(mut self, config: MqttConfig) -> Self {
+        self.mqtt_config = config;
         self
     }
 
     pub async fn start(self) -> TestApp {
         let dir = TempDir::new().unwrap();
         let config_path = dir.path().join("conf.toml");
-        let mqtt_port = free_port();
         let metrics_token_env = self.metrics_token.as_ref().map_or(String::new(), |_| {
             "metrics_bearer_token_env = \"TEST_METRICS_BEARER_TOKEN\"\n".to_owned()
         });
@@ -288,14 +313,14 @@ impl TestAppBuilder {
                  [server]\n\
                  data_dir = \"./data\"\n\
                  [http]\n\
-                 listen = \"127.0.0.1:0\"\n\
+                 listen = \"127.0.0.1:8080\"\n\
                  dashboard = {}\n\
                  cookie_secure = {}\n\
                  metrics = {}\n\
                  {}\
                  max_body_bytes = {}\n\
                  [mqtt]\n\
-                 listen = \"127.0.0.1:{}\"\n\
+                 listen = \"127.0.0.1:0\"\n\
                  max_retained_messages = {}\n\
                  max_retained_bytes = {}\n\
                  [database]\n\
@@ -307,23 +332,24 @@ impl TestAppBuilder {
                 self.metrics_token.is_some(),
                 metrics_token_env,
                 self.max_body_bytes,
-                mqtt_port,
-                self.max_retained_messages,
-                self.max_retained_bytes,
+                self.mqtt_config.max_retained_messages,
+                self.mqtt_config.max_retained_bytes,
                 self.login_max_attempts,
             ),
         )
         .unwrap();
 
         let metrics_token = self.metrics_token.clone();
-        let loaded = Arc::new(
-            config::load_with_env(&config_path, move |name| {
-                (name == "TEST_METRICS_BEARER_TOKEN")
-                    .then(|| metrics_token.clone())
-                    .flatten()
-            })
-            .unwrap(),
-        );
+        let mut loaded = config::load_with_env(&config_path, move |name| {
+            (name == "TEST_METRICS_BEARER_TOKEN")
+                .then(|| metrics_token.clone())
+                .flatten()
+        })
+        .unwrap();
+        let mut mqtt_config = self.mqtt_config;
+        mqtt_config.listen = loaded.config.mqtt.listen;
+        loaded.config.mqtt = mqtt_config;
+        let loaded = Arc::new(loaded);
         let lock = DataDirLock::try_new(&loaded.data_dir).unwrap();
         let pool = pool::connect(&loaded).await.unwrap();
         migrate::run(&pool).await.unwrap();
@@ -408,6 +434,80 @@ pub fn mqtt_options(
     options
 }
 
+pub async fn mqtt_subscribe(
+    client: &AsyncClient,
+    eventloop: &mut EventLoop,
+    filter: &str,
+    qos: QoS,
+) -> SubscribeReasonCode {
+    client.subscribe(filter, qos).await.unwrap();
+    loop {
+        if let MqttEvent::Incoming(Packet::SubAck(ack)) =
+            mqtt_next(eventloop, Duration::from_secs(5)).await.unwrap()
+        {
+            return ack.return_codes[0];
+        }
+    }
+}
+
+pub async fn mqtt_publish(
+    client: &AsyncClient,
+    topic: &str,
+    qos: QoS,
+    retain: bool,
+    payload: &[u8],
+) {
+    client.publish(topic, qos, retain, payload).await.unwrap();
+}
+
+pub async fn mqtt_wait_publish(eventloop: &mut EventLoop, dur: Duration) -> rumqttc::Publish {
+    tokio::time::timeout(dur, async {
+        loop {
+            if let MqttEvent::Incoming(Packet::Publish(publish)) =
+                eventloop.poll().await.expect("poll MQTT event")
+            {
+                return publish;
+            }
+        }
+    })
+    .await
+    .expect("receive MQTT PUBLISH before timeout")
+}
+
+pub async fn mqtt_wait_puback(eventloop: &mut EventLoop, dur: Duration) {
+    tokio::time::timeout(dur, async {
+        loop {
+            if matches!(
+                eventloop.poll().await.expect("poll MQTT event"),
+                MqttEvent::Incoming(Packet::PubAck(_))
+            ) {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("receive MQTT PUBACK before timeout");
+}
+
+pub async fn mqtt_wait_telemetry_ack(
+    eventloop: &mut EventLoop,
+    topic: &str,
+    dur: Duration,
+) -> Value {
+    tokio::time::timeout(dur, async {
+        loop {
+            if let MqttEvent::Incoming(Packet::Publish(publish)) =
+                eventloop.poll().await.expect("poll MQTT event")
+                && publish.topic == topic
+            {
+                return serde_json::from_slice(&publish.payload).expect("parse telemetry ACK");
+            }
+        }
+    })
+    .await
+    .expect("receive telemetry ACK before timeout")
+}
+
 /// Connects and returns the CONNACK `session_present` flag; panics if refused.
 pub async fn mqtt_connect(
     addr: SocketAddr,
@@ -473,6 +573,51 @@ pub async fn mqtt_wait_closed(eventloop: &mut EventLoop, dur: Duration) {
             Err(_) => panic!("connection stayed open"),
         }
     }
+}
+
+pub async fn ws_session_cookie(app: &TestApp) -> (reqwest::Client, String) {
+    app.create_admin("ws-admin", "websocket-test-password")
+        .await;
+    let client = app.client();
+    let response = client
+        .post(format!("{}/api/v1/auth/login", app.base))
+        .header("X-IoT-CSRF", "1")
+        .json(&serde_json::json!({
+            "username": "ws-admin",
+            "password": "websocket-test-password",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let cookie = response
+        .headers()
+        .get(SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    (client, cookie)
+}
+
+pub type TestWebSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+pub async fn ws_connect(app: &TestApp, cookie: &str) -> TestWebSocket {
+    let authority = app.base.trim_start_matches("http://");
+    let mut request = format!("ws://{authority}/api/v1/events")
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert(COOKIE, HeaderValue::from_str(cookie).unwrap());
+    request
+        .headers_mut()
+        .insert(ORIGIN, HeaderValue::from_str(&app.base).unwrap());
+    tokio_tungstenite::connect_async(request).await.unwrap().0
 }
 
 /// Waits until `check` holds, polling every 20 ms.

@@ -121,6 +121,7 @@ Phải chứng minh bằng code throwaway, không merge vào sản phẩm:
 | API 0.x có thể đổi | Pin chính xác `=0.24.0`; mọi kiểu RMQTT chỉ nằm trong `src/mqtt/`; nâng version phải chạy lại protocol suite A19 |
 | Không có graceful stop công khai | `abort()` chỉ đóng listener, không đóng session. Shutdown bắt buộc kick toàn bộ session đang online, chờ ngắn, rồi abort listener task; dữ liệu bền vững đã nằm trong SQL |
 | Không có cap retained mặc định | Hook tự đếm `(topic, bytes)`; trước khi reject ghi metric/log `retained_cap`. RMQTT sau đó đóng connection, không PUBACK |
+| Listener limits không bao phủ mọi đường | RMQTT 0.24 không tự giới hạn tổng session đang sống bằng `max_connections`, và `max_topic_levels` không chặn PUBLISH; adapter dùng connection limiter và ACL theo config. Kiểm chứng trong `tests/mqtt_protocol.rs` |
 | Thư viện chấp nhận MQTT 5/3.1 | Hook `ClientConnect` từ chối protocol level khác 4; giữ mã RMQTT thực tế: v3.1 `0x05`, v5 `0x87` |
 | Session/retained không bền qua restart | MVP không cam kết; thiết bị reconnect, command/telemetry đã commit vẫn còn trong SQL |
 | Log dùng `log`, app dùng `tracing` | Bật feature `tracing-log` và cài `LogTracer` để gom log RMQTT vào cùng pipeline |

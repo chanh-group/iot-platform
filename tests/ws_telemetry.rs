@@ -2,60 +2,12 @@ mod common;
 
 use std::time::Duration;
 
-use common::{TestApp, mqtt_connect};
+use common::{TestApp, mqtt_connect, ws_connect, ws_session_cookie};
 use futures_util::{SinkExt, StreamExt};
-use reqwest::header::{COOKIE, ORIGIN, SET_COOKIE};
 use rumqttc::{Event, Packet, QoS};
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-
-async fn session_cookie(app: &TestApp) -> (reqwest::Client, String) {
-    app.create_admin("ws-admin", "websocket-test-password")
-        .await;
-    let client = app.client();
-    let response = client
-        .post(format!("{}/api/v1/auth/login", app.base))
-        .header("X-IoT-CSRF", "1")
-        .json(&json!({
-            "username": "ws-admin",
-            "password": "websocket-test-password",
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert!(response.status().is_success());
-    let cookie = response
-        .headers()
-        .get(SET_COOKIE)
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_owned();
-    (client, cookie)
-}
-
-async fn connect_ws(
-    app: &TestApp,
-    cookie: &str,
-) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
-    let authority = app.base.trim_start_matches("http://");
-    let mut request = format!("ws://{authority}/api/v1/events")
-        .into_client_request()
-        .unwrap();
-    request
-        .headers_mut()
-        .insert(COOKIE, HeaderValue::from_str(cookie).unwrap());
-    request
-        .headers_mut()
-        .insert(ORIGIN, HeaderValue::from_str(&app.base).unwrap());
-    tokio_tungstenite::connect_async(request).await.unwrap().0
-}
 
 async fn publish(app: &TestApp, device_id: &str, token: &str, event_id: &str, raw: &[u8]) {
     let (client, mut eventloop, _) =
@@ -115,9 +67,9 @@ async fn next_json(
 #[tokio::test]
 async fn subscribed_clients_receive_only_committed_telemetry_and_refetch_after_reconnect() {
     let app = TestApp::start().await;
-    let (client, cookie) = session_cookie(&app).await;
+    let (client, cookie) = ws_session_cookie(&app).await;
     let device = app.create_device("ws-telemetry", true).await;
-    let mut socket = connect_ws(&app, &cookie).await;
+    let mut socket = ws_connect(&app, &cookie).await;
 
     let hello = next_json(&mut socket).await;
     assert_eq!(hello["type"], "hello");
@@ -195,7 +147,7 @@ async fn subscribed_clients_receive_only_committed_telemetry_and_refetch_after_r
     assert_eq!(next_json(&mut socket).await["type"], "unsubscribed");
 
     socket.close(None).await.unwrap();
-    let mut reconnected = connect_ws(&app, &cookie).await;
+    let mut reconnected = ws_connect(&app, &cookie).await;
     assert_eq!(next_json(&mut reconnected).await["type"], "hello");
     assert!(
         tokio::time::timeout(Duration::from_millis(100), reconnected.next())
@@ -241,9 +193,9 @@ async fn subscribed_clients_receive_only_committed_telemetry_and_refetch_after_r
 #[tokio::test]
 async fn failed_telemetry_commit_is_not_broadcast() {
     let app = TestApp::start().await;
-    let (_, cookie) = session_cookie(&app).await;
+    let (_, cookie) = ws_session_cookie(&app).await;
     let device = app.create_device("ws-commit-failure", true).await;
-    let mut socket = connect_ws(&app, &cookie).await;
+    let mut socket = ws_connect(&app, &cookie).await;
     assert_eq!(next_json(&mut socket).await["type"], "hello");
     socket
         .send(Message::Text(

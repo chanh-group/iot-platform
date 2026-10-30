@@ -40,6 +40,7 @@ pub fn listener(config: &MqttConfig) -> anyhow::Result<Listener> {
         .max_qos_allowed(QoS::ExactlyOnce)
         .max_topic_levels(max_topic_levels)
         .max_subscriptions(max_subscriptions)
+        .session_expiry_interval(Duration::from_millis(config.max_session_expiry_ms))
         .max_session_expiry_interval(Duration::from_millis(config.max_session_expiry_ms))
         .bind()?
         .tcp()

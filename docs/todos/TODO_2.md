@@ -89,13 +89,14 @@ Nguồn sự thật:
 
 ## 7. Protocol suite và acceptance — P2-12
 
-- [ ] Mở rộng `tests/common/mod.rs`: helper tạo device/credential qua fixture/repository tạm, `rumqttc` MQTT client, subscribe/publish/wait ACK và WS client; mỗi test data dir/HTTP/MQTT port riêng, retry race port tối đa 3 lần.
-- [ ] `tests/mqtt_protocol.rs` chạy matrix A19: QoS 0/1/2, wildcard hợp lệ, retained, LWT, clean-session reconnect/expiry, duplicate client ID, MQTT 3.1/MQTT 5 reject.
-- [ ] Matrix phải kiểm chứng các limit `max_*` đã cấu hình (packet, connection/subscription/inflight/queue/client-id/topic-level) ở mức có thể tái lập; không chỉ tin builder setup từ spike.
-- [ ] A05: telemetry hợp lệ commit SQLite, ACK `stored`, REST và WS thấy dữ liệu đã commit.
-- [ ] A06: retry byte-identical cùng event ID giữ một row, ACK `duplicate`.
-- [ ] A07: cùng event ID/raw payload khác giữ row cũ, ACK `rejected/event_id_conflict`.
-- [ ] Test retained/session state rỗng sau restart; persistence telemetry vẫn là SQL. Không claim broker session/retained survive restart.
+- [x] Mở rộng `tests/common/mod.rs`: fixture device/credential, `rumqttc` connect/subscribe/publish/PUBACK/application ACK và WS client dùng chung; mỗi `TestApp` có DB tạm, HTTP/MQTT bind port `0` độc lập để tránh race port.
+- [x] A19 protocol matrix: QoS 0/1/2, wildcard hợp lệ, retained/LWT, clean-session reconnect/expiry và restart trong `tests/mqtt_protocol.rs` + `tests/attributes_retained.rs`; duplicate client ID và MQTT 3.1/5 reject trong `tests/mqtt_auth.rs`.
+- [x] Kiểm chứng limit qua listener: packet, connection, subscription, client ID, topic level và offline queue cap trong `tests/mqtt_protocol.rs`; retained cap trong `tests/attributes_retained.rs`.
+- [ ] Chưa có test tái lập saturation cho `max_inflight_per_client`; QoS smoke không chứng minh giới hạn này.
+- [x] A05: `tests/telemetry_flow.rs` xác nhận commit + ACK `stored`; `tests/telemetry_api.rs` và `tests/ws_telemetry.rs` xác nhận REST/WS thấy dữ liệu đã commit.
+- [x] A06: `tests/telemetry_flow.rs` retry byte-identical giữ một row và ACK `duplicate`.
+- [x] A07: `tests/telemetry_flow.rs` payload khác cùng event ID giữ row cũ và ACK `rejected/event_id_conflict`.
+- [x] Retained/session state rỗng sau restart (`tests/attributes_retained.rs`, `tests/mqtt_protocol.rs`); telemetry vẫn được lưu trong SQL.
 
 ## 8. Kiểm tra cuối Phase 2
 

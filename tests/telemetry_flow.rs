@@ -2,8 +2,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{TestApp, mqtt_connect};
-use rumqttc::{Event, Packet, QoS};
+use common::{TestApp, mqtt_connect, mqtt_publish, mqtt_subscribe, mqtt_wait_telemetry_ack};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -21,42 +20,22 @@ async fn publish_with_retain(
     let (client, mut eventloop, _) =
         mqtt_connect(app.mqtt_addr, device_id, device_id, token, true).await;
     let ack_topic = format!("devices/{device_id}/telemetry/ack");
-    client
-        .subscribe(&ack_topic, QoS::AtLeastOnce)
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if matches!(
-                eventloop.poll().await.unwrap(),
-                Event::Incoming(Packet::SubAck(_))
-            ) {
-                break;
-            }
-        }
-    })
-    .await
-    .unwrap();
-    client
-        .publish(
-            format!("devices/{device_id}/telemetry"),
-            QoS::AtLeastOnce,
-            retain,
-            raw,
-        )
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            if let Event::Incoming(Packet::Publish(publish)) = eventloop.poll().await.unwrap()
-                && publish.topic == ack_topic
-            {
-                return serde_json::from_slice(&publish.payload).unwrap();
-            }
-        }
-    })
-    .await
-    .unwrap()
+    mqtt_subscribe(
+        &client,
+        &mut eventloop,
+        &ack_topic,
+        rumqttc::QoS::AtLeastOnce,
+    )
+    .await;
+    mqtt_publish(
+        &client,
+        &format!("devices/{device_id}/telemetry"),
+        rumqttc::QoS::AtLeastOnce,
+        retain,
+        raw,
+    )
+    .await;
+    mqtt_wait_telemetry_ack(&mut eventloop, &ack_topic, Duration::from_secs(3)).await
 }
 
 async fn wait_for_rows(app: &TestApp, device_id: &str, count: i64) {

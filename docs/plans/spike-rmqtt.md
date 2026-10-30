@@ -235,11 +235,13 @@ Tổng: **13 passed, 0 failed**. Không có test ignored.
 | 8 | §2.5: session expiry mặc định 1 giờ | Cơ chế chứng minh với TTL 2 s; listener production đặt `3600 s`, cap `3600 s` | Test dùng TTL ngắn theo yêu cầu; Phase 1 dùng config thật, không hard-code. |
 | 9 | §2.4: ACL kiểm tra cả lúc broker giao message | `MessageDelivered` chỉ thay payload, không có kết quả allow/deny | **Đã chốt:** chặn ở SUBSCRIBE; filter allow luôn nằm trong `devices/{self}/` nên delivery không thể vượt prefix thiết bị. |
 
-Không phải khác biệt, nhưng **chưa kiểm chứng end-to-end** trong Phase 0 (đã cấu hình trong `Builder`, sẽ test ở Phase 1/A19):
+Không phải khác biệt, nhưng **chưa kiểm chứng end-to-end trong Phase 0** (đã cấu hình trong `Builder`):
 
 - `max_connections=1000`, `max_subscriptions=8`, `max_inflight=32`, `max_mqueue_len=256`, `max_packet_size=256 KiB`, `max_clientid_len=64`, `max_topic_levels=16`.
 - `$SYS`/`$share` mới được test ở ACL unit, chưa qua hook end-to-end.
 - Chưa test tải/đồng thời nhiều client; chưa test TLS (ngoài MVP, dùng reverse proxy).
+
+Phase 2 follow-up: `tests/mqtt_protocol.rs` kiểm chứng các giới hạn có thể tái lập, QoS, wildcard, LWT, session reconnect/expiry và restart; `max_inflight_per_client` chưa có test saturation. Test cho thấy RMQTT 0.24 builder không tự chặn số session đang sống hoặc topic-depth trên PUBLISH; product enforce các giới hạn đó ở auth limiter và ACL (xem `01-stack-and-architecture.md`).
 
 ## 6. Quyết định
 
@@ -253,7 +255,7 @@ Lý do:
 - Shutdown không panic, không accept connection mới, nhả port.
 - All-in-one SQLx + SQLite WAL/FULL + Axum + RMQTT chạy trong một process.
 
-Các quyết định bắt buộc trước MQTT auth đã được chốt trong contract: mã CONNACK thực tế, retained-cap disconnect/metric/log và kick trước abort. Việc còn lại cho Phase 1/A19 là đưa các limit `max_*` vào test, thay vì chỉ cấu hình.
+Các quyết định bắt buộc trước MQTT auth đã được chốt trong contract: mã CONNACK thực tế, retained-cap disconnect/metric/log và kick trước abort. Phase 2 P2-12 đã bổ sung test cho các limit `max_*`; các giới hạn RMQTT không thực thi đầy đủ được bù tại adapter như ghi ở trên.
 
 Rủi ro còn lại:
 

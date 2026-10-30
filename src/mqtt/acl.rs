@@ -18,16 +18,20 @@ use crate::core::telemetry::{
 use crate::storage::sqlite::attributes::AttributeHandle;
 
 /// Publish/subscribe ACL handlers for authenticated device sessions.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AclHooks {
     ingest: Option<(IngestHandle, AttributeHandle, TelemetryPayload, AckHandle)>,
+    max_topic_levels: usize,
 }
 
 impl AclHooks {
     /// Stateless hook; the device identity comes from the session.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub(crate) fn new(max_topic_levels: usize) -> Self {
+        Self {
+            ingest: None,
+            max_topic_levels,
+        }
     }
 
     /// Enables telemetry validation and non-blocking queue submission.
@@ -37,9 +41,11 @@ impl AclHooks {
         attributes: AttributeHandle,
         limits: TelemetryPayload,
         ack: AckHandle,
+        max_topic_levels: usize,
     ) -> Self {
         Self {
             ingest: Some((ingest, attributes, limits, ack)),
+            max_topic_levels,
         }
     }
 }
@@ -51,7 +57,7 @@ impl Handler for AclHooks {
             Parameter::MessagePublishCheckAcl(session, publish) => {
                 let device_id: &str = &session.id.client_id;
                 let topic: &str = &publish.topic;
-                let allowed = acl::can_publish(device_id, topic);
+                let allowed = acl::can_publish_with_limit(device_id, topic, self.max_topic_levels);
                 let telemetry_topic = format!("devices/{device_id}/telemetry");
                 let attributes_topic = format!("devices/{device_id}/attributes");
                 let retained_telemetry =
@@ -184,7 +190,8 @@ impl Handler for AclHooks {
             Parameter::ClientSubscribeCheckAcl(session, subscribe) => {
                 let device_id: &str = &session.id.client_id;
                 let filter: &str = &subscribe.topic_filter;
-                let allowed = acl::can_subscribe(device_id, filter);
+                let allowed =
+                    acl::can_subscribe_with_limit(device_id, filter, self.max_topic_levels);
                 if !allowed {
                     tracing::warn!(%device_id, %filter, "mqtt subscribe denied by acl");
                 }
