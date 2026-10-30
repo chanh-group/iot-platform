@@ -149,24 +149,41 @@ async fn latest_uses_received_time_then_internal_id_as_tie_breakers() {
     let client = logged_in_client(&app).await;
     let device = app.create_device("telemetry-api-latest", true).await;
     let ts = auth::now_ms() - 1_000;
+    insert_event(&app, &device.id, "latest-1", ts, ts + 10, json!({ "z": 4 })).await;
     insert_event(
         &app,
         &device.id,
-        "latest-1",
-        ts,
-        ts + 10,
-        json!({ "x": 1, "y": 4 }),
+        "latest-2",
+        ts + 20,
+        ts + 30,
+        json!({ "a": 2 }),
     )
     .await;
-    insert_event(&app, &device.id, "latest-2", ts, ts + 20, json!({ "x": 2 })).await;
-    insert_event(&app, &device.id, "latest-3", ts, ts + 20, json!({ "x": 3 })).await;
+    insert_event(
+        &app,
+        &device.id,
+        "latest-3",
+        ts + 20,
+        ts + 30,
+        json!({ "a": 3 }),
+    )
+    .await;
+    insert_event(
+        &app,
+        &device.id,
+        "latest-4",
+        ts + 20,
+        ts + 25,
+        json!({ "a": 4 }),
+    )
+    .await;
 
     let response: Value = client
         .get(format!(
             "{}/api/v1/devices/{}/telemetry/latest",
             app.base, device.id
         ))
-        .query(&[("keys", "x,y")])
+        .query(&[("keys", "a,z")])
         .send()
         .await
         .unwrap()
@@ -176,11 +193,14 @@ async fn latest_uses_received_time_then_internal_id_as_tie_breakers() {
         .await
         .unwrap();
     assert_eq!(response["items"].as_array().unwrap().len(), 2);
-    assert_eq!(response["items"][0]["key"], "y");
-    assert_eq!(response["items"][0]["value"], 4);
-    assert_eq!(response["items"][1]["key"], "x");
-    assert_eq!(response["items"][1]["value"], 3);
-    assert_eq!(response["items"][1]["event_id"], "latest-3");
+    assert_eq!(response["items"][0]["key"], "a");
+    assert_eq!(response["items"][0]["value"], 3);
+    assert_eq!(response["items"][0]["event_id"], "latest-3");
+    assert_eq!(response["items"][1]["key"], "z");
+    assert_eq!(response["items"][1]["value"], 4);
+    assert!(
+        response["items"][0]["ts"].as_i64().unwrap() > response["items"][1]["ts"].as_i64().unwrap()
+    );
 }
 
 #[tokio::test]

@@ -103,7 +103,7 @@ pub async fn latest(
         ")
          SELECT internal_id, key, event_id, ts, received_at, values_json
          FROM ranked WHERE rank = 1
-         ORDER BY ts, received_at, internal_id, key",
+         ORDER BY key",
     );
     query
         .build_query_as::<LatestValueRow>()

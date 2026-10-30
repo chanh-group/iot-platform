@@ -72,6 +72,7 @@ pub struct TestApp {
     pub config: Arc<LoadedConfig>,
     pub mqtt_addr: SocketAddr,
     pub presence: Arc<Presence>,
+    pub events: EventBus,
     mqtt: MqttServer,
     telemetry_task: JoinHandle<()>,
     handle: JoinHandle<()>,
@@ -247,6 +248,8 @@ pub struct TestAppBuilder {
     metrics_token: Option<String>,
     max_body_bytes: u64,
     login_max_attempts: u64,
+    max_ws_connections: u64,
+    ws_queue_capacity: u64,
     mqtt_config: MqttConfig,
 }
 
@@ -258,6 +261,8 @@ impl Default for TestAppBuilder {
             metrics_token: None,
             max_body_bytes: 262_144,
             login_max_attempts: 5,
+            max_ws_connections: 100,
+            ws_queue_capacity: 256,
             mqtt_config: MqttConfig::default(),
         }
     }
@@ -286,6 +291,12 @@ impl TestAppBuilder {
 
     pub fn login_max_attempts(mut self, attempts: u64) -> Self {
         self.login_max_attempts = attempts;
+        self
+    }
+
+    pub fn websocket_limits(mut self, max_connections: u64, queue_capacity: u64) -> Self {
+        self.max_ws_connections = max_connections;
+        self.ws_queue_capacity = queue_capacity;
         self
     }
 
@@ -346,6 +357,8 @@ impl TestAppBuilder {
                 .flatten()
         })
         .unwrap();
+        loaded.config.http.max_ws_connections = self.max_ws_connections;
+        loaded.config.http.ws_queue_capacity = self.ws_queue_capacity;
         let mut mqtt_config = self.mqtt_config;
         mqtt_config.listen = loaded.config.mqtt.listen;
         loaded.config.mqtt = mqtt_config;
@@ -386,7 +399,7 @@ impl TestAppBuilder {
             Arc::clone(&loaded),
             mqtt_ready,
             telemetry_ready,
-            events,
+            events.clone(),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -409,6 +422,7 @@ impl TestAppBuilder {
             config: loaded,
             mqtt_addr,
             presence,
+            events,
             mqtt,
             telemetry_task,
             handle,

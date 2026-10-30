@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use common::{TestApp, mqtt_connect, ws_connect, ws_session_cookie};
 use futures_util::{SinkExt, StreamExt};
+use iot_server::core::events::TelemetryCommitted;
+use iot_server::observability::metrics::Metrics;
 use rumqttc::{Event, Packet, QoS};
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::Message;
@@ -236,4 +238,101 @@ async fn failed_telemetry_commit_is_not_broadcast() {
     .await
     .unwrap();
     assert_eq!(stored, 0);
+}
+
+#[tokio::test]
+async fn slow_websocket_is_closed_and_releases_its_connection_slot() {
+    let app = TestApp::builder().websocket_limits(1, 16).start().await;
+    let dropped_before = Metrics::global().ws_dropped_total.get();
+    let (_, cookie) = ws_session_cookie(&app).await;
+    let device = app.create_device("ws-slow-consumer", true).await;
+    let mut slow = ws_connect(&app, &cookie).await;
+    assert_eq!(next_json(&mut slow).await["type"], "hello");
+    slow.send(Message::Text(
+        json!({"action":"subscribe", "channels":[format!("device:{}", device.id)]})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(next_json(&mut slow).await["type"], "subscribed");
+
+    let payload = "x".repeat(32 * 1024);
+    for event_id in 0_i64..512 {
+        app.events.publish(TelemetryCommitted {
+            id: event_id.to_string(),
+            ts: event_id,
+            device_id: device.id.clone(),
+            data: json!({"payload":payload.clone()}),
+        });
+    }
+
+    let close_code = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match slow.next().await {
+                Some(Ok(Message::Close(Some(frame)))) => return frame.code,
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("slow websocket failed before close: {error}"),
+                None => panic!("slow websocket ended without a close frame"),
+            }
+        }
+    })
+    .await
+    .expect("slow websocket should be closed");
+    assert_eq!(close_code, CloseCode::Again);
+    assert_eq!(Metrics::global().ws_dropped_total.get() - dropped_before, 1);
+
+    let mut replacement = ws_connect(&app, &cookie).await;
+    assert_eq!(next_json(&mut replacement).await["type"], "hello");
+    replacement.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn request_responses_timeout_when_client_does_not_read_and_release_the_slot() {
+    let app = TestApp::builder().websocket_limits(1, 16).start().await;
+    let (_, cookie) = ws_session_cookie(&app).await;
+    let mut slow = ws_connect(&app, &cookie).await;
+    assert_eq!(next_json(&mut slow).await["type"], "hello");
+
+    let channels: Vec<_> = (1..=8)
+        .map(|id| format!("device:00000000-0000-7000-8000-{id:012x}"))
+        .collect();
+    let request = Message::Text(
+        json!({"action":"subscribe", "channels":channels})
+            .to_string()
+            .into(),
+    );
+    let started = std::time::Instant::now();
+    let server_closed = tokio::time::timeout(Duration::from_secs(15), async {
+        for _ in 0..100_000 {
+            if slow.send(request.clone()).await.is_err() {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .expect("request flood should be bounded by the server's write deadline");
+    assert!(
+        server_closed,
+        "server kept accepting requests without draining replies"
+    );
+    assert!(started.elapsed() >= Duration::from_millis(800));
+
+    let close = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match slow.next().await {
+                Some(Ok(Message::Close(frame))) => return frame.map(|frame| frame.code),
+                Some(Ok(_)) => {}
+                Some(Err(_)) | None => return None,
+            }
+        }
+    })
+    .await
+    .expect("slow request client should be disconnected within the deadline");
+    assert!(close.is_none_or(|code| code == CloseCode::Again));
+
+    let mut replacement = ws_connect(&app, &cookie).await;
+    assert_eq!(next_json(&mut replacement).await["type"], "hello");
+    replacement.close(None).await.unwrap();
 }

@@ -25,6 +25,7 @@ use super::auth::AuthSession;
 
 const MAX_SUBSCRIPTIONS: usize = 8;
 const MESSAGE_LIMIT: usize = 4_096;
+const WS_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 const SERVER_PING_INTERVAL: Duration = Duration::from_secs(30);
 const PONG_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -164,7 +165,8 @@ async fn run(
 
     let (subscriptions_tx, subscriptions_rx) = watch::channel(BTreeSet::new());
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Value>(queue_capacity.max(1));
-    let (slow_tx, mut slow_rx) = watch::channel(false);
+    let slow_consumer = CancellationToken::new();
+    let cancel_slow_consumer = slow_consumer.clone();
     let cancel_producer = CancellationToken::new();
     let producer_cancel = cancel_producer.clone();
     let mut events = state.events.subscribe();
@@ -179,13 +181,13 @@ async fn run(
                             && !send_event(&outbound_tx, event)
                         {
                             Metrics::global().ws_dropped_total.inc();
-                            slow_tx.send_replace(true);
+                            cancel_slow_consumer.cancel();
                             break;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         Metrics::global().ws_dropped_total.inc();
-                        slow_tx.send_replace(true);
+                        cancel_slow_consumer.cancel();
                         break;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -225,29 +227,42 @@ async fn run(
             incoming = socket.recv() => match incoming {
                 Some(Ok(Message::Text(text))) => {
                     if text.len() > MESSAGE_LIMIT {
-                        send_error(&mut socket, "message_too_large", "message exceeds 4096 bytes").await;
+                        if !send_error(&mut socket, "message_too_large", "message exceeds 4096 bytes").await {
+                            close(&mut socket, 1013, "slow_consumer").await;
+                            break;
+                        }
                         continue;
                     }
                     match serde_json::from_str::<ClientMessage>(text.as_str()) {
                         Ok(ClientMessage::Subscribe { channels }) => {
                             let Some(channels) = normalize_channels(&channels) else {
-                                send_error(&mut socket, "invalid_channel", "invalid channel").await;
+                                if !send_error(&mut socket, "invalid_channel", "invalid channel").await {
+                                    close(&mut socket, 1013, "slow_consumer").await;
+                                    break;
+                                }
                                 continue;
                             };
                             let mut current = subscriptions_tx.borrow().clone();
                             current.extend(channels.iter().cloned());
                             if current.len() > MAX_SUBSCRIPTIONS {
-                                send_error(&mut socket, "max_subscriptions", "at most 8 channels are allowed").await;
+                                if !send_error(&mut socket, "max_subscriptions", "at most 8 channels are allowed").await {
+                                    close(&mut socket, 1013, "slow_consumer").await;
+                                    break;
+                                }
                                 continue;
                             }
                             subscriptions_tx.send_replace(current);
                             if !send_json(&mut socket, &json!({"type":"subscribed", "channels":channels})).await {
+                                close(&mut socket, 1013, "slow_consumer").await;
                                 break;
                             }
                         }
                         Ok(ClientMessage::Unsubscribe { channels }) => {
                             let Some(channels) = normalize_channels(&channels) else {
-                                send_error(&mut socket, "invalid_channel", "invalid channel").await;
+                                if !send_error(&mut socket, "invalid_channel", "invalid channel").await {
+                                    close(&mut socket, 1013, "slow_consumer").await;
+                                    break;
+                                }
                                 continue;
                             };
                             let mut current = subscriptions_tx.borrow().clone();
@@ -256,44 +271,67 @@ async fn run(
                             }
                             subscriptions_tx.send_replace(current);
                             if !send_json(&mut socket, &json!({"type":"unsubscribed", "channels":channels})).await {
+                                close(&mut socket, 1013, "slow_consumer").await;
                                 break;
                             }
                         }
                         Ok(ClientMessage::Ping) => {
                             if !send_json(&mut socket, &json!({"type":"pong", "ts":crate::core::auth::now_ms()})).await {
+                                close(&mut socket, 1013, "slow_consumer").await;
                                 break;
                             }
                         }
-                        Err(_) => send_error(&mut socket, "invalid_message", "invalid websocket message").await,
+                        Err(_) => {
+                            if !send_error(&mut socket, "invalid_message", "invalid websocket message").await {
+                                close(&mut socket, 1013, "slow_consumer").await;
+                                break;
+                            }
+                        }
                     }
                 }
                 Some(Ok(Message::Ping(payload))) => {
-                    if socket.send(Message::Pong(payload)).await.is_err() {
+                    if !send_message(&mut socket, Message::Pong(payload)).await {
+                        close(&mut socket, 1013, "slow_consumer").await;
                         break;
                     }
                 }
                 Some(Ok(Message::Pong(_))) => last_pong = Instant::now(),
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                 Some(Ok(Message::Binary(_))) => {
-                    send_error(&mut socket, "invalid_message", "text messages are required").await;
+                    if !send_error(&mut socket, "invalid_message", "text messages are required").await {
+                        close(&mut socket, 1013, "slow_consumer").await;
+                        break;
+                    }
                 }
             },
             outbound = outbound_rx.recv() => match outbound {
-                Some(message) if send_json(&mut socket, &message).await => {},
-                _ => break,
-            },
-            changed = slow_rx.changed() => {
-                if changed.is_ok() && *slow_rx.borrow() {
-                    close(&mut socket, 1013, "slow_consumer").await;
-                    break;
+                Some(message) => {
+                    let sent = tokio::select! {
+                        biased;
+                        _ = slow_consumer.cancelled() => None,
+                        sent = send_json(&mut socket, &message) => Some(sent),
+                    };
+                    if sent != Some(true) {
+                        if sent.is_some() {
+                            Metrics::global().ws_dropped_total.inc();
+                        }
+                        close(&mut socket, 1013, "slow_consumer").await;
+                        break;
+                    }
                 }
+                None => break,
+            },
+            _ = slow_consumer.cancelled() => {
+                close(&mut socket, 1013, "slow_consumer").await;
+                break;
             }
             _ = ping.tick() => {
                 if Instant::now().duration_since(last_pong) >= PONG_TIMEOUT {
                     close(&mut socket, 1001, "pong_timeout").await;
                     break;
                 }
-                if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
+                if !send_message(&mut socket, Message::Ping(Vec::new().into())).await {
+                    close(&mut socket, 1013, "slow_consumer").await;
                     break;
                 }
             }
@@ -334,24 +372,33 @@ async fn send_json(socket: &mut WebSocket, value: &Value) -> bool {
     let Ok(text) = serde_json::to_string(value) else {
         return false;
     };
-    socket.send(Message::Text(text.into())).await.is_ok()
+    send_message(socket, Message::Text(text.into())).await
 }
 
-async fn send_error(socket: &mut WebSocket, code: &str, message: &str) {
-    let _ = send_json(
+async fn send_error(socket: &mut WebSocket, code: &str, message: &str) -> bool {
+    send_json(
         socket,
         &json!({"type":"error", "code":code, "message":message}),
     )
-    .await;
+    .await
+}
+
+async fn send_message(socket: &mut WebSocket, message: Message) -> bool {
+    matches!(
+        tokio::time::timeout(WS_SEND_TIMEOUT, socket.send(message)).await,
+        Ok(Ok(()))
+    )
 }
 
 async fn close(socket: &mut WebSocket, code: u16, reason: &'static str) {
-    let _ = socket
-        .send(Message::Close(Some(CloseFrame {
+    let _ = send_message(
+        socket,
+        Message::Close(Some(CloseFrame {
             code,
             reason: reason.into(),
-        })))
-        .await;
+        })),
+    )
+    .await;
 }
 
 #[cfg(test)]
