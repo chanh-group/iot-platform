@@ -87,7 +87,15 @@ fn level_name(level: LogLevel) -> &'static str {
 }
 
 fn filter_for_level(level: LogLevel) -> Result<EnvFilter, tracing_subscriber::filter::ParseError> {
-    EnvFilter::try_new(level_name(level))
+    let rmqtt_level = match level {
+        LogLevel::Trace | LogLevel::Debug | LogLevel::Info => "info",
+        LogLevel::Warn => "warn",
+        LogLevel::Error => "error",
+    };
+    EnvFilter::try_new(format!(
+        "{},rmqtt={rmqtt_level},tungstenite::protocol=off",
+        level_name(level),
+    ))
 }
 
 #[cfg(test)]
@@ -188,5 +196,80 @@ mod tests {
         let output = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
         assert!(!output.contains("hidden before reload"));
         assert!(output.contains("visible after reload"));
+    }
+
+    #[test]
+    fn trace_filter_suppresses_protocol_payloads_without_hiding_app_traces() {
+        let buffer = Buffer::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(filter_for_level(LogLevel::Trace).unwrap())
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_writer(buffer.clone()),
+            );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::trace!(
+                target: "tungstenite::protocol",
+                payload = "telemetry-payload-sentinel",
+                "frame received"
+            );
+            tracing::trace!(
+                target: "tungstenite::protocol::frame",
+                payload = "nested-frame-payload-sentinel",
+                "nested frame received"
+            );
+            tracing::debug!(
+                target: "rmqtt::hook",
+                payload = "mqtt-hook-payload-sentinel",
+                "publish hook"
+            );
+            tracing::trace!(
+                target: "rmqtt::session",
+                payload = "mqtt-session-payload-sentinel",
+                "received packet"
+            );
+            tracing::trace!("application trace remains available");
+        });
+
+        let output = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert!(!output.contains("telemetry-payload-sentinel"));
+        assert!(!output.contains("nested-frame-payload-sentinel"));
+        assert!(!output.contains("mqtt-hook-payload-sentinel"));
+        assert!(!output.contains("mqtt-session-payload-sentinel"));
+        assert!(output.contains("application trace remains available"));
+    }
+
+    #[test]
+    fn rmqtt_filter_respects_warn_and_error_levels_across_reload() {
+        let buffer = Buffer::default();
+        let (filter, handle) = reload::Layer::new(filter_for_level(LogLevel::Warn).unwrap());
+        let subscriber = tracing_subscriber::registry().with(filter).with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(buffer.clone()),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "rmqtt::hook", "rmqtt info at warn");
+            tracing::warn!(target: "rmqtt::hook", "rmqtt warn at warn");
+            tracing::error!(target: "rmqtt::hook", "rmqtt error at warn");
+
+            handle
+                .reload(filter_for_level(LogLevel::Error).unwrap())
+                .unwrap();
+            tracing::info!(target: "rmqtt::hook", "rmqtt info at error");
+            tracing::warn!(target: "rmqtt::hook", "rmqtt warn at error");
+            tracing::error!(target: "rmqtt::hook", "rmqtt error at error");
+        });
+
+        let output = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert!(!output.contains("rmqtt info at warn"));
+        assert!(output.contains("rmqtt warn at warn"));
+        assert!(output.contains("rmqtt error at warn"));
+        assert!(!output.contains("rmqtt info at error"));
+        assert!(!output.contains("rmqtt warn at error"));
+        assert!(output.contains("rmqtt error at error"));
     }
 }

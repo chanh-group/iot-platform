@@ -257,8 +257,14 @@ pub async fn patch(
         None => "device.update",
     };
     let mut details = json!({
-        "name": patch.name.is_some(),
-        "metadata": patch.metadata_json.is_some(),
+        "name": patch
+            .name
+            .as_deref()
+            .is_some_and(|name| name != old_device.name),
+        "metadata": patch
+            .metadata_json
+            .as_deref()
+            .is_some_and(|metadata| metadata != old_device.metadata_json),
     });
     if let Some(enabled) = enabled_change {
         details["enabled_from"] = json!(old_device.enabled);
