@@ -1,12 +1,21 @@
 //! Command domain and persistence port.
 
+mod ack;
 mod create;
+mod dispatcher;
+mod expiry;
 mod state;
 
+pub use ack::{
+    CommandAck, CommandAckError, CommandAckHandle, CommandAckStatus, PendingCommandAcks,
+    spawn_ack_worker, validate_ack,
+};
 pub use create::{
     CreateCommandRequest, ValidatedCommand, validate_create, validate_create_value,
     validate_idempotency_key,
 };
+pub use dispatcher::{CommandDispatcher, CommandWakeReceiver, spawn_dispatcher};
+pub use expiry::expire_due;
 pub use state::CommandStatus;
 
 use serde::Serialize;
@@ -76,6 +85,17 @@ pub enum CommandRepositoryError {
     StorageUnavailable,
 }
 
+/// Result of attempting to persist a validated device ACK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckApplyOutcome {
+    Applied,
+    Duplicate,
+    LateRecorded,
+    ExpiredAndLateRecorded,
+    UnknownCommand,
+    WrongDevice,
+}
+
 #[async_trait::async_trait]
 pub trait CommandRepository: Send + Sync {
     async fn create(
@@ -92,4 +112,53 @@ pub trait CommandRepository: Send + Sync {
         after: Option<CommandCursor>,
         limit: i64,
     ) -> Result<Vec<Command>, CommandRepositoryError>;
+
+    async fn due(&self, now: i64, limit: i64) -> Result<Vec<Command>, CommandRepositoryError>;
+
+    async fn due_at(
+        &self,
+        scheduled_at: i64,
+        now: i64,
+        limit: i64,
+    ) -> Result<Vec<Command>, CommandRepositoryError>;
+
+    async fn can_dispatch(
+        &self,
+        command_id: &str,
+        now: i64,
+    ) -> Result<bool, CommandRepositoryError>;
+
+    async fn defer_offline(
+        &self,
+        command_id: &str,
+        now: i64,
+        next_attempt_at: i64,
+    ) -> Result<(), CommandRepositoryError>;
+
+    async fn wake_device(&self, device_id: &str, now: i64) -> Result<u64, CommandRepositoryError>;
+
+    async fn wake_all(&self, now: i64, limit: i64) -> Result<u64, CommandRepositoryError>;
+
+    async fn record_dispatch_attempt(
+        &self,
+        command_id: &str,
+        attempted_at: i64,
+        finished_at: i64,
+        next_attempt_at: i64,
+        published: bool,
+    ) -> Result<(), CommandRepositoryError>;
+
+    async fn expire_due(
+        &self,
+        now: i64,
+        limit: i64,
+        pending_ack_ids: &[String],
+    ) -> Result<u64, CommandRepositoryError>;
+
+    async fn apply_ack(
+        &self,
+        device_id: &str,
+        ack: &CommandAck,
+        received_at: i64,
+    ) -> Result<AckApplyOutcome, CommandRepositoryError>;
 }

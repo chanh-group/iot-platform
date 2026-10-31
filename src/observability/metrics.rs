@@ -118,6 +118,12 @@ pub struct Metrics {
     pub retained_cap_rejected_total: Counter,
     pub commands_pending: Gauge,
     pub commands_expired_total: Counter,
+    pub command_ack_dropped_total: Counter,
+    pub command_ack_invalid_total: Counter,
+    pub command_ack_storage_errors_total: Counter,
+    pub command_publish_errors_total: Counter,
+    pub command_storage_errors_total: Counter,
+    pub command_dispatch_wake_dropped_total: Counter,
     pub ws_clients: Gauge,
     pub ws_dropped_total: Counter,
 }
@@ -229,6 +235,36 @@ impl Metrics {
             &mut output,
             "iot_commands_expired_total",
             self.commands_expired_total.get(),
+        );
+        counter(
+            &mut output,
+            "iot_command_ack_dropped_total",
+            self.command_ack_dropped_total.get(),
+        );
+        counter(
+            &mut output,
+            "iot_command_ack_invalid_total",
+            self.command_ack_invalid_total.get(),
+        );
+        counter(
+            &mut output,
+            "iot_command_ack_storage_errors_total",
+            self.command_ack_storage_errors_total.get(),
+        );
+        counter(
+            &mut output,
+            "iot_command_publish_errors_total",
+            self.command_publish_errors_total.get(),
+        );
+        counter(
+            &mut output,
+            "iot_command_storage_errors_total",
+            self.command_storage_errors_total.get(),
+        );
+        counter(
+            &mut output,
+            "iot_command_dispatch_wake_dropped_total",
+            self.command_dispatch_wake_dropped_total.get(),
         );
         gauge(&mut output, "iot_ws_clients", self.ws_clients.get());
         counter(

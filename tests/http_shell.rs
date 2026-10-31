@@ -31,9 +31,19 @@ async fn healthz_is_public_and_readyz_tracks_the_database() {
         json_body(ready).await,
         json!({
             "status": "ready",
-            "checks": { "database": "ok", "mqtt": "ok", "ingest": "ok" }
+            "checks": { "database": "ok", "mqtt": "ok", "ingest": "ok", "commands": "ok" }
         })
     );
+
+    server
+        .command_ready
+        .store(false, std::sync::atomic::Ordering::Release);
+    let ready = get(&server, "/readyz").await;
+    assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(json_body(ready).await["checks"]["commands"], "error");
+    server
+        .command_ready
+        .store(true, std::sync::atomic::Ordering::Release);
 
     server.pool.close().await;
 

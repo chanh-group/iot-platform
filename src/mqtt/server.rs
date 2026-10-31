@@ -4,23 +4,25 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rmqtt::context::ServerContext;
 use rmqtt::hook::Type;
 use rmqtt::server::MqttServer as RmqttServer;
 use sqlx::SqlitePool;
 use tokio::sync::mpsc::OwnedPermit;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::schema::MqttConfig;
+use crate::core::command::{self, CommandWakeReceiver, PendingCommandAcks};
 use crate::core::device_channel::DeviceChannel;
 use crate::core::presence::Presence;
 use crate::core::telemetry::{IngestHandle, TelemetryPayload};
 use crate::observability::metrics::Metrics;
 use crate::storage::sqlite::attributes as attribute_storage;
+use crate::storage::sqlite::commands::SqliteCommandRepository;
 
 use super::acl::AclHooks;
 use super::auth::AuthHooks;
@@ -35,10 +37,17 @@ pub struct MqttServer {
     readiness: Arc<AtomicBool>,
     connections: Arc<ConnectionLimiter>,
     context: ServerContext,
+    publisher: ServerPublisher,
     device_kicks: DeviceKickQueue,
-    task: JoinHandle<anyhow::Result<()>>,
+    task: Option<JoinHandle<anyhow::Result<()>>>,
     kick_task: JoinHandle<()>,
     ack_task: Option<JoinHandle<()>>,
+    ack_cancel: Option<CancellationToken>,
+    command_ack_task: Option<JoinHandle<()>>,
+    command_ack_cancel: CancellationToken,
+    command_ack_pending: PendingCommandAcks,
+    command_wakes: Option<mpsc::Receiver<String>>,
+    command_wake_overflow: Arc<Notify>,
     attributes_task: Option<JoinHandle<()>>,
 }
 
@@ -62,6 +71,7 @@ pub struct MqttControl {
 }
 
 const DEVICE_KICK_QUEUE_CAPACITY: usize = 32;
+const COMMAND_WAKE_QUEUE_CAPACITY: usize = 4_096;
 const DEVICE_KICK_CONCURRENCY: usize = 8;
 const DEVICE_KICK_ATTEMPTS: usize = 3;
 const DEVICE_KICK_TIMEOUT: Duration = Duration::from_secs(3);
@@ -428,6 +438,13 @@ impl MqttServer {
             Arc::clone(&presence),
             Arc::clone(&connections),
         );
+        let command_repository = Arc::new(SqliteCommandRepository::new(pool.clone()));
+        let command_ack_cancel = CancellationToken::new();
+        let (command_ack, command_ack_task) =
+            command::spawn_ack_worker(command_repository, command_ack_cancel.clone());
+        let command_ack_pending = command_ack.pending();
+        let (command_wake_sender, command_wakes) = mpsc::channel(COMMAND_WAKE_QUEUE_CAPACITY);
+        let command_wake_overflow = Arc::new(Notify::new());
         let failure = MqttFailure(Arc::clone(&connections));
         let (device_kicks, kick_task) = spawn_device_kick_worker(
             pool.clone(),
@@ -444,11 +461,12 @@ impl MqttServer {
                 Box::new(AuthHooks::new(pool.clone(), Arc::clone(&connections))),
             )
             .await;
-        let (acl_hooks, ack_task, attributes_task) = match ingest {
+        let (acl_hooks, ack_task, ack_cancel, attributes_task) = match ingest {
             Some((ingest, limits, attribute_queue_capacity)) => {
                 let (attributes, attributes_task) =
                     attribute_storage::spawn_worker(pool.clone(), attribute_queue_capacity);
-                let (ack, task) = spawn_ack_worker(publisher.clone());
+                let ack_cancel = CancellationToken::new();
+                let (ack, task) = spawn_ack_worker(publisher.clone(), ack_cancel.clone());
                 (
                     AclHooks::with_ingest(
                         Arc::clone(&connections),
@@ -456,14 +474,17 @@ impl MqttServer {
                         attributes,
                         limits,
                         ack,
+                        command_ack.clone(),
                         max_topic_levels,
                     ),
                     Some(task),
+                    Some(ack_cancel),
                     Some(attributes_task),
                 )
             }
             None => (
-                AclHooks::new(Arc::clone(&connections), max_topic_levels),
+                AclHooks::with_command_ack(Arc::clone(&connections), command_ack, max_topic_levels),
+                None,
                 None,
                 None,
             ),
@@ -479,16 +500,25 @@ impl MqttServer {
             )
             .await;
         let presence_hooks = PresenceHooks::new(
-            pool,
+            pool.clone(),
             presence,
             Arc::clone(&connections),
             device_kicks.clone(),
+            command_wake_sender,
+            Arc::clone(&command_wake_overflow),
         );
         register
             .add_priority(Type::ClientConnected, 10, Box::new(presence_hooks.clone()))
             .await;
         register
-            .add_priority(Type::ClientDisconnected, 10, Box::new(presence_hooks))
+            .add_priority(
+                Type::ClientDisconnected,
+                10,
+                Box::new(presence_hooks.clone()),
+            )
+            .await;
+        register
+            .add_priority(Type::SessionSubscribed, 10, Box::new(presence_hooks))
             .await;
         register.start().await;
 
@@ -508,10 +538,17 @@ impl MqttServer {
             readiness,
             connections,
             context: retained_context,
+            publisher,
             device_kicks,
-            task,
+            task: Some(task),
             kick_task,
             ack_task,
+            ack_cancel,
+            command_ack_task: Some(command_ack_task),
+            command_ack_cancel,
+            command_ack_pending,
+            command_wakes: Some(command_wakes),
+            command_wake_overflow,
             attributes_task,
         })
     }
@@ -521,6 +558,28 @@ impl MqttServer {
         self.address
     }
 
+    /// Returns the broker-backed channel used by the command dispatcher.
+    #[must_use]
+    pub fn device_channel(&self) -> Arc<dyn DeviceChannel> {
+        Arc::new(self.publisher.clone())
+    }
+
+    /// Returns the pending ACK count shared with the dispatcher expiry sweep.
+    #[must_use]
+    pub fn pending_command_acks(&self) -> PendingCommandAcks {
+        self.command_ack_pending.clone()
+    }
+
+    /// Transfers the bounded device-reconnect wake queue to the dispatcher.
+    pub fn take_command_wakes(&mut self) -> CommandWakeReceiver {
+        let wakes = self.command_wakes.take().unwrap_or_else(|| {
+            let (sender, receiver) = mpsc::channel(1);
+            drop(sender);
+            receiver
+        });
+        CommandWakeReceiver::new(wakes, Arc::clone(&self.command_wake_overflow))
+    }
+
     /// Number of retained broker messages, used to verify retained-topic policy.
     pub async fn retained_count(&self) -> isize {
         self.context.extends.retain().await.count().await
@@ -528,34 +587,125 @@ impl MqttServer {
 
     /// Waits for an unexpected broker stop.
     pub async fn wait(&mut self) -> anyhow::Result<()> {
+        let Some(task) = self.task.as_mut() else {
+            anyhow::bail!("MQTT listener task was already joined");
+        };
         let result = wait_for_task_or_mqtt_failure(
-            &mut self.task,
+            task,
             &mut self.kick_task,
+            &mut self.ack_task,
+            &mut self.command_ack_task,
             self.connections.failure(),
         )
         .await;
+        if self.task.as_ref().is_some_and(JoinHandle::is_finished) {
+            self.task.take();
+        }
+        if self.ack_task.as_ref().is_some_and(JoinHandle::is_finished) {
+            self.ack_task.take();
+        }
+        if self
+            .command_ack_task
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
+            self.command_ack_task.take();
+        }
         if result.is_err() {
-            self.abort();
+            self.stop_listener().await;
         }
         result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn abort_command_ack_worker_for_test(&self) {
+        if let Some(task) = &self.command_ack_task {
+            task.abort();
+        }
     }
 
     /// Stops the MQTT listener. Device sessions must be kicked before shutdown.
     pub fn abort(&self) {
         self.readiness.store(false, Ordering::Release);
-        self.task.abort();
+        if let Some(cancel) = &self.ack_cancel {
+            cancel.cancel();
+        }
+        self.command_ack_cancel.cancel();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
         if let Some(task) = &self.ack_task {
+            task.abort();
+        }
+        if let Some(task) = &self.command_ack_task {
             task.abort();
         }
         if let Some(task) = &self.attributes_task {
             task.abort();
         }
     }
+
+    /// Stops the listener first so hook producers release their bounded queues.
+    pub async fn stop_listener(&mut self) {
+        self.readiness.store(false, Ordering::Release);
+        if let Some(task) = self.task.take() {
+            if !task.is_finished() {
+                task.abort();
+            }
+            match task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "MQTT listener failed during shutdown"),
+                Err(error) if !error.is_cancelled() => {
+                    tracing::warn!(%error, "MQTT listener task failed during shutdown");
+                }
+                Err(_) => {}
+            }
+        }
+        if let Some(task) = self.attributes_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some(cancel) = &self.ack_cancel {
+            cancel.cancel();
+        }
+        self.command_ack_cancel.cancel();
+    }
+
+    /// Drains MQTT workers after listener hooks have stopped producing messages.
+    pub async fn drain_workers(&mut self, timeout: Duration) -> bool {
+        if let Some(cancel) = &self.ack_cancel {
+            cancel.cancel();
+        }
+        self.command_ack_cancel.cancel();
+        let deadline = Instant::now() + timeout;
+        let mut completed = true;
+        for mut task in [self.ack_task.take(), self.command_ack_task.take()]
+            .into_iter()
+            .flatten()
+        {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining, &mut task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "MQTT worker failed during shutdown");
+                    completed = false;
+                }
+                Err(_) => {
+                    task.abort();
+                    let _ = task.await;
+                    completed = false;
+                }
+            }
+        }
+        completed
+    }
 }
 
 async fn wait_for_task_or_mqtt_failure(
     task: &mut JoinHandle<anyhow::Result<()>>,
     kick_task: &mut JoinHandle<()>,
+    ack_task: &mut Option<JoinHandle<()>>,
+    command_ack_task: &mut Option<JoinHandle<()>>,
     mqtt_failure: &CancellationToken,
 ) -> anyhow::Result<()> {
     let result = tokio::select! {
@@ -568,6 +718,14 @@ async fn wait_for_task_or_mqtt_failure(
                 Err(error) => return Err(error.into()),
             }
         }
+        result = wait_optional_task(ack_task) => {
+            result?;
+            anyhow::bail!("MQTT telemetry ACK worker stopped unexpectedly")
+        }
+        result = wait_optional_task(command_ack_task) => {
+            result?;
+            anyhow::bail!("MQTT command ACK worker stopped unexpectedly")
+        }
     };
     match result {
         None => {
@@ -578,6 +736,15 @@ async fn wait_for_task_or_mqtt_failure(
         Some(result) => result.map_err(anyhow::Error::from)??,
     }
     Ok(())
+}
+
+async fn wait_optional_task(
+    task: &mut Option<JoinHandle<()>>,
+) -> Result<(), tokio::task::JoinError> {
+    match task {
+        Some(task) => task.await,
+        None => std::future::pending().await,
+    }
 }
 
 impl Drop for MqttServer {
@@ -691,8 +858,11 @@ mod tests {
         let state = AppState::new(
             pool.clone(),
             Arc::new(loaded),
-            Arc::clone(&readiness),
-            Arc::new(AtomicBool::new(true)),
+            crate::http::ServiceReadiness {
+                mqtt: Arc::clone(&readiness),
+                telemetry: Arc::new(AtomicBool::new(true)),
+                commands: Arc::new(AtomicBool::new(true)),
+            },
             EventBus::new(),
             Arc::clone(&presence),
             mqtt.control(),
@@ -1681,8 +1851,11 @@ mod tests {
         let state = AppState::new(
             pool,
             Arc::new(loaded),
-            Arc::clone(&readiness),
-            Arc::new(AtomicBool::new(true)),
+            crate::http::ServiceReadiness {
+                mqtt: Arc::clone(&readiness),
+                telemetry: Arc::new(AtomicBool::new(true)),
+                commands: Arc::new(AtomicBool::new(true)),
+            },
             EventBus::new(),
             Arc::clone(&presence),
             mqtt.control(),
@@ -1725,7 +1898,16 @@ mod tests {
         mqtt_failure.cancel();
 
         let mut kick_task = tokio::spawn(std::future::pending::<()>());
-        let result = wait_for_task_or_mqtt_failure(&mut task, &mut kick_task, &mqtt_failure).await;
+        let mut ack_task = None;
+        let mut command_ack_task = Some(tokio::spawn(std::future::pending::<()>()));
+        let result = wait_for_task_or_mqtt_failure(
+            &mut task,
+            &mut kick_task,
+            &mut ack_task,
+            &mut command_ack_task,
+            &mqtt_failure,
+        )
+        .await;
 
         assert!(result.is_err());
         assert!(task.is_finished());

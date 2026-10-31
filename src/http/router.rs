@@ -102,12 +102,13 @@ async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
 
     let mqtt_ok = state.mqtt_ready.load(Ordering::Acquire);
     let telemetry_ok = state.telemetry_ready.load(Ordering::Acquire);
+    let commands_ok = state.command_ready.load(Ordering::Acquire);
 
-    if database_ok && mqtt_ok && telemetry_ok {
+    if database_ok && mqtt_ok && telemetry_ok && commands_ok {
         (
             StatusCode::OK,
             Json(
-                json!({ "status": "ready", "checks": { "database": "ok", "mqtt": "ok", "ingest": "ok" } }),
+                json!({ "status": "ready", "checks": { "database": "ok", "mqtt": "ok", "ingest": "ok", "commands": "ok" } }),
             ),
         )
     } else {
@@ -119,7 +120,8 @@ async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
                 "checks": {
                     "database": if database_ok { "ok" } else { "error" },
                     "mqtt": if mqtt_ok { "ok" } else { "error" },
-                    "ingest": if telemetry_ok { "ok" } else { "degraded" }
+                    "ingest": if telemetry_ok { "ok" } else { "degraded" },
+                    "commands": if commands_ok { "ok" } else { "error" }
                 }
             })),
         )

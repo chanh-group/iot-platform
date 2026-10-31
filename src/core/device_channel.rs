@@ -21,6 +21,19 @@ pub trait DeviceChannel: Send + Sync {
         payload: &[u8],
     ) -> Result<(), DeviceChannelError>;
 
+    /// Publishes only to an active session; dispatchers must not use broker offline queues.
+    async fn publish_if_online(
+        &self,
+        device_id: &str,
+        topic: &str,
+        payload: &[u8],
+    ) -> Result<(), DeviceChannelError> {
+        if !self.is_online(device_id).await? {
+            return Err(DeviceChannelError::Unavailable);
+        }
+        self.publish(device_id, topic, payload).await
+    }
+
     /// Closes a device's active broker session.
     async fn kick(&self, device_id: &str) -> Result<(), DeviceChannelError>;
 

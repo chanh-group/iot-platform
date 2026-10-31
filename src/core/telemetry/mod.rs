@@ -5,7 +5,9 @@ mod payload;
 mod repository;
 mod validate;
 
-pub use ingest::{IngestHandle, IngestResult, IngestSubmitError, spawn_worker};
+pub use ingest::{
+    IngestHandle, IngestResult, IngestSubmitError, IngestWorkerControl, spawn_worker,
+};
 pub use payload::{TelemetryPayload, ValidatedTelemetry};
 pub use repository::{TelemetryInsertResult, TelemetryRepository};
 pub(crate) use validate::valid_values;

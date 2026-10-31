@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 use crate::core::events::{EventBus, TelemetryCommitted};
 use crate::observability::metrics::{IngestRejectReason, Metrics};
@@ -21,6 +22,14 @@ pub struct IngestHandle(mpsc::Sender<Work>);
 
 /// Completion receiver for a submitted telemetry event.
 pub type IngestResult = oneshot::Receiver<Result<TelemetryInsertResult, ()>>;
+
+/// Shutdown and readiness controls for the ingestion worker.
+pub struct IngestWorkerControl {
+    /// Stops accepting new queue items and drains items already accepted.
+    pub cancellation: CancellationToken,
+    /// Indicates whether database commits are currently healthy.
+    pub readiness: Arc<AtomicBool>,
+}
 
 /// Why a telemetry event could not be submitted to the ingest queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,7 +77,7 @@ pub fn spawn_worker(
     batch_size: usize,
     max_batch_bytes: usize,
     flush_interval: Duration,
-    readiness: Arc<AtomicBool>,
+    control: IngestWorkerControl,
 ) -> (IngestHandle, tokio::task::JoinHandle<()>) {
     let (sender, receiver) = mpsc::channel(capacity);
     let handle = IngestHandle(sender);
@@ -79,7 +88,7 @@ pub fn spawn_worker(
         batch_size,
         max_batch_bytes,
         flush_interval,
-        readiness,
+        control,
     ));
     (handle, task)
 }
@@ -91,17 +100,29 @@ async fn run_worker(
     batch_size: usize,
     max_batch_bytes: usize,
     flush_interval: Duration,
-    readiness: Arc<AtomicBool>,
+    control: IngestWorkerControl,
 ) {
-    let mut pending = None;
+    let IngestWorkerControl {
+        cancellation: cancel,
+        readiness,
+    } = control;
+    let mut pending: Option<Work> = None;
+    let mut draining = false;
     loop {
         let first = match pending.take() {
-            Some(work) => work,
-            None => match receiver.recv().await {
-                Some(work) => work,
-                None => break,
+            Some(work) => Some(work),
+            None if draining => receiver.recv().await,
+            None => tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    receiver.close();
+                    draining = true;
+                    receiver.recv().await
+                }
+                work = receiver.recv() => work,
             },
         };
+        let Some(first) = first else { break };
         let mut batch = vec![first];
         let mut bytes = batch[0].event.raw_bytes;
         Metrics::global()
@@ -111,6 +132,12 @@ async fn run_worker(
         tokio::pin!(deadline);
         while batch.len() < batch_size {
             tokio::select! {
+                biased;
+                _ = cancel.cancelled(), if !draining => {
+                    receiver.close();
+                    draining = true;
+                    break;
+                }
                 _ = &mut deadline => break,
                 work = receiver.recv() => match work {
                     Some(work) if bytes.saturating_add(work.event.raw_bytes) <= max_batch_bytes => {

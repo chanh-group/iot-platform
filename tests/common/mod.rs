@@ -11,12 +11,14 @@ use std::time::{Duration, Instant};
 use iot_server::config::schema::{MqttConfig, TelemetryConfig};
 use iot_server::config::{self, LoadedConfig};
 use iot_server::core::auth;
+use iot_server::core::command::spawn_dispatcher;
 use iot_server::core::events::EventBus;
 use iot_server::core::presence::Presence;
 use iot_server::core::telemetry::{self as telemetry_core, TelemetryPayload};
-use iot_server::http::{AppState, router};
+use iot_server::http::{AppState, ServiceReadiness, router};
 use iot_server::mqtt::server::MqttServer;
 use iot_server::runtime::data_dir_lock::DataDirLock;
+use iot_server::storage::sqlite::commands::SqliteCommandRepository;
 use iot_server::storage::sqlite::telemetry::SqliteTelemetryRepository;
 use iot_server::storage::sqlite::users;
 use iot_server::storage::sqlite::{migrate, pool};
@@ -33,6 +35,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub const PASSWORD: &str = "correct horse battery staple";
@@ -75,6 +78,10 @@ pub struct TestApp {
     pub events: EventBus,
     mqtt: MqttServer,
     telemetry_task: JoinHandle<()>,
+    telemetry_cancel: CancellationToken,
+    command_task: JoinHandle<()>,
+    command_cancel: CancellationToken,
+    pub command_ready: Arc<AtomicBool>,
     handle: JoinHandle<()>,
     _lock: DataDirLock,
     _dir: TempDir,
@@ -218,6 +225,14 @@ impl TestApp {
     }
 
     pub async fn restart_mqtt_with_config(&mut self, mut config: MqttConfig) {
+        self.command_cancel.cancel();
+        if tokio::time::timeout(Duration::from_secs(1), &mut self.command_task)
+            .await
+            .is_err()
+        {
+            self.command_task.abort();
+            let _ = (&mut self.command_task).await;
+        }
         self.mqtt.abort();
         config.listen = "127.0.0.1:0".parse().expect("valid test MQTT address");
         let readiness = Arc::new(AtomicBool::new(false));
@@ -231,13 +246,26 @@ impl TestApp {
         .expect("restart test MQTT server");
         self.mqtt_addr = mqtt.local_addr();
         self.mqtt = mqtt;
+        self.command_cancel = CancellationToken::new();
+        self.command_task = spawn_dispatcher(
+            Arc::new(SqliteCommandRepository::new(self.pool.clone())),
+            self.mqtt.device_channel(),
+            self.config.config.commands.clone(),
+            self.mqtt.pending_command_acks(),
+            self.mqtt.take_command_wakes(),
+            self.command_cancel.clone(),
+            Arc::clone(&self.command_ready),
+        );
     }
 }
 
 impl Drop for TestApp {
     fn drop(&mut self) {
         self.mqtt.abort();
+        self.telemetry_cancel.cancel();
         self.telemetry_task.abort();
+        self.command_cancel.cancel();
+        self.command_task.abort();
         self.handle.abort();
     }
 }
@@ -253,6 +281,8 @@ pub struct TestAppBuilder {
     mqtt_config: MqttConfig,
     telemetry_config: TelemetryConfig,
     command_max_ttl_ms: u64,
+    command_dispatch_interval_ms: u64,
+    command_retry_initial_ms: u64,
 }
 
 impl Default for TestAppBuilder {
@@ -268,6 +298,8 @@ impl Default for TestAppBuilder {
             mqtt_config: MqttConfig::default(),
             telemetry_config: TelemetryConfig::default(),
             command_max_ttl_ms: 86_400_000,
+            command_dispatch_interval_ms: 100,
+            command_retry_initial_ms: 1_000,
         }
     }
 }
@@ -325,6 +357,12 @@ impl TestAppBuilder {
         self
     }
 
+    pub fn command_dispatch_timing(mut self, interval_ms: u64, retry_initial_ms: u64) -> Self {
+        self.command_dispatch_interval_ms = interval_ms;
+        self.command_retry_initial_ms = retry_initial_ms;
+        self
+    }
+
     pub async fn start(self) -> TestApp {
         let dir = TempDir::new().unwrap();
         let config_path = dir.path().join("conf.toml");
@@ -375,6 +413,8 @@ impl TestAppBuilder {
         })
         .unwrap();
         loaded.config.telemetry = self.telemetry_config;
+        loaded.config.commands.dispatch_interval_ms = self.command_dispatch_interval_ms;
+        loaded.config.commands.retry_initial_ms = self.command_retry_initial_ms;
         loaded.config.http.max_ws_connections = self.max_ws_connections;
         loaded.config.http.ws_queue_capacity = self.ws_queue_capacity;
         let mut mqtt_config = self.mqtt_config;
@@ -391,6 +431,7 @@ impl TestAppBuilder {
         let events = EventBus::new();
         let limits = TelemetryPayload::try_from(telemetry).unwrap();
         let telemetry_ready = Arc::new(AtomicBool::new(true));
+        let telemetry_cancel = CancellationToken::new();
         let (ingest, telemetry_task) = telemetry_core::spawn_worker(
             Arc::new(SqliteTelemetryRepository::new(pool.clone())),
             events.clone(),
@@ -398,9 +439,12 @@ impl TestAppBuilder {
             telemetry.batch_size as usize,
             telemetry.max_batch_bytes as usize,
             Duration::from_millis(telemetry.flush_interval_ms),
-            Arc::clone(&telemetry_ready),
+            telemetry_core::IngestWorkerControl {
+                cancellation: telemetry_cancel.clone(),
+                readiness: Arc::clone(&telemetry_ready),
+            },
         );
-        let mqtt = MqttServer::start_with_ingest(
+        let mut mqtt = MqttServer::start_with_ingest(
             &loaded.config.mqtt,
             Arc::clone(&mqtt_ready),
             pool.clone(),
@@ -412,11 +456,25 @@ impl TestAppBuilder {
         .await
         .unwrap();
         let mqtt_addr = mqtt.local_addr();
+        let command_cancel = CancellationToken::new();
+        let command_ready = Arc::new(AtomicBool::new(false));
+        let command_task = spawn_dispatcher(
+            Arc::new(SqliteCommandRepository::new(pool.clone())),
+            mqtt.device_channel(),
+            loaded.config.commands.clone(),
+            mqtt.pending_command_acks(),
+            mqtt.take_command_wakes(),
+            command_cancel.clone(),
+            Arc::clone(&command_ready),
+        );
         let state = AppState::new(
             pool.clone(),
             Arc::clone(&loaded),
-            mqtt_ready,
-            telemetry_ready,
+            ServiceReadiness {
+                mqtt: mqtt_ready,
+                telemetry: telemetry_ready,
+                commands: Arc::clone(&command_ready),
+            },
             events.clone(),
             Arc::clone(&presence),
             mqtt.control(),
@@ -445,6 +503,10 @@ impl TestAppBuilder {
             events,
             mqtt,
             telemetry_task,
+            telemetry_cancel,
+            command_task,
+            command_cancel,
+            command_ready,
             handle,
             _lock: lock,
             _dir: dir,

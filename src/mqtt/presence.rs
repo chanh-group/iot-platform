@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use rmqtt::hook::{Handler, HookResult, Parameter, ReturnType};
 use sqlx::SqlitePool;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::core::auth;
@@ -379,6 +379,8 @@ pub struct PresenceHooks {
     presence: Arc<Presence>,
     connections: Arc<ConnectionLimiter>,
     kicks: DeviceKickQueue,
+    command_wakes: mpsc::Sender<String>,
+    command_wake_overflow: Arc<Notify>,
 }
 
 impl PresenceHooks {
@@ -389,12 +391,26 @@ impl PresenceHooks {
         presence: Arc<Presence>,
         connections: Arc<ConnectionLimiter>,
         kicks: DeviceKickQueue,
+        command_wakes: mpsc::Sender<String>,
+        command_wake_overflow: Arc<Notify>,
     ) -> Self {
         Self {
             pool,
             presence,
             connections,
             kicks,
+            command_wakes,
+            command_wake_overflow,
+        }
+    }
+
+    fn wake_commands(&self, device_id: &str) {
+        if self.command_wakes.try_send(device_id.to_owned()).is_err() {
+            Metrics::global().command_dispatch_wake_dropped_total.inc();
+            self.command_wake_overflow.notify_one();
+            tracing::warn!(
+                "command dispatcher wake queue full or closed; scheduling overflow recovery"
+            );
         }
     }
 
@@ -475,6 +491,7 @@ impl Handler for PresenceHooks {
                         return (true, None);
                     }
                 }
+                self.wake_commands(device_id);
                 self.record_last_seen(device_id).await;
             }
             Parameter::ClientDisconnected(session, _reason) => {
@@ -493,6 +510,12 @@ impl Handler for PresenceHooks {
                     }
                 }
                 self.record_last_seen(device_id).await;
+            }
+            Parameter::SessionSubscribed(session, subscribe) => {
+                let device_id: &str = &session.id.client_id;
+                if subscribe.topic_filter == format!("devices/{device_id}/commands") {
+                    self.wake_commands(device_id);
+                }
             }
             _ => {}
         }

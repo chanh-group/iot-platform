@@ -84,6 +84,12 @@ async fn metrics_requires_its_bearer_token_and_exports_core_series() {
         "iot_telemetry_commit_errors_total",
         "iot_commands_pending",
         "iot_commands_expired_total",
+        "iot_command_ack_dropped_total",
+        "iot_command_ack_invalid_total",
+        "iot_command_ack_storage_errors_total",
+        "iot_command_publish_errors_total",
+        "iot_command_storage_errors_total",
+        "iot_command_dispatch_wake_dropped_total",
         "iot_ws_clients",
         "iot_ws_dropped_total",
     ] {

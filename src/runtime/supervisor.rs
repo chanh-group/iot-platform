@@ -7,7 +7,7 @@ use std::path::Path;
 use std::process::{self, ExitCode};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::net::TcpListener;
 use tokio::signal::unix::{self, SignalKind};
@@ -15,14 +15,16 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::LoadedConfig;
+use crate::core::command::spawn_dispatcher;
 use crate::core::events::EventBus;
 use crate::core::presence::Presence;
 use crate::core::telemetry::{self, TelemetryPayload};
-use crate::http::{AppState, router};
+use crate::http::{AppState, ServiceReadiness, router};
 use crate::mqtt::server::MqttServer;
 use crate::observability::logging;
 use crate::runtime::data_dir_lock::DataDirLock;
 use crate::runtime::{EXIT_LOCK, EXIT_MIGRATION, EXIT_RUNTIME, shutdown};
+use crate::storage::sqlite::commands::SqliteCommandRepository;
 use crate::storage::sqlite::telemetry::SqliteTelemetryRepository;
 use crate::storage::sqlite::{migrate, pool};
 
@@ -58,6 +60,7 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
     let telemetry_config = &loaded.config.telemetry;
     let events = EventBus::new();
     let telemetry_ready = Arc::new(AtomicBool::new(true));
+    let telemetry_cancel = CancellationToken::new();
     let limits = match TelemetryPayload::try_from(telemetry_config) {
         Ok(limits) => limits,
         Err(error) => {
@@ -73,7 +76,10 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
         telemetry_config.batch_size as usize,
         telemetry_config.max_batch_bytes as usize,
         Duration::from_millis(telemetry_config.flush_interval_ms),
-        Arc::clone(&telemetry_ready),
+        telemetry::IngestWorkerControl {
+            cancellation: telemetry_cancel.clone(),
+            readiness: Arc::clone(&telemetry_ready),
+        },
     );
 
     let mqtt_ready = Arc::new(AtomicBool::new(false));
@@ -92,6 +98,7 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
         Ok(server) => server,
         Err(error) => {
             tracing::error!(%error, "cannot start mqtt listener");
+            telemetry_cancel.cancel();
             drop(ingest);
             ingest_task.abort();
             pool.close().await;
@@ -104,6 +111,7 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
         Err(error) => {
             tracing::error!(%error, "cannot bind http listener");
             mqtt.abort();
+            telemetry_cancel.cancel();
             drop(ingest);
             ingest_task.abort();
             pool.close().await;
@@ -115,6 +123,7 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
         Err(error) => {
             tracing::error!(%error, "cannot read http listener address");
             mqtt.abort();
+            telemetry_cancel.cancel();
             drop(ingest);
             ingest_task.abort();
             pool.close().await;
@@ -125,11 +134,25 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
     logging::startup(config_path, &loaded, listen_addr);
 
     let shutdown_timeout = Duration::from_millis(loaded.config.server.shutdown_timeout_ms);
+    let command_ready = Arc::new(AtomicBool::new(false));
+    let command_cancel = CancellationToken::new();
+    let mut command_task = spawn_dispatcher(
+        Arc::new(SqliteCommandRepository::new(pool.clone())),
+        mqtt.device_channel(),
+        loaded.config.commands.clone(),
+        mqtt.pending_command_acks(),
+        mqtt.take_command_wakes(),
+        command_cancel.clone(),
+        Arc::clone(&command_ready),
+    );
     let state = AppState::new(
         pool.clone(),
         Arc::new(loaded),
-        mqtt_ready,
-        telemetry_ready,
+        ServiceReadiness {
+            mqtt: mqtt_ready,
+            telemetry: telemetry_ready,
+            commands: command_ready,
+        },
         events,
         presence,
         mqtt.control(),
@@ -151,8 +174,12 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
         Ok(signal) => signal,
         Err(error) => {
             tracing::error!(%error, "cannot listen for SIGTERM");
+            command_cancel.cancel();
+            command_task.abort();
+            let _ = command_task.await;
             server.abort();
             mqtt.abort();
+            telemetry_cancel.cancel();
             drop(ingest);
             ingest_task.abort();
             state.pool.close().await;
@@ -163,8 +190,12 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
         Ok(signal) => signal,
         Err(error) => {
             tracing::error!(%error, "cannot listen for SIGINT");
+            command_cancel.cancel();
+            command_task.abort();
+            let _ = command_task.await;
             server.abort();
             mqtt.abort();
+            telemetry_cancel.cancel();
             drop(ingest);
             ingest_task.abort();
             state.pool.close().await;
@@ -187,7 +218,15 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
         process::exit(i32::from(EXIT_RUNTIME));
     });
 
-    match wait_for_exit(&mut server, mqtt.wait(), &mut ingest_task, &mut signal_rx).await {
+    match wait_for_exit(
+        &mut server,
+        mqtt.wait(),
+        &mut ingest_task,
+        &mut command_task,
+        &mut signal_rx,
+    )
+    .await
+    {
         TaskExit::Signal => {}
         TaskExit::Http(result) => {
             match result {
@@ -195,6 +234,22 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
                 Ok(Err(error)) => tracing::error!(%error, "http server failed"),
                 Err(error) => tracing::error!(%error, "http server task panicked"),
             }
+            let deadline = Instant::now() + shutdown_timeout;
+            stop_command_worker(
+                &mut command_task,
+                &command_cancel,
+                shutdown_remaining(deadline),
+            )
+            .await;
+            telemetry_cancel.cancel();
+            drop(ingest);
+            if tokio::time::timeout(shutdown_remaining(deadline), &mut ingest_task)
+                .await
+                .is_err()
+            {
+                ingest_task.abort();
+            }
+            let _ = stop_mqtt_workers(&mut mqtt, shutdown_remaining(deadline)).await;
             state.pool.close().await;
             return ExitCode::FAILURE;
         }
@@ -203,7 +258,24 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
                 Ok(()) => tracing::error!("mqtt listener stopped unexpectedly"),
                 Err(error) => tracing::error!(%error, "mqtt listener failed"),
             }
-            let outcome = shutdown::http(&state.ready, &cancel, server, shutdown_timeout).await;
+            let deadline = Instant::now() + shutdown_timeout;
+            stop_command_worker(
+                &mut command_task,
+                &command_cancel,
+                shutdown_remaining(deadline),
+            )
+            .await;
+            telemetry_cancel.cancel();
+            drop(ingest);
+            if tokio::time::timeout(shutdown_remaining(deadline), &mut ingest_task)
+                .await
+                .is_err()
+            {
+                ingest_task.abort();
+            }
+            let _ = stop_mqtt_workers(&mut mqtt, shutdown_remaining(deadline)).await;
+            let outcome =
+                shutdown::http(&state.ready, &cancel, server, shutdown_remaining(deadline)).await;
             state.pool.close().await;
             if let Err(error) = outcome {
                 tracing::error!(%error, "http shutdown after mqtt failure failed");
@@ -211,6 +283,9 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
             return ExitCode::FAILURE;
         }
         TaskExit::Telemetry(result) => {
+            let deadline = Instant::now() + shutdown_timeout;
+            command_cancel.cancel();
+            telemetry_cancel.cancel();
             let exit = shutdown_after_telemetry_worker_exit(
                 &state.telemetry_ready,
                 &result,
@@ -218,7 +293,13 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
                 &state.ready,
                 &cancel,
                 server,
-                shutdown_timeout,
+                shutdown_remaining(deadline),
+            )
+            .await;
+            stop_command_worker(
+                &mut command_task,
+                &command_cancel,
+                shutdown_remaining(deadline),
             )
             .await;
             drop(ingest);
@@ -226,31 +307,95 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
             drop(lock);
             return exit;
         }
+        TaskExit::Command(result) => {
+            match result {
+                Ok(()) => tracing::error!("command dispatcher stopped unexpectedly"),
+                Err(error) => tracing::error!(%error, "command dispatcher task panicked"),
+            }
+            let deadline = Instant::now() + shutdown_timeout;
+            command_cancel.cancel();
+            telemetry_cancel.cancel();
+            drop(ingest);
+            if tokio::time::timeout(shutdown_remaining(deadline), &mut ingest_task)
+                .await
+                .is_err()
+            {
+                ingest_task.abort();
+            }
+            let _ = stop_mqtt_workers(&mut mqtt, shutdown_remaining(deadline)).await;
+            let _ =
+                shutdown::http(&state.ready, &cancel, server, shutdown_remaining(deadline)).await;
+            state.pool.close().await;
+            drop(lock);
+            return ExitCode::FAILURE;
+        }
     }
 
-    mqtt.abort();
+    let deadline = Instant::now() + shutdown_timeout;
+    command_cancel.cancel();
+    let command_stopped = stop_command_worker(
+        &mut command_task,
+        &command_cancel,
+        shutdown_remaining(deadline),
+    )
+    .await;
+    telemetry_cancel.cancel();
     drop(ingest);
-    if tokio::time::timeout(shutdown_timeout, &mut ingest_task)
-        .await
-        .is_err()
-    {
-        tracing::warn!("telemetry worker did not drain before shutdown deadline");
-        ingest_task.abort();
-    }
-    let outcome = shutdown::http(&state.ready, &cancel, server, shutdown_timeout).await;
+    let telemetry_stopped =
+        match tokio::time::timeout(shutdown_remaining(deadline), &mut ingest_task).await {
+            Ok(Ok(())) => true,
+            Ok(Err(error)) => {
+                tracing::error!(%error, "telemetry worker failed during shutdown");
+                false
+            }
+            Err(_) => {
+                tracing::warn!("telemetry worker did not drain before shutdown deadline");
+                ingest_task.abort();
+                let _ = (&mut ingest_task).await;
+                false
+            }
+        };
+    let mqtt_workers_stopped = stop_mqtt_workers(&mut mqtt, shutdown_remaining(deadline)).await;
+    let outcome = shutdown::http(&state.ready, &cancel, server, shutdown_remaining(deadline)).await;
     state.pool.close().await;
     drop(lock);
 
-    match outcome {
-        Ok(()) => {
+    match (
+        outcome,
+        command_stopped,
+        mqtt_workers_stopped,
+        telemetry_stopped,
+    ) {
+        (Ok(()), true, true, true) => {
             logging::shutdown("signal");
             ExitCode::SUCCESS
         }
-        Err(error) => {
+        (Err(error), _, _, _) => {
             tracing::error!(%error, "shutdown failed");
             ExitCode::FAILURE
         }
+        (_, false, _, _) => {
+            tracing::error!("command dispatcher did not stop before shutdown deadline");
+            ExitCode::FAILURE
+        }
+        (_, _, false, _) => {
+            tracing::error!("MQTT workers did not drain before shutdown deadline");
+            ExitCode::FAILURE
+        }
+        (_, _, _, false) => {
+            tracing::error!("telemetry worker did not drain before shutdown deadline");
+            ExitCode::FAILURE
+        }
     }
+}
+
+fn shutdown_remaining(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
+async fn stop_mqtt_workers(mqtt: &mut MqttServer, timeout: Duration) -> bool {
+    mqtt.stop_listener().await;
+    mqtt.drain_workers(timeout).await
 }
 
 #[derive(Debug)]
@@ -259,12 +404,14 @@ enum TaskExit {
     Http(Result<io::Result<()>, tokio::task::JoinError>),
     Mqtt(anyhow::Result<()>),
     Telemetry(Result<(), tokio::task::JoinError>),
+    Command(Result<(), tokio::task::JoinError>),
 }
 
 async fn wait_for_exit<MqttExit>(
     server: &mut tokio::task::JoinHandle<io::Result<()>>,
     mqtt: MqttExit,
     ingest_task: &mut tokio::task::JoinHandle<()>,
+    command_task: &mut tokio::task::JoinHandle<()>,
     signal_rx: &mut mpsc::Receiver<()>,
 ) -> TaskExit
 where
@@ -276,6 +423,27 @@ where
         result = &mut *server => TaskExit::Http(result),
         result = mqtt => TaskExit::Mqtt(result),
         result = &mut *ingest_task => TaskExit::Telemetry(result),
+        result = &mut *command_task => TaskExit::Command(result),
+    }
+}
+
+async fn stop_command_worker(
+    task: &mut tokio::task::JoinHandle<()>,
+    cancel: &CancellationToken,
+    timeout: Duration,
+) -> bool {
+    cancel.cancel();
+    match tokio::time::timeout(timeout, &mut *task).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            tracing::error!(%error, "command dispatcher task failed during shutdown");
+            false
+        }
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            false
+        }
     }
 }
 
@@ -319,10 +487,18 @@ mod tests {
             Ok(())
         });
         let mut ingest_task = tokio::spawn(async {});
+        let mut command_task = tokio::spawn(std::future::pending::<()>());
         let (_signal_tx, mut signal_rx) = mpsc::channel(1);
         let mqtt_exit = std::future::pending::<anyhow::Result<()>>();
 
-        let exit = wait_for_exit(&mut server, mqtt_exit, &mut ingest_task, &mut signal_rx).await;
+        let exit = wait_for_exit(
+            &mut server,
+            mqtt_exit,
+            &mut ingest_task,
+            &mut command_task,
+            &mut signal_rx,
+        )
+        .await;
         let TaskExit::Telemetry(result) = exit else {
             panic!("expected telemetry worker exit, got {exit:?}");
         };
@@ -343,5 +519,78 @@ mod tests {
         assert!(mqtt_stopped.load(Ordering::Acquire));
         assert!(http_stopped.load(Ordering::Acquire));
         assert!(!http_readiness.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn unexpected_command_dispatcher_exit_is_supervised() {
+        let mut server = tokio::spawn(std::future::pending::<io::Result<()>>());
+        let mqtt_exit = std::future::pending::<anyhow::Result<()>>();
+        let mut ingest_task = tokio::spawn(std::future::pending::<()>());
+        let mut command_task = tokio::spawn(async {});
+        let (_signal_tx, mut signal_rx) = mpsc::channel(1);
+
+        let exit = wait_for_exit(
+            &mut server,
+            mqtt_exit,
+            &mut ingest_task,
+            &mut command_task,
+            &mut signal_rx,
+        )
+        .await;
+        assert!(matches!(exit, TaskExit::Command(Ok(()))));
+        server.abort();
+        ingest_task.abort();
+    }
+
+    #[tokio::test]
+    async fn mqtt_listener_and_ack_failures_follow_supervisor_cleanup_once() {
+        for ack_failure in [false, true] {
+            let config = crate::config::schema::MqttConfig {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                ..crate::config::schema::MqttConfig::default()
+            };
+            let mqtt_ready = Arc::new(AtomicBool::new(false));
+            let mut mqtt = MqttServer::start(
+                &config,
+                Arc::clone(&mqtt_ready),
+                sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap(),
+                Arc::new(Presence::new()),
+            )
+            .await
+            .unwrap();
+            if ack_failure {
+                mqtt.abort_command_ack_worker_for_test();
+            } else {
+                mqtt.control()
+                    .failure
+                    .report_failure("injected listener failure");
+            }
+
+            let mut http = tokio::spawn(std::future::pending::<io::Result<()>>());
+            let mut ingest = tokio::spawn(std::future::pending::<()>());
+            let mut command = tokio::spawn(std::future::pending::<()>());
+            let (_signal_tx, mut signal_rx) = mpsc::channel(1);
+            let exit = tokio::time::timeout(
+                Duration::from_secs(2),
+                wait_for_exit(
+                    &mut http,
+                    mqtt.wait(),
+                    &mut ingest,
+                    &mut command,
+                    &mut signal_rx,
+                ),
+            )
+            .await
+            .expect("supervisor should observe MQTT worker failure");
+            assert!(matches!(exit, TaskExit::Mqtt(Err(_))));
+            assert!(
+                !mqtt_ready.load(Ordering::Acquire),
+                "MQTT failure must lower readiness"
+            );
+            let _ = stop_mqtt_workers(&mut mqtt, Duration::from_secs(1)).await;
+            http.abort();
+            ingest.abort();
+            command.abort();
+        }
     }
 }

@@ -28,6 +28,16 @@ use crate::mqtt::server::{DeviceKickQueue, MqttControl, MqttFailure};
 use crate::storage::sqlite::commands::SqliteCommandRepository;
 use middleware::LoginRateLimiter;
 
+/// Health signals for long-running services that back the HTTP readiness check.
+pub struct ServiceReadiness {
+    /// Whether the MQTT listener is serving.
+    pub mqtt: Arc<AtomicBool>,
+    /// Whether telemetry commits are healthy.
+    pub telemetry: Arc<AtomicBool>,
+    /// Whether the command dispatcher task is alive.
+    pub commands: Arc<AtomicBool>,
+}
+
 /// Shared handler state: database pool, config, login limiter, and task readiness.
 #[derive(Clone)]
 pub struct AppState {
@@ -43,6 +53,8 @@ pub struct AppState {
     pub mqtt_ready: Arc<AtomicBool>,
     /// Cleared while telemetry commits are failing and retried.
     pub telemetry_ready: Arc<AtomicBool>,
+    /// Cleared if the SQL-backed command dispatcher stops.
+    pub command_ready: Arc<AtomicBool>,
     /// Best-effort event stream shared with the telemetry worker.
     pub events: EventBus,
     /// Blocks new MQTT authentication while a committed disable is kicked.
@@ -66,8 +78,7 @@ impl AppState {
     pub fn new(
         pool: SqlitePool,
         config: Arc<LoadedConfig>,
-        mqtt_ready: Arc<AtomicBool>,
-        telemetry_ready: Arc<AtomicBool>,
+        readiness: ServiceReadiness,
         events: EventBus,
         presence: Arc<Presence>,
         mqtt_control: MqttControl,
@@ -84,8 +95,9 @@ impl AppState {
             config,
             login_limiter: Arc::new(limiter),
             ready: Arc::new(AtomicBool::new(true)),
-            mqtt_ready,
-            telemetry_ready,
+            mqtt_ready: readiness.mqtt,
+            telemetry_ready: readiness.telemetry,
+            command_ready: readiness.commands,
             events,
             device_admission: mqtt_control.device_admission,
             device_kicks: mqtt_control.device_kicks,

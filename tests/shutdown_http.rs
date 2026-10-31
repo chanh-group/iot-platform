@@ -149,7 +149,13 @@ async fn sigterm_drains_in_flight_request_and_releases_lock() {
     .expect("wait task panicked")
     .expect("wait failed");
 
-    assert!(output.status.success(), "exit {:?}", output.status);
+    assert!(
+        output.status.success(),
+        "exit {:?}: stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("panicked"), "{stderr}");
     let stdout = String::from_utf8_lossy(&output.stdout);

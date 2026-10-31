@@ -6,6 +6,7 @@ use rmqtt::context::ServerContext;
 use rmqtt::types::{CodecPublish, From, Id, Publish, QoS};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::{Semaphore, mpsc};
+use tokio_util::sync::CancellationToken;
 
 use crate::core::device_channel::{DeviceChannel, DeviceChannelError};
 use crate::core::presence::Presence;
@@ -173,6 +174,24 @@ impl DeviceChannel for ServerPublisher {
             .map_err(|_| DeviceChannelError::Unavailable)
     }
 
+    async fn publish_if_online(
+        &self,
+        device_id: &str,
+        topic: &str,
+        payload: &[u8],
+    ) -> Result<(), DeviceChannelError> {
+        if !self
+            .1
+            .is_online(device_id)
+            .map_err(|_| DeviceChannelError::Unavailable)?
+        {
+            return Err(DeviceChannelError::Unavailable);
+        }
+        self.publish_device(device_id, topic, payload)
+            .await
+            .map_err(|_| DeviceChannelError::Unavailable)
+    }
+
     async fn kick(&self, device_id: &str) -> Result<(), DeviceChannelError> {
         self.kick_device(device_id)
             .await
@@ -189,6 +208,7 @@ impl DeviceChannel for ServerPublisher {
 /// Starts the sole ACK publisher; a full queue drops the ACK so device retries remain safe.
 pub(crate) fn spawn_ack_worker(
     publisher: ServerPublisher,
+    cancel: CancellationToken,
 ) -> (AckHandle, tokio::task::JoinHandle<()>) {
     // Immediate rejection ACKs must not wait behind ingest results during a DB outage.
     let (immediate_sender, immediate_receiver) = mpsc::channel::<Ack>(ACK_QUEUE_CAPACITY);
@@ -197,8 +217,8 @@ pub(crate) fn spawn_ack_worker(
     let permits = Arc::new(Semaphore::new(ACK_QUEUE_CAPACITY));
     let task = tokio::spawn(async move {
         tokio::join!(
-            run_ack_worker(immediate_receiver, publisher.clone()),
-            run_ack_worker(ingest_receiver, publisher),
+            run_ack_worker(immediate_receiver, publisher.clone(), cancel.clone()),
+            run_ack_worker(ingest_receiver, publisher, cancel),
         );
     });
     (
@@ -211,33 +231,52 @@ pub(crate) fn spawn_ack_worker(
     )
 }
 
-async fn run_ack_worker(mut receiver: mpsc::Receiver<Ack>, publisher: ServerPublisher) {
-    while let Some(ack) = receiver.recv().await {
-        let (status, code) = match ack.outcome {
-            AckOutcome::Immediate { status, code } => (status, code),
-            AckOutcome::Ingest(result) => match result.await {
-                Ok(Ok(crate::core::telemetry::TelemetryInsertResult::Stored)) => ("stored", None),
-                Ok(Ok(crate::core::telemetry::TelemetryInsertResult::Duplicate)) => {
-                    ("duplicate", None)
-                }
-                Ok(Ok(crate::core::telemetry::TelemetryInsertResult::Conflict)) => {
-                    ("rejected", Some("event_id_conflict"))
-                }
-                Ok(Err(())) | Err(_) => ("retryable", Some("storage_unavailable")),
-            },
-        };
-        let payload = serde_json::json!({
-            "event_id": ack.event_id,
-            "status": status,
-            "received_at": ack.received_at,
-            "code": code,
-        });
-        if let Err(error) = publisher
-            .telemetry_ack(&ack.device_id, payload.to_string().as_bytes())
-            .await
-        {
-            tracing::warn!(%error, device_id = %ack.device_id, "cannot publish telemetry ACK");
+async fn run_ack_worker(
+    mut receiver: mpsc::Receiver<Ack>,
+    publisher: ServerPublisher,
+    cancel: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                receiver.close();
+                break;
+            }
+            ack = receiver.recv() => {
+                let Some(ack) = ack else { break };
+                publish_ack(ack, &publisher).await;
+            }
         }
+    }
+    while let Some(ack) = receiver.recv().await {
+        publish_ack(ack, &publisher).await;
+    }
+}
+
+async fn publish_ack(ack: Ack, publisher: &ServerPublisher) {
+    let (status, code) = match ack.outcome {
+        AckOutcome::Immediate { status, code } => (status, code),
+        AckOutcome::Ingest(result) => match result.await {
+            Ok(Ok(crate::core::telemetry::TelemetryInsertResult::Stored)) => ("stored", None),
+            Ok(Ok(crate::core::telemetry::TelemetryInsertResult::Duplicate)) => ("duplicate", None),
+            Ok(Ok(crate::core::telemetry::TelemetryInsertResult::Conflict)) => {
+                ("rejected", Some("event_id_conflict"))
+            }
+            Ok(Err(())) | Err(_) => ("retryable", Some("storage_unavailable")),
+        },
+    };
+    let payload = serde_json::json!({
+        "event_id": ack.event_id,
+        "status": status,
+        "received_at": ack.received_at,
+        "code": code,
+    });
+    if let Err(error) = publisher
+        .telemetry_ack(&ack.device_id, payload.to_string().as_bytes())
+        .await
+    {
+        tracing::warn!(%error, device_id = %ack.device_id, "cannot publish telemetry ACK");
     }
 }
 

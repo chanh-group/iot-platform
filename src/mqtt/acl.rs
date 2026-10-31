@@ -15,6 +15,7 @@ use super::server_publish::AckHandle;
 use crate::core::acl;
 use crate::core::attributes;
 use crate::core::auth;
+use crate::core::command::CommandAckHandle;
 use crate::core::telemetry::{
     self, IngestHandle, IngestSubmitError, TelemetryError, TelemetryPayload,
 };
@@ -24,6 +25,7 @@ use crate::storage::sqlite::attributes::AttributeHandle;
 #[derive(Clone)]
 pub struct AclHooks {
     ingest: Option<(IngestHandle, AttributeHandle, TelemetryPayload, AckHandle)>,
+    command_ack: Option<CommandAckHandle>,
     max_topic_levels: usize,
     connections: Arc<ConnectionLimiter>,
 }
@@ -34,6 +36,22 @@ impl AclHooks {
     pub(crate) fn new(connections: Arc<ConnectionLimiter>, max_topic_levels: usize) -> Self {
         Self {
             ingest: None,
+            command_ack: None,
+            max_topic_levels,
+            connections,
+        }
+    }
+
+    /// Enables non-blocking command ACK submissions while telemetry is disabled.
+    #[must_use]
+    pub(crate) fn with_command_ack(
+        connections: Arc<ConnectionLimiter>,
+        command_ack: CommandAckHandle,
+        max_topic_levels: usize,
+    ) -> Self {
+        Self {
+            ingest: None,
+            command_ack: Some(command_ack),
             max_topic_levels,
             connections,
         }
@@ -47,10 +65,12 @@ impl AclHooks {
         attributes: AttributeHandle,
         limits: TelemetryPayload,
         ack: AckHandle,
+        command_ack: CommandAckHandle,
         max_topic_levels: usize,
     ) -> Self {
         Self {
             ingest: Some((ingest, attributes, limits, ack)),
+            command_ack: Some(command_ack),
             max_topic_levels,
             connections,
         }
@@ -74,10 +94,13 @@ impl Handler for AclHooks {
                     && acl::can_publish_with_limit(device_id, topic, self.max_topic_levels);
                 let telemetry_topic = format!("devices/{device_id}/telemetry");
                 let attributes_topic = format!("devices/{device_id}/attributes");
+                let command_ack_topic = format!("devices/{device_id}/commands/ack");
                 let retained_telemetry =
                     allowed && topic == telemetry_topic && publish.inner.retain;
                 let retained_attributes =
                     allowed && topic == attributes_topic && publish.inner.retain;
+                let retained_command_ack =
+                    allowed && topic == command_ack_topic && publish.inner.retain;
                 if !allowed {
                     tracing::warn!(%device_id, %topic, "mqtt publish denied by acl");
                 }
@@ -86,6 +109,13 @@ impl Handler for AclHooks {
                         .attribute_rejected_total
                         .inc();
                     tracing::warn!(%device_id, %topic, "retained attributes publish rejected");
+                }
+                if allowed
+                    && topic == command_ack_topic
+                    && !publish.inner.retain
+                    && let Some(command_ack) = &self.command_ack
+                {
+                    command_ack.try_send(device_id, publish.inner.payload.as_ref());
                 }
                 if allowed
                     && topic == telemetry_topic
@@ -194,7 +224,7 @@ impl Handler for AclHooks {
                 } else if retained_telemetry {
                     // Keep the session open so the application-level rejection ACK can be delivered.
                     PublishAclResult::rejected(false, None)
-                } else if retained_attributes {
+                } else if retained_attributes || retained_command_ack {
                     PublishAclResult::rejected(true, None)
                 } else {
                     PublishAclResult::allow()

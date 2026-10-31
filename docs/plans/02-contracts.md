@@ -268,6 +268,8 @@ Device ACK `devices/{id}/commands/ack`, QoS 0/1:
 - Command ID do server sinh (UUID v7); node dedup theo `command_id`.
 - Lệnh không retained; không gửi lại lệnh đã hết hạn.
 - Device offline: command `pending` trong SQL; khi reconnect và còn hạn, dispatcher publish. Không phụ thuộc session queue của broker.
+- Kết nối device đánh thức dispatcher; subscribe thành công chính xác `devices/{id}/commands` cũng đánh thức để resend cùng command ID nếu lần publish trước xảy ra trước subscribe.
+- Wake queue hữu hạn 4 096. Khi đầy, metric tăng và một overflow notification được coalesce; dispatcher đánh thức mọi command `pending`/`dispatched` còn hạn trên device enabled bằng các SQL update tối đa 100 dòng/lượt, rồi drain due batches tối đa 100. Không phụ thuộc polling để cứu wake bị drop.
 - Tối đa `commands.max_pending_per_device` command ở trạng thái `pending`/`dispatched`; vượt → HTTP `409 command_queue_full`.
 
 ### 2.9. Status và data
@@ -849,7 +851,7 @@ Query: `limit` (mặc định 50, max 200), `cursor`, `status` (một giá trị
 - Mặc định tắt (`[http] metrics = false` → 404).
 - Khi bật, **không** dùng session cookie: bắt buộc `http.metrics_bearer_token_env` trỏ tới environment variable có token ngẫu nhiên tối thiểu 32 byte. Yêu cầu `Authorization: Bearer <token>`; thiếu/sai trả 401. Token không bao giờ xuất hiện trong API, log hay `GET /config`.
 - Production đặt endpoint sau reverse proxy/mTLS hoặc network policy chỉ cho Prometheus. Không bật metrics nếu không có một trong các lớp mạng đó.
-- Tên metric tối thiểu: `iot_mqtt_connections_active`, `iot_mqtt_kick_failures_total`, `iot_ingest_accepted_total`, `iot_ingest_rejected_total{reason}`, `iot_retained_cap_rejected_total`, `iot_telemetry_queue_depth`, `iot_telemetry_commit_seconds` (histogram), `iot_telemetry_commit_errors_total`, `iot_commands_pending`, `iot_commands_expired_total`, `iot_ws_clients`, `iot_ws_dropped_total`.
+- Tên metric tối thiểu: `iot_mqtt_connections_active`, `iot_mqtt_kick_failures_total`, `iot_ingest_accepted_total`, `iot_ingest_rejected_total{reason}`, `iot_retained_cap_rejected_total`, `iot_telemetry_queue_depth`, `iot_telemetry_commit_seconds` (histogram), `iot_telemetry_commit_errors_total`, `iot_commands_pending`, `iot_commands_expired_total`, `iot_command_ack_dropped_total`, `iot_command_ack_invalid_total`, `iot_command_ack_storage_errors_total`, `iot_command_publish_errors_total`, `iot_command_storage_errors_total`, `iot_command_dispatch_wake_dropped_total`, `iot_ws_clients`, `iot_ws_dropped_total`.
 - Không dùng device ID làm label.
 
 ### 4.8. WebSocket
@@ -905,11 +907,12 @@ Envelope event:
 
 #### `GET /readyz`
 
-- 200 `{"status":"ready","checks":{"database":"ok","mqtt":"ok","ingest":"ok"}}`.
-- 503 `{"status":"not_ready","checks":{"database":"error","mqtt":"ok","ingest":"degraded"}}`.
+- 200 `{"status":"ready","checks":{"database":"ok","mqtt":"ok","ingest":"ok","commands":"ok"}}`.
+- 503 `{"status":"not_ready","checks":{"database":"error","mqtt":"ok","ingest":"degraded","commands":"error"}}`.
 - `database`: `SELECT 1` timeout 1s.
 - `mqtt`: listener task còn sống.
 - `ingest`: worker task còn sống và không trong trạng thái storage-error kéo dài.
+- `commands`: dispatcher còn sống và các thao tác ghi command gần nhất thành công; lỗi ghi làm readiness 503 cho đến lần ghi dispatcher thành công tiếp theo. Task dừng/panic cũng làm readiness 503 và supervisor shutdown có kiểm soát.
 - Không trả chi tiết lỗi/secret.
 
 #### Static dashboard
