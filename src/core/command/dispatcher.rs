@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::schema::CommandsConfig;
 use crate::core::auth;
 use crate::core::device_channel::DeviceChannel;
+use crate::core::events::EventBus;
 use crate::observability::metrics::Metrics;
 
 use super::{Command, CommandRepository, CommandStatus, PendingCommandAcks, expire_due};
@@ -22,12 +23,26 @@ pub const DISPATCH_BATCH_SIZE: i64 = 100;
 pub struct CommandWakeReceiver {
     receiver: mpsc::Receiver<String>,
     overflow: Arc<Notify>,
+    events: EventBus,
 }
 
 impl CommandWakeReceiver {
     #[must_use]
     pub fn new(receiver: mpsc::Receiver<String>, overflow: Arc<Notify>) -> Self {
-        Self { receiver, overflow }
+        Self::with_events(receiver, overflow, EventBus::new())
+    }
+
+    /// Builds the wake receiver with the shared real-time event bus.
+    pub fn with_events(
+        receiver: mpsc::Receiver<String>,
+        overflow: Arc<Notify>,
+        events: EventBus,
+    ) -> Self {
+        Self {
+            receiver,
+            overflow,
+            events,
+        }
     }
 }
 
@@ -47,6 +62,7 @@ pub struct CommandDispatcher {
     config: CommandsConfig,
     pending_acks: PendingCommandAcks,
     wakes: CommandWakeReceiver,
+    events: EventBus,
 }
 
 impl CommandDispatcher {
@@ -58,12 +74,14 @@ impl CommandDispatcher {
         pending_acks: PendingCommandAcks,
         wakes: CommandWakeReceiver,
     ) -> Self {
+        let events = wakes.events.clone();
         Self {
             repository,
             channel,
             config,
             pending_acks,
             wakes,
+            events,
         }
     }
 
@@ -74,6 +92,7 @@ impl CommandDispatcher {
             now,
             DISPATCH_BATCH_SIZE,
             &self.pending_acks,
+            &self.events,
         )
         .await?
             > 0;
@@ -137,7 +156,8 @@ impl CommandDispatcher {
             self.config.retry_max_ms,
             command.attempts,
         ));
-        self.repository
+        let updated = self
+            .repository
             .record_dispatch_attempt(
                 &command.id,
                 attempted_at,
@@ -146,6 +166,18 @@ impl CommandDispatcher {
                 published,
             )
             .await?;
+        if command.status == CommandStatus::Pending
+            && let Some(updated) = updated
+            && updated.status == CommandStatus::Dispatched
+        {
+            self.events.publish_command(
+                &updated.id,
+                &updated.device_id,
+                updated.status,
+                updated.completed_at,
+                updated.error.as_deref(),
+            );
+        }
         if command.status != CommandStatus::Pending && !published {
             tracing::debug!("command resend will retry with the same command ID");
         }
@@ -221,6 +253,7 @@ impl CommandDispatcher {
                 expiry_now,
                 DISPATCH_BATCH_SIZE,
                 &self.pending_acks,
+                &self.events,
             )
             .await
             {
@@ -266,7 +299,9 @@ impl CommandDispatcher {
     }
 
     fn storage_failed(&self, error: impl std::fmt::Display, readiness: &AtomicBool) {
-        readiness.store(false, Ordering::Release);
+        if readiness.swap(false, Ordering::AcqRel) {
+            self.events.publish_storage_unavailable();
+        }
         Metrics::global().command_storage_errors_total.inc();
         tracing::warn!(%error, "command dispatcher storage operation failed; retrying");
     }

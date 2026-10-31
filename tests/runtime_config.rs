@@ -578,11 +578,11 @@ async fn config_audit_failure_does_not_roll_back_the_published_snapshot() {
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert_eq!(app.config.runtime_config.load().revision, 1);
     assert_eq!(revisions.try_recv().unwrap(), 1);
-    assert!(
+    assert_eq!(
         iot_server::observability::metrics::Metrics::global()
             .audit_write_errors_total
-            .get()
-            > audit_errors_before
+            .get(),
+        audit_errors_before + 1
     );
     assert!(
         std::fs::read_to_string(&app.config.runtime_settings_path)
@@ -590,6 +590,50 @@ async fn config_audit_failure_does_not_roll_back_the_published_snapshot() {
             .contains("level = \"debug\"")
     );
     sqlx::query("DROP TRIGGER fail_runtime_config_audit")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "CREATE TABLE audit_commit_guard (
+             user_id TEXT REFERENCES users(id) DEFERRABLE INITIALLY DEFERRED
+         )",
+    )
+    .execute(&app.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_runtime_config_audit_commit AFTER INSERT ON audit_events
+         WHEN NEW.action = 'config.update'
+         BEGIN INSERT INTO audit_commit_guard(user_id) VALUES ('missing-user'); END",
+    )
+    .execute(&app.pool)
+    .await
+    .unwrap();
+    let commit_errors_before = iot_server::observability::metrics::Metrics::global()
+        .audit_write_errors_total
+        .get();
+    let response = patch(&client, &app, 1, json!({"telemetry":{"retention_days":7}})).await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(app.config.runtime_config.load().revision, 2);
+    assert_eq!(revisions.try_recv().unwrap(), 2);
+    assert_eq!(
+        iot_server::observability::metrics::Metrics::global()
+            .audit_write_errors_total
+            .get(),
+        commit_errors_before + 1
+    );
+    let committed_audits: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE action = 'config.update'")
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(committed_audits, 0);
+    sqlx::query("DROP TRIGGER fail_runtime_config_audit_commit")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE audit_commit_guard")
         .execute(&app.pool)
         .await
         .unwrap();

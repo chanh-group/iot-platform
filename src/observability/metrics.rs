@@ -1,7 +1,62 @@
 //! Process-wide metrics registry and Prometheus exposition (`02` §4.7).
 
-use std::sync::OnceLock;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+const REJECTION_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+const REJECTION_BUCKET: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Default)]
+struct RollingCounter(Mutex<VecDeque<(Instant, u64)>>);
+
+impl RollingCounter {
+    fn add(&self) {
+        let Ok(mut buckets) = self.0.lock() else {
+            return;
+        };
+        Self::add_at(&mut buckets, Instant::now());
+    }
+
+    fn add_at(buckets: &mut VecDeque<(Instant, u64)>, now: Instant) {
+        Self::prune(buckets, now);
+        if let Some((started, count)) = buckets.back_mut()
+            && now.saturating_duration_since(*started) < REJECTION_BUCKET
+        {
+            *count = count.saturating_add(1);
+        } else {
+            buckets.push_back((now, 1));
+        }
+    }
+
+    fn prune(buckets: &mut VecDeque<(Instant, u64)>, now: Instant) {
+        let cutoff = now
+            .checked_sub(REJECTION_WINDOW)
+            .unwrap_or_else(|| buckets.front().map_or(now, |(started, _)| *started));
+        while buckets.front().is_some_and(|(started, _)| {
+            started
+                .checked_add(REJECTION_BUCKET)
+                .is_some_and(|end| end <= cutoff)
+        }) {
+            buckets.pop_front();
+        }
+    }
+
+    fn count(&self) -> u64 {
+        let Ok(mut buckets) = self.0.lock() else {
+            return 0;
+        };
+        Self::count_at(&mut buckets, Instant::now())
+    }
+
+    fn count_at(buckets: &mut VecDeque<(Instant, u64)>, now: Instant) -> u64 {
+        Self::prune(buckets, now);
+        buckets
+            .iter()
+            .fold(0_u64, |total, (_, count)| total.saturating_add(*count))
+    }
+}
 
 /// Monotonic counter.
 #[derive(Debug, Default)]
@@ -108,6 +163,7 @@ pub struct Metrics {
     pub ingest_accepted_total: Counter,
     pub ingest_rejected_total: Counter,
     pub ingest_rejected_reasons: [Counter; 6],
+    ingest_rejected_rolling: RollingCounter,
     pub telemetry_ack_dropped_total: Counter,
     pub telemetry_queue_depth: Gauge,
     pub telemetry_commit_count: Counter,
@@ -146,6 +202,13 @@ impl Metrics {
     pub fn reject_ingest(&self, reason: IngestRejectReason) {
         self.ingest_rejected_total.inc();
         self.ingest_rejected_reasons[reason.index()].inc();
+        self.ingest_rejected_rolling.add();
+    }
+
+    /// Returns the rolling process-local rejection count with one-second resolution.
+    #[must_use]
+    pub fn ingest_rejected_24h(&self) -> u64 {
+        self.ingest_rejected_rolling.count()
     }
 
     pub fn observe_telemetry_commit(&self, micros: u64) {
@@ -323,5 +386,24 @@ mod tests {
         assert!(exposition.contains("iot_telemetry_commit_seconds_bucket{le=\"0.025\"} 1"));
         assert!(exposition.contains("iot_telemetry_commit_seconds_count 1"));
         assert!(!exposition.contains("device_id"));
+    }
+
+    #[test]
+    fn rolling_rejection_count_expires_outside_24_hours() {
+        let mut buckets = VecDeque::new();
+        let start = Instant::now();
+        RollingCounter::add_at(&mut buckets, start);
+        RollingCounter::add_at(&mut buckets, start + Duration::from_millis(500));
+        assert_eq!(
+            RollingCounter::count_at(&mut buckets, start + Duration::from_secs(2)),
+            2
+        );
+
+        let before_expiry = start + REJECTION_WINDOW + Duration::from_millis(500);
+        assert_eq!(RollingCounter::count_at(&mut buckets, before_expiry), 2);
+
+        let after_expiry = start + REJECTION_WINDOW + Duration::from_secs(2);
+        assert_eq!(RollingCounter::count_at(&mut buckets, after_expiry), 0);
+        assert!(before_expiry < after_expiry);
     }
 }

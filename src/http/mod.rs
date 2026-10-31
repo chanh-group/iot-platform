@@ -9,6 +9,7 @@ pub mod devices;
 pub mod events;
 pub mod metrics;
 pub mod middleware;
+pub mod overview;
 pub mod router;
 pub mod telemetry;
 

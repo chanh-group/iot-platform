@@ -2,6 +2,8 @@
 
 use sqlx::SqliteConnection;
 
+use crate::observability::metrics::Metrics;
+
 /// One row destined for `audit_events`.
 pub struct AuditEvent<'a> {
     pub actor_type: &'a str,
@@ -36,6 +38,7 @@ pub async fn insert(
     .bind(event.remote_ip)
     .bind(event.details_json)
     .execute(&mut *conn)
-    .await?;
-    Ok(())
+    .await
+    .map(|_| ())
+    .inspect_err(|_| Metrics::global().audit_write_errors_total.inc())
 }

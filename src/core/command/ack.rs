@@ -10,6 +10,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::core::auth;
+use crate::core::events::EventBus;
 use crate::observability::metrics::Metrics;
 
 use super::{CommandRepository, CommandRepositoryError};
@@ -216,6 +217,7 @@ impl CommandAckHandle {
 /// Starts the sole command ACK persistence worker.
 pub fn spawn_ack_worker(
     repository: Arc<dyn CommandRepository>,
+    events: EventBus,
     cancel: CancellationToken,
 ) -> (CommandAckHandle, JoinHandle<()>) {
     let (sender, mut receiver) = mpsc::channel::<QueuedAck>(ACK_QUEUE_CAPACITY);
@@ -230,18 +232,18 @@ pub fn spawn_ack_worker(
                 }
                 queued = receiver.recv() => {
                     let Some(queued) = queued else { break };
-                    process_ack(repository.as_ref(), queued).await;
+                    process_ack(repository.as_ref(), &events, queued).await;
                 }
             }
         }
         while let Some(queued) = receiver.recv().await {
-            process_ack(repository.as_ref(), queued).await;
+            process_ack(repository.as_ref(), &events, queued).await;
         }
     });
     (CommandAckHandle { sender, pending }, task)
 }
 
-async fn process_ack(repository: &dyn CommandRepository, queued: QueuedAck) {
+async fn process_ack(repository: &dyn CommandRepository, events: &EventBus, queued: QueuedAck) {
     match repository
         .apply_ack(&queued.device_id, &queued.ack, queued.received_at)
         .await
@@ -252,13 +254,13 @@ async fn process_ack(repository: &dyn CommandRepository, queued: QueuedAck) {
         Ok(super::AckApplyOutcome::UnknownCommand) => {
             tracing::warn!("unknown command ACK ignored");
         }
-        Ok(
-            super::AckApplyOutcome::Applied
-            | super::AckApplyOutcome::Duplicate
-            | super::AckApplyOutcome::LateRecorded,
-        ) => {}
+        Ok(super::AckApplyOutcome::Applied) => {
+            publish_command_event(repository, events, &queued.ack.command_id).await;
+        }
+        Ok(super::AckApplyOutcome::Duplicate | super::AckApplyOutcome::LateRecorded) => {}
         Ok(super::AckApplyOutcome::ExpiredAndLateRecorded) => {
             Metrics::global().commands_expired_total.inc();
+            publish_command_event(repository, events, &queued.ack.command_id).await;
         }
         Err(CommandRepositoryError::StorageUnavailable) => {
             Metrics::global().command_ack_storage_errors_total.inc();
@@ -268,6 +270,24 @@ async fn process_ack(repository: &dyn CommandRepository, queued: QueuedAck) {
             Metrics::global().command_ack_storage_errors_total.inc();
             tracing::warn!("command ACK persistence failed");
         }
+    }
+}
+
+async fn publish_command_event(
+    repository: &dyn CommandRepository,
+    events: &EventBus,
+    command_id: &str,
+) {
+    match repository.get(command_id).await {
+        Ok(Some(command)) => events.publish_command(
+            &command.id,
+            &command.device_id,
+            command.status,
+            command.completed_at,
+            command.error.as_deref(),
+        ),
+        Ok(None) => tracing::warn!("command missing after ACK state transition"),
+        Err(error) => tracing::warn!(%error, "cannot read command after persisted ACK"),
     }
 }
 
@@ -327,6 +347,21 @@ mod tests {
         }
         assert_eq!(
             Metrics::global().command_ack_dropped_total.get(),
+            before + 1
+        );
+    }
+
+    #[test]
+    fn invalid_ack_increments_its_metric() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let handle = CommandAckHandle {
+            sender,
+            pending: PendingCommandAcks::default(),
+        };
+        let before = Metrics::global().command_ack_invalid_total.get();
+        handle.try_send("device", b"{}");
+        assert_eq!(
+            Metrics::global().command_ack_invalid_total.get(),
             before + 1
         );
     }

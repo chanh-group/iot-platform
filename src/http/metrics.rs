@@ -5,6 +5,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use subtle::ConstantTimeEq;
 
+use crate::core::domain_error::DomainError;
 use crate::observability::metrics::Metrics;
 use crate::observability::request_id::RequestId;
 
@@ -39,6 +40,22 @@ pub async fn export(
             request_id,
         ));
     }
+
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM commands WHERE status IN ('pending', 'dispatched')",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::warn!(%error, "command metrics storage unavailable");
+        ApiError::from_domain(
+            DomainError::Unavailable("storage unavailable".to_owned()),
+            request_id.clone(),
+        )
+    })?;
+    Metrics::global()
+        .commands_pending
+        .set(u64::try_from(pending).unwrap_or(0));
 
     let mut response = Metrics::global().render_prometheus().into_response();
     response.headers_mut().insert(

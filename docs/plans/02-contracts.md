@@ -848,6 +848,8 @@ Query: `limit` (mặc định 50, max 200), `cursor`, `status` (một giá trị
 
 - Dùng cho dashboard; số liệu có thể lệch nhẹ so với DB do cache/broadcast.
 - `storage_ok` false nếu lần ghi gần nhất lỗi hoặc readiness DB false.
+- Mỗi response dùng một `now` duy nhất; các trường `*_24h` dùng khoảng `[now - 86_400_000, now)` theo Unix milliseconds. `telemetry.events_24h` lọc `received_at`; `commands.failed_24h`/`expired_24h` lọc `completed_at` cùng status. `last_received_at` là `MAX(received_at)` không giới hạn thời gian.
+- `ingest.rejected_24h` đếm rejection telemetry trong cửa sổ trượt process-local, dùng bucket một giây (sai số biên tối đa một giây); không thay bằng lifetime counter và không khôi phục rejection trước lần restart gần nhất.
 
 #### `GET /metrics`
 
@@ -855,6 +857,8 @@ Query: `limit` (mặc định 50, max 200), `cursor`, `status` (một giá trị
 - Khi bật, **không** dùng session cookie: bắt buộc `http.metrics_bearer_token_env` trỏ tới environment variable có token ngẫu nhiên tối thiểu 32 byte. Yêu cầu `Authorization: Bearer <token>`; thiếu/sai trả 401. Token không bao giờ xuất hiện trong API, log hay `GET /config`.
 - Production đặt endpoint sau reverse proxy/mTLS hoặc network policy chỉ cho Prometheus. Không bật metrics nếu không có một trong các lớp mạng đó.
 - Tên metric tối thiểu: `iot_mqtt_connections_active`, `iot_mqtt_kick_failures_total`, `iot_ingest_accepted_total`, `iot_ingest_rejected_total{reason}`, `iot_retained_cap_rejected_total`, `iot_telemetry_queue_depth`, `iot_telemetry_commit_seconds` (histogram), `iot_telemetry_commit_errors_total`, `iot_telemetry_retention_errors_total`, `iot_audit_write_errors_total`, `iot_commands_pending`, `iot_commands_expired_total`, `iot_command_ack_dropped_total`, `iot_command_ack_invalid_total`, `iot_command_ack_storage_errors_total`, `iot_command_publish_errors_total`, `iot_command_storage_errors_total`, `iot_command_dispatch_wake_dropped_total`, `iot_ws_clients`, `iot_ws_dropped_total`.
+- `iot_commands_pending` là gauge số command hiện ở trạng thái `pending` hoặc `dispatched`; `iot_commands_expired_total` là counter process-local cho transition sang `expired`.
+- `iot_audit_write_errors_total` tăng khi insert audit lỗi; audit config runtime cũng đếm lỗi begin/commit transaction, không đếm trùng lỗi insert.
 - Không dùng device ID làm label.
 
 ### 4.8. WebSocket
@@ -892,13 +896,17 @@ Envelope event:
 | Type | Channel | Data |
 | --- | --- | --- |
 | `telemetry` | `device:{id}` | `{event_id, ts, received_at, values}` của event đã commit |
-| `command` | `device:{id}`, `overview` | `{command_id, device_id, status, completed_at, error}` |
+| `command` | `device:{id}`, `overview` | `{command_id, device_id, status, state_version, completed_at, error}` |
 | `presence` | `overview`, `device:{id}` | `{online: true/false, last_seen_at}` |
 | `reported_status` | `device:{id}` | `{status: "online"/"offline", ts}` từ topic status/LWT |
 | `config` | `overview` | `{revision}` |
 | `system` | `overview` | `{kind: "storage_unavailable"/"queue_full", severity: "warning"/"error", message}` |
 
 - Telemetry chỉ broadcast sau commit.
+- Một event được gửi tối đa một lần cho mỗi connection, kể cả khi connection đồng thời subscribe `overview` và `device:{id}`.
+- `command.state_version` tăng theo state: `pending=1`, `dispatched=2`, terminal (`succeeded|failed|expired`)=3. Event chỉ là invalidation; client refetch `GET /api/v1/commands/{command_id}` trước khi cập nhật view và bỏ event có version thấp hơn state đã áp dụng. Không bảo đảm thứ tự phát giữa các task.
+- `presence` event được phát đồng bộ với transition registry theo cùng thứ tự; cập nhật `last_seen_at` ở SQL là advisory và không được trì hoãn event.
+- `system.kind="queue_full"` được coalesce một lần trong mỗi episode queue-full; latch chỉ rearm sau khi consumer xác nhận queue rỗng trong vùng đồng bộ với producer. Metric rejection vẫn tăng cho từng event bị từ chối.
 - `system.message` là thông báo chung, không chứa SQL/đường dẫn/secret.
 - Session hết hạn hoặc logout: server đóng WS thuộc session với code 4401; client reconnect sẽ nhận 401.
 

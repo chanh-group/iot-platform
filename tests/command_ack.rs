@@ -2,15 +2,19 @@ mod common;
 
 use std::time::Duration;
 
-use common::{TestApp, mqtt_connect, mqtt_next, mqtt_subscribe, mqtt_wait_publish};
+use common::{
+    TestApp, mqtt_connect, mqtt_next, mqtt_subscribe, mqtt_wait_publish, ws_session_cookie,
+};
 use iot_server::config::schema::CommandsConfig;
 use iot_server::core::auth;
 use iot_server::core::command::{
     AckApplyOutcome, Command, CommandAck, CommandAckStatus, CommandCursor, CommandDispatcher,
-    CommandRepository, CommandRepositoryError, CommandStatus, CommandWakeReceiver, CreateOutcome,
-    NewCommand, spawn_ack_worker,
+    CommandRepository, CommandRepositoryError, CommandState, CommandStatus, CommandWakeReceiver,
+    CreateOutcome, NewCommand, PendingCommandAcks, spawn_ack_worker,
 };
 use iot_server::core::device_channel::{DeviceChannel, DeviceChannelError};
+use iot_server::core::events::{EventBus, RealtimeEvent};
+use iot_server::observability::metrics::Metrics;
 use iot_server::storage::sqlite::commands::SqliteCommandRepository;
 use rumqttc::{Event as MqttEvent, Packet, QoS, SubscribeReasonCode};
 use serde_json::{Value, json};
@@ -96,9 +100,12 @@ struct BlockingAckRepository {
     started: Notify,
     release: Notify,
     completed: Notify,
+    dispatch_gate: Option<(std::sync::Arc<Notify>, std::sync::Arc<Notify>)>,
 }
 
 struct OfflineCommandChannel;
+
+struct OnlineCommandChannel;
 
 fn closed_wakes() -> CommandWakeReceiver {
     let (sender, receiver) = mpsc::channel(1);
@@ -123,6 +130,26 @@ impl DeviceChannel for OfflineCommandChannel {
 
     async fn is_online(&self, _device_id: &str) -> Result<bool, DeviceChannelError> {
         Ok(false)
+    }
+}
+
+#[async_trait::async_trait]
+impl DeviceChannel for OnlineCommandChannel {
+    async fn publish(
+        &self,
+        _device_id: &str,
+        _topic: &str,
+        _payload: &[u8],
+    ) -> Result<(), DeviceChannelError> {
+        Ok(())
+    }
+
+    async fn kick(&self, _device_id: &str) -> Result<(), DeviceChannelError> {
+        Ok(())
+    }
+
+    async fn is_online(&self, _device_id: &str) -> Result<bool, DeviceChannelError> {
+        Ok(true)
     }
 }
 
@@ -196,8 +223,9 @@ impl CommandRepository for BlockingAckRepository {
         finished_at: i64,
         next_attempt_at: i64,
         published: bool,
-    ) -> Result<(), CommandRepositoryError> {
-        self.inner
+    ) -> Result<Option<CommandState>, CommandRepositoryError> {
+        let state = self
+            .inner
             .record_dispatch_attempt(
                 command_id,
                 attempted_at,
@@ -205,7 +233,12 @@ impl CommandRepository for BlockingAckRepository {
                 next_attempt_at,
                 published,
             )
-            .await
+            .await?;
+        if let Some((started, release)) = &self.dispatch_gate {
+            started.notify_one();
+            release.notified().await;
+        }
+        Ok(state)
     }
 
     async fn expire_due(
@@ -213,7 +246,7 @@ impl CommandRepository for BlockingAckRepository {
         now: i64,
         limit: i64,
         pending_ack_ids: &[String],
-    ) -> Result<u64, CommandRepositoryError> {
+    ) -> Result<Vec<CommandState>, CommandRepositoryError> {
         self.inner.expire_due(now, limit, pending_ack_ids).await
     }
 
@@ -473,9 +506,10 @@ async fn on_time_queued_ack_defers_expiry_while_worker_is_blocked() {
         started: Notify::new(),
         release: Notify::new(),
         completed: Notify::new(),
+        dispatch_gate: None,
     });
     let cancel = CancellationToken::new();
-    let (handle, worker) = spawn_ack_worker(gated.clone(), cancel.clone());
+    let (handle, worker) = spawn_ack_worker(gated.clone(), EventBus::new(), cancel.clone());
     let payload = json!({
         "command_id": command_id,
         "status": "succeeded",
@@ -522,6 +556,118 @@ async fn on_time_queued_ack_defers_expiry_while_worker_is_blocked() {
 
     cancel.cancel();
     worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn delayed_dispatch_event_after_ack_has_stale_version_and_rest_stays_terminal() {
+    let app = TestApp::builder()
+        .command_dispatch_timing(10_000, 10_000)
+        .start()
+        .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (client, _) = ws_session_cookie(&app).await;
+    let device = app.create_device("command-event-order", true).await;
+    let mut events = app.events.subscribe_realtime();
+    let created = client
+        .post(format!(
+            "{}/api/v1/devices/{}/commands",
+            app.base, device.id
+        ))
+        .header("X-IoT-CSRF", "1")
+        .json(&json!({"name":"reboot"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), reqwest::StatusCode::ACCEPTED);
+    let command_id = created.json::<Value>().await.unwrap()["command_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let RealtimeEvent::Command(pending) = events.recv().await.unwrap() else {
+        panic!("command create should publish a command event");
+    };
+    assert_eq!(pending.status, CommandStatus::Pending);
+    assert_eq!(pending.state_version, 1);
+
+    let dispatch_started = std::sync::Arc::new(Notify::new());
+    let dispatch_release = std::sync::Arc::new(Notify::new());
+    let repository: std::sync::Arc<dyn CommandRepository> =
+        std::sync::Arc::new(BlockingAckRepository {
+            inner: SqliteCommandRepository::new(app.pool.clone()),
+            started: Notify::new(),
+            release: Notify::new(),
+            completed: Notify::new(),
+            dispatch_gate: Some((
+                std::sync::Arc::clone(&dispatch_started),
+                std::sync::Arc::clone(&dispatch_release),
+            )),
+        });
+    let (wake_sender, wake_receiver) = mpsc::channel(1);
+    drop(wake_sender);
+    let dispatcher = CommandDispatcher::new(
+        repository,
+        std::sync::Arc::new(OnlineCommandChannel),
+        CommandsConfig::default(),
+        PendingCommandAcks::default(),
+        CommandWakeReceiver::with_events(
+            wake_receiver,
+            std::sync::Arc::new(Notify::new()),
+            app.events.clone(),
+        ),
+    );
+    let dispatch_task = tokio::spawn(async move { dispatcher.run_once(auth::now_ms()).await });
+    tokio::time::timeout(Duration::from_secs(2), dispatch_started.notified())
+        .await
+        .expect("dispatcher should commit dispatched before waiting on the gate");
+    let committed_dispatch: String = sqlx::query_scalar("SELECT status FROM commands WHERE id = ?")
+        .bind(&command_id)
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(committed_dispatch, "dispatched");
+
+    let cancel = CancellationToken::new();
+    let (handle, ack_task) = spawn_ack_worker(
+        std::sync::Arc::new(SqliteCommandRepository::new(app.pool.clone())),
+        app.events.clone(),
+        cancel.clone(),
+    );
+    handle.try_send(
+        &device.id,
+        json!({"command_id":command_id,"status":"succeeded"})
+            .to_string()
+            .as_bytes(),
+    );
+    let terminal = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .expect("ACK should publish the terminal command event")
+        .unwrap();
+    let RealtimeEvent::Command(terminal) = terminal else {
+        panic!("ACK should publish a command event");
+    };
+    assert_eq!(terminal.status, CommandStatus::Succeeded);
+    assert_eq!(terminal.state_version, 3);
+
+    dispatch_release.notify_one();
+    dispatch_task.await.unwrap().unwrap();
+    let delayed = events.recv().await.unwrap();
+    let RealtimeEvent::Command(delayed) = delayed else {
+        panic!("delayed dispatcher should publish a command event");
+    };
+    assert_eq!(delayed.status, CommandStatus::Dispatched);
+    assert_eq!(delayed.state_version, 2);
+
+    let current: Value = client
+        .get(format!("{}/api/v1/commands/{command_id}", app.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(current["status"], "succeeded");
+    cancel.cancel();
+    ack_task.await.unwrap();
 }
 
 #[tokio::test]
@@ -592,14 +738,28 @@ async fn ack_storage_failure_does_not_create_a_terminal_state() {
     .execute(&app.pool)
     .await
     .unwrap();
-    let repository = SqliteCommandRepository::new(app.pool.clone());
-    let ack = CommandAck {
-        command_id: command_id.clone(),
-        status: CommandAckStatus::Succeeded,
-        result: None,
-        error: None,
-    };
-    assert!(repository.apply_ack(&device.id, &ack, now).await.is_err());
+    let before = Metrics::global().command_ack_storage_errors_total.get();
+    let cancel = CancellationToken::new();
+    let (handle, worker) = spawn_ack_worker(
+        std::sync::Arc::new(SqliteCommandRepository::new(app.pool.clone())),
+        EventBus::new(),
+        cancel.clone(),
+    );
+    let payload = json!({
+        "command_id": command_id,
+        "status": "succeeded",
+    })
+    .to_string();
+    handle.try_send(&device.id, payload.as_bytes());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while Metrics::global().command_ack_storage_errors_total.get() == before {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("failed ACK persistence should increment its metric");
+    cancel.cancel();
+    worker.await.unwrap();
     let status: String = sqlx::query_scalar("SELECT status FROM commands WHERE id = ?")
         .bind(command_id)
         .fetch_one(&app.pool)

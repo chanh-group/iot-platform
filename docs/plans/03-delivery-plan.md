@@ -132,7 +132,7 @@ Nếu fail: dừng, cập nhật ADR-001 và `02` §9. Không tự viết broker
 | P3-05 | Command REST: create/get/list by device | `src/http/commands.rs` | P3-03 | `tests/command_api.rs` |
 | P3-06 | Runtime config store + PATCH atomic + apply hot fields | `src/config/runtime.rs`, `src/http/config.rs` | P1-04, P1-11 | T-A12/A13 |
 | P3-07 | Audit events + redaction; gắn vào mutation | `src/core/audit.rs`, `src/storage/sqlite/audit.rs` | P3-01..P3-06 | `tests/audit.rs` |
-| P3-08 | Overview endpoint + WS command/presence/config/system | `src/http/overview.rs`, `src/http/ws.rs` | P3-04, P3-06 | `tests/ws_events.rs` |
+| P3-08 | Overview endpoint + WS command/presence/config/system/reported_status + metrics | `src/http/overview.rs`, `src/core/events.rs`, `src/http/events.rs`, `src/observability/metrics.rs` | P3-04, P3-06 | `tests/overview.rs`, `tests/ws_events.rs`, `tests/metrics.rs` |
 | P3-09 | Frontend shell: login, overview, devices, device detail, chart, commands, config | `web/src/*`, `web/package.json`, `web/vite.config.ts` | P3-01..P3-08 | `npm run check`, `npm run build` |
 | P3-10 | uPlot telemetry chart: range picker, key selector, latest; REST refetch | `web/src/lib/TelemetryChart.svelte` | P3-09, P2-10 | manual checklist |
 | P3-11 | WS client: subscribe device/overview, reconnect + REST backfill | `web/src/lib/ws.ts` | P3-08 | manual + unit |
@@ -207,7 +207,7 @@ Quy tắc A18: cùng bộ integration test, migration, backup/restore, crash rec
 | Docker | build, run, recreate volume, health | release |
 | Load | baseline, không gate | release + khi đổi hot path |
 
-### 9.2. Mapping
+### 9.2. Acceptance and task evidence mapping
 
 | ID | Phase | Test/evidence | Ghi chú |
 | --- | --- | --- | --- |
@@ -225,11 +225,12 @@ Quy tắc A18: cùng bộ integration test, migration, backup/restore, crash rec
 | A12 | 3 | `tests/runtime_config.rs` | Revision + restart |
 | A13 | 3 | `tests/runtime_config.rs` | Sai/revision/file |
 | A14 | 3 | `tests/credential_rotate.rs` | Kick + token cũ |
-| A15 | 3 + 4 | `tests/ws_slow.rs` | Queue + REST backfill |
+| A15 | 3 + 4 | `tests/ws_telemetry.rs` | Slow consumer, reconnect/backfill, session/logout; release gate remains Phase 4 |
 | A16 | 4 | `tests/shutdown.rs` | SIGTERM drain |
 | A17 | 4 | `tests/docker_smoke.sh` | Recreate volume |
 | A18 | 5 | `tests/backends/*` | Chỉ backend công bố |
 | A19 | 2 | `tests/mqtt_protocol.rs` | Matrix MVP |
+| P3-08 | 3 | `tests/overview.rs`, `tests/ws_events.rs`, `tests/command_ack.rs`, `tests/metrics.rs`; WS regressions in `tests/ws_telemetry.rs` | 24-hour windows, storage health, channel routing/dedup, delayed command event version/refetch, ordered presence, LWT, queue coalescing, metric auth and transitions |
 
 ### 9.3. Test harness
 

@@ -1,6 +1,8 @@
 mod common;
 
 use common::TestApp;
+use iot_server::core::auth;
+use iot_server::observability::metrics::Metrics;
 
 const TOKEN: &str = "test-metrics-bearer-token-long-enough-0123456789";
 
@@ -57,6 +59,23 @@ async fn metrics_requires_its_bearer_token_and_exports_core_series() {
         .unwrap();
     assert_eq!(cookie_only.status(), reqwest::StatusCode::UNAUTHORIZED);
 
+    let device = app.create_device("metrics-command", true).await;
+    let command = session_client
+        .post(format!(
+            "{}/api/v1/devices/{}/commands",
+            app.base, device.id
+        ))
+        .header("X-IoT-CSRF", "1")
+        .json(&serde_json::json!({"name":"reboot"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(command.status(), reqwest::StatusCode::ACCEPTED);
+    let command_id = command.json::<serde_json::Value>().await.unwrap()["command_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
     let response = client
         .get(format!("{}/metrics", app.base))
         .bearer_auth(TOKEN)
@@ -74,6 +93,7 @@ async fn metrics_requires_its_bearer_token_and_exports_core_series() {
             .starts_with("text/plain; version=0.0.4")
     );
     let exposition = response.text().await.unwrap();
+    assert!(exposition.contains("iot_commands_pending 1\n"));
     for metric in [
         "iot_mqtt_connections_active",
         "iot_ingest_accepted_total",
@@ -99,4 +119,44 @@ async fn metrics_requires_its_bearer_token_and_exports_core_series() {
     }
     assert!(!exposition.contains(TOKEN));
     assert!(!exposition.contains("device_id"));
+
+    let expired_before = Metrics::global().commands_expired_total.get();
+    let expires_at = auth::now_ms() - 1;
+    sqlx::query(
+        "UPDATE commands SET created_at = ?, expires_at = ?, next_attempt_at = ? WHERE id = ?",
+    )
+    .bind(expires_at - 1)
+    .bind(expires_at)
+    .bind(expires_at - 1)
+    .bind(&command_id)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let status: String = sqlx::query_scalar("SELECT status FROM commands WHERE id = ?")
+                .bind(&command_id)
+                .fetch_one(&app.pool)
+                .await
+                .unwrap();
+            if status == "expired" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("dispatcher should expire the command");
+    assert!(Metrics::global().commands_expired_total.get() > expired_before);
+
+    let after_expiry = client
+        .get(format!("{}/metrics", app.base))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(after_expiry.contains("iot_commands_pending 0\n"));
 }

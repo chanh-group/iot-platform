@@ -17,6 +17,7 @@ use crate::core::command::{
     self, CommandAudit, CommandCursor, CommandRepositoryError, CommandStatus, NewCommand,
 };
 use crate::core::domain_error::DomainError;
+use crate::observability::metrics::Metrics;
 use crate::observability::request_id::RequestId;
 
 use super::AppState;
@@ -71,6 +72,15 @@ pub async fn create(
         .map_err(|error| repository_error(error, &request_id))?;
 
     let command = outcome.command;
+    if !outcome.replayed {
+        state.events.publish_command(
+            &command.id,
+            &command.device_id,
+            command.status,
+            command.completed_at,
+            command.error.as_deref(),
+        );
+    }
     let mut response = (
         StatusCode::ACCEPTED,
         Json(json!({
@@ -245,10 +255,13 @@ fn repository_error(error: CommandRepositoryError, request_id: &str) -> ApiError
             "idempotency key was used with a different request".to_owned(),
             request_id.to_owned(),
         ),
-        CommandRepositoryError::StorageUnavailable => ApiError::from_domain(
-            DomainError::Unavailable("storage unavailable".to_owned()),
-            request_id.to_owned(),
-        ),
+        CommandRepositoryError::StorageUnavailable => {
+            Metrics::global().command_storage_errors_total.inc();
+            ApiError::from_domain(
+                DomainError::Unavailable("storage unavailable".to_owned()),
+                request_id.to_owned(),
+            )
+        }
     }
 }
 

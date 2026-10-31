@@ -39,6 +39,16 @@ pub struct Command {
     pub attempts: i64,
 }
 
+/// Minimal persisted command state used for post-write events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandState {
+    pub id: String,
+    pub device_id: String,
+    pub status: CommandStatus,
+    pub completed_at: Option<i64>,
+    pub error: Option<String>,
+}
+
 /// Validated create request plus request/audit context for an atomic insert.
 pub struct NewCommand<'a> {
     pub device_id: &'a str,
@@ -146,14 +156,14 @@ pub trait CommandRepository: Send + Sync {
         finished_at: i64,
         next_attempt_at: i64,
         published: bool,
-    ) -> Result<(), CommandRepositoryError>;
+    ) -> Result<Option<CommandState>, CommandRepositoryError>;
 
     async fn expire_due(
         &self,
         now: i64,
         limit: i64,
         pending_ack_ids: &[String],
-    ) -> Result<u64, CommandRepositoryError>;
+    ) -> Result<Vec<CommandState>, CommandRepositoryError>;
 
     async fn apply_ack(
         &self,

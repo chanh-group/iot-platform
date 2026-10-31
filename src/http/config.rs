@@ -136,15 +136,21 @@ async fn audit_config_update(
         remote_ip: Some(&remote_ip),
         details_json: Some(&details),
     };
-    let result = async {
-        let mut transaction = state.pool.begin().await?;
-        audit::insert(&mut transaction, crate::core::auth::now_ms(), &event).await?;
-        transaction.commit().await
+    let mut transaction = match state.pool.begin().await {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            Metrics::global().audit_write_errors_total.inc();
+            tracing::error!(%error, "config update audit transaction could not start");
+            return;
+        }
+    };
+    if let Err(error) = audit::insert(&mut transaction, crate::core::auth::now_ms(), &event).await {
+        tracing::error!(%error, "config update audit insert failed after runtime snapshot publication");
+        return;
     }
-    .await;
-    if let Err(error) = result {
+    if let Err(error) = transaction.commit().await {
         Metrics::global().audit_write_errors_total.inc();
-        tracing::error!(%error, "config update audit write failed after runtime snapshot publication");
+        tracing::error!(%error, "config update audit transaction commit failed");
     }
 }
 

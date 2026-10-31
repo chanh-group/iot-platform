@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::core::auth;
 use crate::core::command::{
     self, AckApplyOutcome, Command, CommandAck, CommandCursor, CommandRepository,
-    CommandRepositoryError, CommandStatus, CreateOutcome, NewCommand,
+    CommandRepositoryError, CommandState, CommandStatus, CreateOutcome, NewCommand,
 };
 use crate::storage::sqlite::audit::{self, AuditEvent};
 
@@ -60,6 +60,31 @@ impl CommandRow {
             result,
             error: self.error,
             attempts: self.attempts,
+        })
+    }
+}
+
+#[derive(FromRow)]
+struct CommandStateRow {
+    id: String,
+    device_id: String,
+    status: String,
+    completed_at: Option<i64>,
+    error: Option<String>,
+}
+
+impl CommandStateRow {
+    fn into_state(self) -> Result<CommandState, CommandRepositoryError> {
+        let status = CommandStatus::parse(&self.status).ok_or_else(|| {
+            tracing::error!(status = %self.status, "invalid command status in SQLite");
+            CommandRepositoryError::StorageUnavailable
+        })?;
+        Ok(CommandState {
+            id: self.id,
+            device_id: self.device_id,
+            status,
+            completed_at: self.completed_at,
+            error: self.error,
         })
     }
 }
@@ -451,8 +476,8 @@ impl CommandRepository for SqliteCommandRepository {
         finished_at: i64,
         next_attempt_at: i64,
         published: bool,
-    ) -> Result<(), CommandRepositoryError> {
-        sqlx::query(
+    ) -> Result<Option<CommandState>, CommandRepositoryError> {
+        sqlx::query_as::<_, CommandStateRow>(
             "UPDATE commands
              SET status = CASE
                      WHEN expires_at > ? AND ? THEN 'dispatched'
@@ -466,6 +491,7 @@ impl CommandRepository for SqliteCommandRepository {
                  last_attempt_at = ?,
                  next_attempt_at = ?
              WHERE id = ? AND status IN ('pending', 'dispatched')
+             RETURNING id, device_id, status, completed_at, error
             ",
         )
         .bind(finished_at)
@@ -476,10 +502,11 @@ impl CommandRepository for SqliteCommandRepository {
         .bind(attempted_at)
         .bind(next_attempt_at)
         .bind(command_id)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await
-        .map_err(storage_error)?;
-        Ok(())
+        .map_err(storage_error)?
+        .map(CommandStateRow::into_state)
+        .transpose()
     }
 
     async fn expire_due(
@@ -487,7 +514,7 @@ impl CommandRepository for SqliteCommandRepository {
         now: i64,
         limit: i64,
         pending_ack_ids: &[String],
-    ) -> Result<u64, CommandRepositoryError> {
+    ) -> Result<Vec<CommandState>, CommandRepositoryError> {
         let limit = limit.clamp(1, 100);
         let scan_limit =
             limit.saturating_add(i64::try_from(pending_ack_ids.len()).unwrap_or(i64::MAX));
@@ -508,7 +535,7 @@ impl CommandRepository for SqliteCommandRepository {
             .take(usize::try_from(limit).unwrap_or(100))
             .collect();
         if ids.is_empty() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
         let mut query = QueryBuilder::<Sqlite>::new(
             "UPDATE commands SET status = 'expired', completed_at = expires_at WHERE id IN (",
@@ -518,13 +545,18 @@ impl CommandRepository for SqliteCommandRepository {
             ids_list.push_bind(id);
         }
         ids_list.push_unseparated(") AND status IN ('pending', 'dispatched') AND expires_at <= ");
-        query.push_bind(now).push(" RETURNING id");
+        query
+            .push_bind(now)
+            .push(" RETURNING id, device_id, status, completed_at, error");
         let expired = query
-            .build_query_scalar::<String>()
+            .build_query_as::<CommandStateRow>()
             .fetch_all(&self.pool)
             .await
             .map_err(storage_error)?;
-        Ok(u64::try_from(expired.len()).unwrap_or(u64::MAX))
+        expired
+            .into_iter()
+            .map(CommandStateRow::into_state)
+            .collect()
     }
 
     async fn apply_ack(

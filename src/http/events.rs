@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::core::domain_error::DomainError;
-use crate::core::events::TelemetryCommitted;
+use crate::core::events::RealtimeEvent;
 use crate::observability::metrics::Metrics;
 use crate::observability::request_id::RequestId;
 
@@ -169,15 +169,14 @@ async fn run(
     let cancel_slow_consumer = slow_consumer.clone();
     let cancel_producer = CancellationToken::new();
     let producer_cancel = cancel_producer.clone();
-    let mut events = state.events.subscribe();
+    let mut events = state.events.subscribe_realtime();
     let producer = tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = producer_cancel.cancelled() => break,
                 received = events.recv() => match received {
                     Ok(event) => {
-                        let channel = format!("device:{}", event.device_id);
-                        if subscriptions_rx.borrow().contains(&channel)
+                        if is_subscribed(&event, &subscriptions_rx.borrow())
                             && !send_event(&outbound_tx, event)
                         {
                             Metrics::global().ws_dropped_total.inc();
@@ -341,16 +340,83 @@ async fn run(
     producer.abort();
 }
 
-fn send_event(sender: &mpsc::Sender<Value>, event: TelemetryCommitted) -> bool {
-    sender
-        .try_send(json!({
+fn is_subscribed(event: &RealtimeEvent, channels: &BTreeSet<String>) -> bool {
+    let overview = channels.contains("overview");
+    match event {
+        RealtimeEvent::Telemetry(event) => {
+            channels.contains(&format!("device:{}", event.device_id))
+        }
+        RealtimeEvent::Command(event) => {
+            overview || channels.contains(&format!("device:{}", event.device_id))
+        }
+        RealtimeEvent::Presence(event) => {
+            overview || channels.contains(&format!("device:{}", event.device_id))
+        }
+        RealtimeEvent::ReportedStatus(event) => {
+            channels.contains(&format!("device:{}", event.device_id))
+        }
+        RealtimeEvent::Config(_) | RealtimeEvent::System(_) => overview,
+    }
+}
+
+fn send_event(sender: &mpsc::Sender<Value>, event: RealtimeEvent) -> bool {
+    let payload = match event {
+        RealtimeEvent::Telemetry(event) => json!({
             "type": "telemetry",
             "id": event.id,
             "ts": event.ts,
             "device_id": event.device_id,
             "data": event.data,
-        }))
-        .is_ok()
+        }),
+        RealtimeEvent::Command(event) => json!({
+            "type": "command",
+            "id": event.id,
+            "ts": event.ts,
+            "device_id": event.device_id,
+            "data": {
+                "command_id": event.command_id,
+                "device_id": event.device_id,
+                "status": event.status.as_str(),
+                "state_version": event.state_version,
+                "completed_at": event.completed_at,
+                "error": event.error,
+            },
+        }),
+        RealtimeEvent::Presence(event) => json!({
+            "type": "presence",
+            "id": event.id,
+            "ts": event.ts,
+            "device_id": event.device_id,
+            "data": {
+                "online": event.online,
+                "last_seen_at": event.last_seen_at,
+            },
+        }),
+        RealtimeEvent::ReportedStatus(event) => json!({
+            "type": "reported_status",
+            "id": event.id,
+            "ts": event.ts,
+            "device_id": event.device_id,
+            "data": {"status": event.status, "ts": event.ts},
+        }),
+        RealtimeEvent::Config(event) => json!({
+            "type": "config",
+            "id": event.id,
+            "ts": event.ts,
+            "data": {"revision": event.revision},
+        }),
+        RealtimeEvent::System(event) => json!({
+            "type": "system",
+            "id": event.id,
+            "ts": event.ts,
+            "data": {
+                "kind": event.kind,
+                "severity": event.severity,
+                "message": event.message,
+            },
+        }),
+    };
+    sender.try_send(payload).is_ok()
 }
 
 fn normalize_channels(channels: &[String]) -> Option<Vec<String>> {
@@ -404,6 +470,10 @@ async fn close(socket: &mut WebSocket, code: u16, reason: &'static str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::events::{
+        CommandChanged, ConfigChanged, PresenceChanged, ReportedStatus, SystemEvent,
+        TelemetryCommitted,
+    };
     use axum::http::HeaderValue;
 
     #[test]
@@ -438,17 +508,86 @@ mod tests {
     }
 
     #[test]
+    fn event_channels_match_contract_and_dual_subscription_sends_once() {
+        let overview = BTreeSet::from(["overview".to_owned()]);
+        let device = BTreeSet::from(["device:device-a".to_owned()]);
+        let other_device = BTreeSet::from(["device:device-b".to_owned()]);
+        let both = BTreeSet::from(["overview".to_owned(), "device:device-a".to_owned()]);
+        let command = RealtimeEvent::Command(CommandChanged {
+            id: "event-id".to_owned(),
+            ts: 1,
+            command_id: "command-id".to_owned(),
+            device_id: "device-a".to_owned(),
+            status: crate::core::command::CommandStatus::Pending,
+            state_version: 1,
+            completed_at: None,
+            error: None,
+        });
+        let config = RealtimeEvent::Config(ConfigChanged {
+            id: "config-id".to_owned(),
+            ts: 1,
+            revision: 1,
+        });
+        let telemetry = RealtimeEvent::Telemetry(TelemetryCommitted {
+            id: "telemetry-id".to_owned(),
+            ts: 1,
+            device_id: "device-a".to_owned(),
+            data: json!({}),
+        });
+        let presence = RealtimeEvent::Presence(PresenceChanged {
+            id: "presence-id".to_owned(),
+            ts: 1,
+            device_id: "device-a".to_owned(),
+            online: true,
+            last_seen_at: 1,
+        });
+        let reported_status = RealtimeEvent::ReportedStatus(ReportedStatus {
+            id: "reported-id".to_owned(),
+            ts: 1,
+            device_id: "device-a".to_owned(),
+            status: "online",
+        });
+        let system = RealtimeEvent::System(SystemEvent {
+            id: "system-id".to_owned(),
+            ts: 1,
+            kind: "queue_full",
+            severity: "warning",
+            message: "queue full",
+        });
+
+        assert!(is_subscribed(&command, &overview));
+        assert!(is_subscribed(&command, &device));
+        assert!(!is_subscribed(&command, &other_device));
+        assert!(is_subscribed(&config, &overview));
+        assert!(!is_subscribed(&config, &device));
+        assert!(is_subscribed(&presence, &overview));
+        assert!(is_subscribed(&presence, &device));
+        assert!(is_subscribed(&reported_status, &device));
+        assert!(!is_subscribed(&reported_status, &overview));
+        assert!(is_subscribed(&system, &overview));
+        assert!(!is_subscribed(&system, &device));
+        assert!(!is_subscribed(&telemetry, &overview));
+        assert!(is_subscribed(&telemetry, &device));
+
+        let (sender, mut receiver) = mpsc::channel(2);
+        assert!(is_subscribed(&command, &both));
+        assert!(send_event(&sender, command));
+        assert_eq!(receiver.try_recv().unwrap()["type"], "command");
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
     fn full_client_queue_rejects_the_newest_event() {
         let (sender, _receiver) = mpsc::channel(1);
         sender.try_send(json!({"queued":true})).unwrap();
         assert!(!send_event(
             &sender,
-            TelemetryCommitted {
+            RealtimeEvent::Telemetry(TelemetryCommitted {
                 id: "event-id".to_owned(),
                 ts: 1,
                 device_id: "device-id".to_owned(),
                 data: json!({}),
-            }
+            })
         ));
     }
 }

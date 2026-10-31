@@ -19,7 +19,11 @@ struct Work {
 
 /// Handle used to submit validated telemetry to the bounded ingest queue.
 #[derive(Clone)]
-pub struct IngestHandle(mpsc::Sender<Work>);
+pub struct IngestHandle {
+    sender: mpsc::Sender<Work>,
+    events: EventBus,
+    queue_episode: Arc<std::sync::Mutex<()>>,
+}
 
 /// Completion receiver for a submitted telemetry event.
 pub type IngestResult = oneshot::Receiver<Result<TelemetryInsertResult, ()>>;
@@ -42,6 +46,10 @@ pub enum IngestSubmitError {
 }
 
 impl IngestHandle {
+    pub(crate) fn event_bus(&self) -> EventBus {
+        self.events.clone()
+    }
+
     /// Queues without waiting, so the broker callback never blocks on ingest.
     pub fn try_submit(
         &self,
@@ -49,23 +57,29 @@ impl IngestHandle {
         event: ValidatedTelemetry,
     ) -> Result<IngestResult, IngestSubmitError> {
         let (response, receiver) = oneshot::channel();
-        self.0
-            .try_send(Work {
-                device_id,
-                event,
-                response: Some(response),
-            })
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => {
-                    Metrics::global().reject_ingest(IngestRejectReason::QueueFull);
-                    IngestSubmitError::Full
-                }
-                mpsc::error::TrySendError::Closed(_) => IngestSubmitError::Closed,
-            })?;
+        let Ok(_episode) = self.queue_episode.lock() else {
+            tracing::error!("ingest queue episode lock is poisoned");
+            return Err(IngestSubmitError::Closed);
+        };
+        match self.sender.try_send(Work {
+            device_id,
+            event,
+            response: Some(response),
+        }) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                Metrics::global().reject_ingest(IngestRejectReason::QueueFull);
+                self.events.publish_queue_full();
+                return Err(IngestSubmitError::Full);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err(IngestSubmitError::Closed);
+            }
+        }
         Metrics::global().ingest_accepted_total.inc();
         Metrics::global()
             .telemetry_queue_depth
-            .set((self.0.max_capacity() - self.0.capacity()) as u64);
+            .set((self.sender.max_capacity() - self.sender.capacity()) as u64);
         Ok(receiver)
     }
 }
@@ -80,7 +94,12 @@ pub fn spawn_worker(
     control: IngestWorkerControl,
 ) -> (IngestHandle, tokio::task::JoinHandle<()>) {
     let (sender, receiver) = mpsc::channel(capacity);
-    let handle = IngestHandle(sender);
+    let queue_episode = Arc::new(std::sync::Mutex::new(()));
+    let handle = IngestHandle {
+        sender,
+        events: events.clone(),
+        queue_episode: Arc::clone(&queue_episode),
+    };
     let task = tokio::spawn(run_worker(
         repository,
         events,
@@ -88,6 +107,7 @@ pub fn spawn_worker(
         max_batch_bytes,
         runtime_config,
         control,
+        queue_episode,
     ));
     (handle, task)
 }
@@ -99,6 +119,7 @@ async fn run_worker(
     max_batch_bytes: usize,
     runtime_config: RuntimeConfigStore,
     control: IngestWorkerControl,
+    queue_episode: Arc<std::sync::Mutex<()>>,
 ) {
     let IngestWorkerControl {
         cancellation: cancel,
@@ -171,7 +192,9 @@ async fn run_worker(
             match repository.insert_batch(&rows).await {
                 Ok(results) => break results,
                 Err(error) => {
-                    readiness.store(false, Ordering::Release);
+                    if readiness.swap(false, Ordering::AcqRel) {
+                        events.publish_storage_unavailable();
+                    }
                     Metrics::global().telemetry_commit_errors_total.inc();
                     tracing::error!(%error, "telemetry batch commit failed; retrying");
                     if !notified_storage_error {
@@ -202,6 +225,20 @@ async fn run_worker(
                 let _ = response.send(Ok(result));
             }
         }
+        reset_queue_full_if_drained(&receiver, &queue_episode, &events);
+    }
+}
+
+fn reset_queue_full_if_drained(
+    receiver: &mpsc::Receiver<Work>,
+    queue_episode: &std::sync::Mutex<()>,
+    events: &EventBus,
+) {
+    let Ok(_episode) = queue_episode.lock() else {
+        return;
+    };
+    if receiver.capacity() == receiver.max_capacity() {
+        events.reset_queue_full();
     }
 }
 
@@ -228,14 +265,65 @@ mod tests {
     }
 
     #[test]
-    fn queue_rejects_without_waiting_when_full() {
-        let (sender, _receiver) = mpsc::channel(1);
-        let ingest = IngestHandle(sender);
+    fn queue_full_alert_coalesces_per_drain_and_counts_each_rejection() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        let events = EventBus::new();
+        let mut realtime = events.subscribe_realtime();
+        let queue_episode = Arc::new(std::sync::Mutex::new(()));
+        let ingest = IngestHandle {
+            sender,
+            events: events.clone(),
+            queue_episode: Arc::clone(&queue_episode),
+        };
+        let rejected_before = Metrics::global().ingest_rejected_total.get();
+        assert!(ingest.try_submit("device".to_owned(), event()).is_ok());
+        assert!(ingest.try_submit("device".to_owned(), event()).is_ok());
+        for _ in 0..4 {
+            assert!(matches!(
+                ingest.try_submit("device".to_owned(), event()),
+                Err(IngestSubmitError::Full)
+            ));
+        }
+        let crate::core::events::RealtimeEvent::System(system) = realtime.try_recv().unwrap()
+        else {
+            panic!("queue-full rejection should publish one system event");
+        };
+        assert_eq!(system.kind, "queue_full");
+        assert!(realtime.try_recv().is_err());
+
+        assert!(receiver.try_recv().is_ok());
+        assert!(receiver.try_recv().is_ok());
+        assert!(ingest.try_submit("device".to_owned(), event()).is_ok());
         assert!(ingest.try_submit("device".to_owned(), event()).is_ok());
         assert!(matches!(
             ingest.try_submit("device".to_owned(), event()),
             Err(IngestSubmitError::Full)
         ));
+        assert!(
+            realtime.try_recv().is_err(),
+            "producers must not rearm the alert before the drain is synchronized"
+        );
+
+        assert!(receiver.try_recv().is_ok());
+        assert!(receiver.try_recv().is_ok());
+        reset_queue_full_if_drained(&receiver, &queue_episode, &events);
+        assert!(ingest.try_submit("device".to_owned(), event()).is_ok());
+        assert!(ingest.try_submit("device".to_owned(), event()).is_ok());
+        assert!(matches!(
+            ingest.try_submit("device".to_owned(), event()),
+            Err(IngestSubmitError::Full)
+        ));
+        let crate::core::events::RealtimeEvent::System(system) = realtime.try_recv().unwrap()
+        else {
+            panic!("a drained queue should rearm one system event for the next episode");
+        };
+        assert_eq!(system.kind, "queue_full");
+        assert!(realtime.try_recv().is_err());
+        assert_eq!(
+            Metrics::global().ingest_rejected_total.get(),
+            rejected_before + 6,
+            "the metric counts each rejection despite coalesced system events"
+        );
     }
 
     struct RecordingRepository {

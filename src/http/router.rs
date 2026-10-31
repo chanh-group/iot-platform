@@ -20,7 +20,7 @@ use super::api_error::ApiError;
 use super::assets;
 use super::auth;
 use super::middleware;
-use super::{commands, config, devices, events, metrics, telemetry};
+use super::{commands, config, devices, events, metrics, overview, telemetry};
 
 /// Builds the app: API routes, health checks, SPA fallback, and layers.
 pub fn build(state: AppState) -> Router {
@@ -34,6 +34,7 @@ pub fn build(state: AppState) -> Router {
         .route("/api/v1/auth/login", routing::post(auth::login))
         .route("/api/v1/auth/logout", routing::post(auth::logout))
         .route("/api/v1/auth/me", routing::get(auth::me))
+        .route("/api/v1/overview", routing::get(overview::get))
         .route("/api/v1/config", routing::get(config::get))
         .route("/api/v1/config/runtime", routing::patch(config::patch))
         .route(

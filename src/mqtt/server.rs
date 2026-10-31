@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::schema::MqttConfig;
 use crate::core::command::{self, CommandWakeReceiver, PendingCommandAcks};
 use crate::core::device_channel::DeviceChannel;
+use crate::core::events::EventBus;
 use crate::core::presence::Presence;
 use crate::core::telemetry::{IngestHandle, TelemetryPayload};
 use crate::observability::metrics::Metrics;
@@ -46,6 +47,7 @@ pub struct MqttServer {
     command_ack_task: Option<JoinHandle<()>>,
     command_ack_cancel: CancellationToken,
     command_ack_pending: PendingCommandAcks,
+    events: EventBus,
     command_wakes: Option<mpsc::Receiver<String>>,
     command_wake_overflow: Arc<Notify>,
     attributes_task: Option<JoinHandle<()>>,
@@ -409,6 +411,10 @@ impl MqttServer {
         test_kicker: Option<Arc<dyn DeviceChannel>>,
         test_emergency_kicker: Option<Arc<dyn DeviceChannel>>,
     ) -> anyhow::Result<Self> {
+        let events = ingest
+            .as_ref()
+            .map(|(handle, _, _)| handle.event_bus())
+            .unwrap_or_default();
         let listener = config::listener(config)?;
         let address = listener.local_addr()?;
         let max_connections = usize::try_from(config.max_connections)
@@ -440,8 +446,11 @@ impl MqttServer {
         );
         let command_repository = Arc::new(SqliteCommandRepository::new(pool.clone()));
         let command_ack_cancel = CancellationToken::new();
-        let (command_ack, command_ack_task) =
-            command::spawn_ack_worker(command_repository, command_ack_cancel.clone());
+        let (command_ack, command_ack_task) = command::spawn_ack_worker(
+            command_repository,
+            events.clone(),
+            command_ack_cancel.clone(),
+        );
         let command_ack_pending = command_ack.pending();
         let (command_wake_sender, command_wakes) = mpsc::channel(COMMAND_WAKE_QUEUE_CAPACITY);
         let command_wake_overflow = Arc::new(Notify::new());
@@ -483,12 +492,21 @@ impl MqttServer {
                 )
             }
             None => (
-                AclHooks::with_command_ack(Arc::clone(&connections), command_ack, max_topic_levels),
+                AclHooks::with_command_ack(
+                    Arc::clone(&connections),
+                    command_ack,
+                    events.clone(),
+                    max_topic_levels,
+                ),
                 None,
                 None,
                 None,
             ),
         };
+        // RMQTT dispatches Last Will through MessagePublish without the ACL hook.
+        register
+            .add_priority(Type::MessagePublish, 10, Box::new(acl_hooks.clone()))
+            .await;
         register
             .add_priority(Type::MessagePublishCheckAcl, 10, Box::new(acl_hooks))
             .await;
@@ -506,6 +524,7 @@ impl MqttServer {
             device_kicks.clone(),
             command_wake_sender,
             Arc::clone(&command_wake_overflow),
+            events.clone(),
         );
         register
             .add_priority(Type::ClientConnected, 10, Box::new(presence_hooks.clone()))
@@ -547,6 +566,7 @@ impl MqttServer {
             command_ack_task: Some(command_ack_task),
             command_ack_cancel,
             command_ack_pending,
+            events,
             command_wakes: Some(command_wakes),
             command_wake_overflow,
             attributes_task,
@@ -577,7 +597,11 @@ impl MqttServer {
             drop(sender);
             receiver
         });
-        CommandWakeReceiver::new(wakes, Arc::clone(&self.command_wake_overflow))
+        CommandWakeReceiver::with_events(
+            wakes,
+            Arc::clone(&self.command_wake_overflow),
+            self.events.clone(),
+        )
     }
 
     /// Number of retained broker messages, used to verify retained-topic policy.
@@ -1558,6 +1582,7 @@ mod tests {
 
     #[tokio::test]
     async fn both_failed_kicks_fence_a_live_mqtt_session_in_both_directions() {
+        let kick_failures_before = Metrics::global().mqtt_kick_failures_total.get();
         let primary = Arc::new(FailingKick(AtomicUsize::new(0)));
         let emergency = Arc::new(FailingKick(AtomicUsize::new(0)));
         let mut fixture = start_device_http(
@@ -1609,6 +1634,7 @@ mod tests {
             emergency.0.load(AtomicOrdering::Relaxed),
             DEVICE_KICK_ATTEMPTS
         );
+        assert!(Metrics::global().mqtt_kick_failures_total.get() > kick_failures_before);
 
         assert!(
             publisher

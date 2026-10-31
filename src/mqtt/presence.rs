@@ -9,11 +9,12 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use rmqtt::hook::{Handler, HookResult, Parameter, ReturnType};
 use sqlx::SqlitePool;
-use tokio::sync::{Notify, mpsc, oneshot, watch};
+use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::core::auth;
-use crate::core::presence::Presence;
+use crate::core::events::EventBus;
+use crate::core::presence::{Presence, PresenceError};
 use crate::observability::metrics::Metrics;
 use crate::storage::sqlite::devices;
 
@@ -381,6 +382,8 @@ pub struct PresenceHooks {
     kicks: DeviceKickQueue,
     command_wakes: mpsc::Sender<String>,
     command_wake_overflow: Arc<Notify>,
+    events: EventBus,
+    transition_order: Arc<AsyncMutex<()>>,
 }
 
 impl PresenceHooks {
@@ -393,6 +396,7 @@ impl PresenceHooks {
         kicks: DeviceKickQueue,
         command_wakes: mpsc::Sender<String>,
         command_wake_overflow: Arc<Notify>,
+        events: EventBus,
     ) -> Self {
         Self {
             pool,
@@ -401,6 +405,8 @@ impl PresenceHooks {
             kicks,
             command_wakes,
             command_wake_overflow,
+            events,
+            transition_order: Arc::new(AsyncMutex::new(())),
         }
     }
 
@@ -414,9 +420,9 @@ impl PresenceHooks {
         }
     }
 
-    async fn record_last_seen(&self, device_id: &str) {
+    async fn record_last_seen(&self, device_id: &str, last_seen_at: i64) {
         // Last-seen persistence is advisory and must not affect broker readiness.
-        if let Err(error) = devices::update_last_seen(&self.pool, device_id, auth::now_ms()).await {
+        if let Err(error) = devices::update_last_seen(&self.pool, device_id, last_seen_at).await {
             tracing::warn!(%error, %device_id, "cannot update devices.last_seen_at");
         }
     }
@@ -439,6 +445,32 @@ impl PresenceHooks {
         drop(completion);
         Ok(())
     }
+}
+
+async fn transition_presence(
+    presence: &Presence,
+    transition_order: &AsyncMutex<()>,
+    events: &EventBus,
+    device_id: &str,
+    generation: &str,
+    online: bool,
+) -> Result<(bool, i64), PresenceError> {
+    let _transition = transition_order.lock().await;
+    let last_seen_at = auth::now_ms();
+    let changed = if online {
+        presence.connect(device_id, generation)?
+    } else {
+        presence.disconnect(device_id, generation)?
+    };
+    if changed {
+        if online {
+            Metrics::global().mqtt_connections_active.inc();
+        } else {
+            Metrics::global().mqtt_connections_active.dec();
+        }
+        events.publish_presence(device_id, online, last_seen_at);
+    }
+    Ok((changed, last_seen_at))
 }
 
 #[async_trait]
@@ -483,16 +515,24 @@ impl Handler for PresenceHooks {
                         return (true, None);
                     }
                 }
-                match self.presence.connect(device_id, &generation) {
-                    Ok(true) => Metrics::global().mqtt_connections_active.inc(),
-                    Ok(false) => {}
+                let (_, last_seen_at) = match transition_presence(
+                    &self.presence,
+                    &self.transition_order,
+                    &self.events,
+                    device_id,
+                    &generation,
+                    true,
+                )
+                .await
+                {
+                    Ok(transition) => transition,
                     Err(error) => {
                         self.connections.report_failure(error);
                         return (true, None);
                     }
-                }
+                };
                 self.wake_commands(device_id);
-                self.record_last_seen(device_id).await;
+                self.record_last_seen(device_id, last_seen_at).await;
             }
             Parameter::ClientDisconnected(session, _reason) => {
                 let device_id: &str = &session.id.client_id;
@@ -501,15 +541,23 @@ impl Handler for PresenceHooks {
                     self.connections.report_failure(error);
                     return (true, None);
                 }
-                match self.presence.disconnect(device_id, &generation) {
-                    Ok(true) => Metrics::global().mqtt_connections_active.dec(),
-                    Ok(false) => {}
+                let (_, last_seen_at) = match transition_presence(
+                    &self.presence,
+                    &self.transition_order,
+                    &self.events,
+                    device_id,
+                    &generation,
+                    false,
+                )
+                .await
+                {
+                    Ok(transition) => transition,
                     Err(error) => {
                         self.connections.report_failure(error);
                         return (true, None);
                     }
-                }
-                self.record_last_seen(device_id).await;
+                };
+                self.record_last_seen(device_id, last_seen_at).await;
             }
             Parameter::SessionSubscribed(session, subscribe) => {
                 let device_id: &str = &session.id.client_id;
@@ -526,6 +574,66 @@ impl Handler for PresenceHooks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn presence_events_follow_registry_order_while_connect_last_seen_is_blocked() {
+        let presence = Arc::new(Presence::new());
+        let transition_order = Arc::new(AsyncMutex::new(()));
+        let events = EventBus::new();
+        let mut receiver = events.subscribe_realtime();
+        let connected = Arc::new(Notify::new());
+        let release_last_seen = Arc::new(Notify::new());
+        let connect_presence = Arc::clone(&presence);
+        let connect_order = Arc::clone(&transition_order);
+        let connect_events = events.clone();
+        let connect_signal = Arc::clone(&connected);
+        let connect_release = Arc::clone(&release_last_seen);
+        let connect = tokio::spawn(async move {
+            let (changed, _) = transition_presence(
+                &connect_presence,
+                &connect_order,
+                &connect_events,
+                "device",
+                "session-1",
+                true,
+            )
+            .await
+            .unwrap();
+            assert!(changed);
+            connect_signal.notify_one();
+            // This gate represents the advisory `last_seen_at` write after the transition.
+            connect_release.notified().await;
+        });
+
+        connected.notified().await;
+        let online = receiver.try_recv().unwrap();
+        assert!(matches!(
+            online,
+            crate::core::events::RealtimeEvent::Presence(event) if event.online
+        ));
+
+        let (changed, _) = transition_presence(
+            &presence,
+            &transition_order,
+            &events,
+            "device",
+            "session-1",
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(changed);
+        let offline = receiver.try_recv().unwrap();
+        assert!(matches!(
+            offline,
+            crate::core::events::RealtimeEvent::Presence(event) if !event.online
+        ));
+        assert!(!presence.is_online("device").unwrap());
+
+        release_last_seen.notify_one();
+        connect.await.unwrap();
+        assert!(receiver.try_recv().is_err());
+    }
 
     #[test]
     fn limiter_counts_pending_and_active_connections_without_stale_disconnects() {

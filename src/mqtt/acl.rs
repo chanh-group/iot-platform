@@ -8,7 +8,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rmqtt::codec::v5::SubscribeAckReason;
 use rmqtt::hook::{Handler, HookResult, Parameter, ReturnType};
-use rmqtt::types::{PublishAclResult, SubscribeAclResult};
+use rmqtt::types::{FromType, PublishAclResult, SubscribeAclResult};
+use serde::Deserialize;
 
 use super::presence::ConnectionLimiter;
 use super::server_publish::AckHandle;
@@ -16,6 +17,7 @@ use crate::core::acl;
 use crate::core::attributes;
 use crate::core::auth;
 use crate::core::command::CommandAckHandle;
+use crate::core::events::EventBus;
 use crate::core::telemetry::{
     self, IngestHandle, IngestSubmitError, TelemetryError, TelemetryPayload,
 };
@@ -26,6 +28,7 @@ use crate::storage::sqlite::attributes::AttributeHandle;
 pub struct AclHooks {
     ingest: Option<(IngestHandle, AttributeHandle, TelemetryPayload, AckHandle)>,
     command_ack: Option<CommandAckHandle>,
+    events: EventBus,
     max_topic_levels: usize,
     connections: Arc<ConnectionLimiter>,
 }
@@ -37,6 +40,7 @@ impl AclHooks {
         Self {
             ingest: None,
             command_ack: None,
+            events: EventBus::new(),
             max_topic_levels,
             connections,
         }
@@ -47,11 +51,13 @@ impl AclHooks {
     pub(crate) fn with_command_ack(
         connections: Arc<ConnectionLimiter>,
         command_ack: CommandAckHandle,
+        events: EventBus,
         max_topic_levels: usize,
     ) -> Self {
         Self {
             ingest: None,
             command_ack: Some(command_ack),
+            events,
             max_topic_levels,
             connections,
         }
@@ -68,9 +74,11 @@ impl AclHooks {
         command_ack: CommandAckHandle,
         max_topic_levels: usize,
     ) -> Self {
+        let events = ingest.event_bus();
         Self {
             ingest: Some((ingest, attributes, limits, ack)),
             command_ack: Some(command_ack),
+            events,
             max_topic_levels,
             connections,
         }
@@ -80,6 +88,19 @@ impl AclHooks {
         self.connections
             .device_can_exchange(device_id)
             .unwrap_or(false)
+    }
+
+    fn report_status(&self, device_id: &str, topic: &str, payload: &[u8]) {
+        if topic != format!("devices/{device_id}/status") {
+            return;
+        }
+        if let Ok(status) = serde_json::from_slice::<ReportedStatusMessage>(payload) {
+            self.events.publish_reported_status(
+                device_id,
+                status.status.as_str(),
+                status.ts.unwrap_or_else(auth::now_ms),
+            );
+        }
     }
 }
 
@@ -219,6 +240,9 @@ impl Handler for AclHooks {
                         }
                     }
                 }
+                if allowed && topic == format!("devices/{device_id}/status") {
+                    self.report_status(device_id, topic, publish.inner.payload.as_ref());
+                }
                 let result = if !allowed {
                     PublishAclResult::rejected(true, None)
                 } else if retained_telemetry {
@@ -246,7 +270,38 @@ impl Handler for AclHooks {
                 };
                 (true, Some(HookResult::SubscribeAclResult(result)))
             }
+            Parameter::MessagePublish(_, from, publish)
+                if matches!(from.typ(), FromType::LastWill) =>
+            {
+                let device_id = from.id.client_id.to_string();
+                if auth::is_device_id(&device_id) {
+                    self.report_status(&device_id, &publish.topic, publish.inner.payload.as_ref());
+                }
+                (true, None)
+            }
             _ => (true, None),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ReportedStatusMessage {
+    status: ReportedStatusValue,
+    ts: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ReportedStatusValue {
+    Online,
+    Offline,
+}
+
+impl ReportedStatusValue {
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Online => "online",
+            Self::Offline => "offline",
         }
     }
 }

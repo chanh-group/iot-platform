@@ -2,7 +2,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{TestApp, mqtt_connect, ws_connect, ws_session_cookie};
+use common::{TestApp, TestWebSocket, mqtt_connect, ws_connect, ws_session_cookie};
 use futures_util::{SinkExt, StreamExt};
 use iot_server::core::events::TelemetryCommitted;
 use iot_server::observability::metrics::Metrics;
@@ -66,6 +66,28 @@ async fn next_json(
     serde_json::from_str(text.as_str()).unwrap()
 }
 
+async fn next_event_type(socket: &mut TestWebSocket, expected: &str) -> Value {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let event = next_json(socket).await;
+            if event["type"] == expected {
+                return event;
+            }
+            assert_eq!(event["type"], "presence", "unexpected WebSocket event");
+        }
+    })
+    .await
+    .expect("receive expected WebSocket event")
+}
+
+async fn expect_presence_transition(socket: &mut TestWebSocket, device_id: &str) {
+    for online in [true, false] {
+        let event = next_event_type(socket, "presence").await;
+        assert_eq!(event["device_id"], device_id);
+        assert_eq!(event["data"]["online"], online);
+    }
+}
+
 #[tokio::test]
 async fn subscribed_clients_receive_only_committed_telemetry_and_refetch_after_reconnect() {
     let app = TestApp::start().await;
@@ -112,6 +134,7 @@ async fn subscribed_clients_receive_only_committed_telemetry_and_refetch_after_r
     .await;
     assert_eq!(rejected["status"], "rejected");
     assert_eq!(rejected["code"], "invalid_payload");
+    expect_presence_transition(&mut socket, &device.id).await;
     assert!(
         tokio::time::timeout(Duration::from_millis(150), socket.next())
             .await
@@ -127,7 +150,7 @@ async fn subscribed_clients_receive_only_committed_telemetry_and_refetch_after_r
     )
     .await;
     assert_eq!(stored_ack["status"], "stored");
-    let event = next_json(&mut socket).await;
+    let event = next_event_type(&mut socket, "telemetry").await;
     assert_eq!(event["type"], "telemetry");
     assert_eq!(event["device_id"], device.id);
     assert_eq!(event["data"]["event_id"], "committed-ws-event");
@@ -149,7 +172,10 @@ async fn subscribed_clients_receive_only_committed_telemetry_and_refetch_after_r
         ))
         .await
         .unwrap();
-    assert_eq!(next_json(&mut socket).await["type"], "unsubscribed");
+    assert_eq!(
+        next_event_type(&mut socket, "unsubscribed").await["type"],
+        "unsubscribed"
+    );
 
     socket.close(None).await.unwrap();
     let mut reconnected = ws_connect(&app, &cookie).await;
@@ -204,9 +230,12 @@ async fn failed_telemetry_commit_is_not_broadcast() {
     assert_eq!(next_json(&mut socket).await["type"], "hello");
     socket
         .send(Message::Text(
-            json!({"action":"subscribe", "channels":[format!("device:{}", device.id)]})
-                .to_string()
-                .into(),
+            json!({
+                "action":"subscribe",
+                "channels":["overview", format!("device:{}", device.id)],
+            })
+            .to_string()
+            .into(),
         ))
         .await
         .unwrap();
@@ -229,11 +258,18 @@ async fn failed_telemetry_commit_is_not_broadcast() {
     .await;
     assert_eq!(failed_ack["status"], "retryable");
     assert_eq!(failed_ack["code"], "storage_unavailable");
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), socket.next())
-            .await
-            .is_err()
-    );
+    let system = next_event_type(&mut socket, "system").await;
+    assert_eq!(system["data"]["kind"], "storage_unavailable");
+    assert_eq!(system["data"]["severity"], "error");
+    assert!(!system.to_string().contains("injected commit failure"));
+    for _ in 0..3 {
+        if let Ok(Some(Ok(Message::Text(text)))) =
+            tokio::time::timeout(Duration::from_millis(200), socket.next()).await
+        {
+            let event: Value = serde_json::from_str(text.as_str()).unwrap();
+            assert_ne!(event["type"], "telemetry");
+        }
+    }
     let stored: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM telemetry_events WHERE device_id = ? AND event_id = ?",
     )
