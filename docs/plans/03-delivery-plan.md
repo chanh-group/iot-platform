@@ -142,7 +142,7 @@ Nếu fail: dừng, cập nhật ADR-001 và `02` §9. Không tự viết broker
 
 - A10–A14 pass.
 - Dashboard làm được: login, xem online, tạo/disable/rotate device, xem chart theo khoảng, tạo command và xem trạng thái, sửa runtime config, thấy lỗi storage.
-- runtime `PATCH`: revision conflict 409, field lạ 422, lỗi ghi giữ config cũ.
+- runtime `PATCH`: revision conflict 409; field không tồn tại 400 `validation_error`; field tồn tại nhưng cần restart 422 `restart_required`; lỗi trước rename giữ config cũ, lỗi mở/fsync thư mục sau rename báo durability uncertain và config mới đã áp dụng trong process theo `02` §4.6.
 - Credential rotate đóng connection cũ; token cũ không reconnect.
 - Không có secret trong audit/log/response (test redaction).
 - `svelte-check` sạch; build `web/dist` tái lập được.

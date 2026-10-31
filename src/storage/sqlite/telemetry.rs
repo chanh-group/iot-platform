@@ -51,6 +51,26 @@ pub async fn insert_batch(
     }
 }
 
+/// Deletes at most one received-at-ordered retention batch in one SQLite statement transaction.
+pub async fn delete_before(
+    pool: &SqlitePool,
+    received_before: i64,
+    limit: i64,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "DELETE FROM telemetry_events
+         WHERE internal_id IN (
+             SELECT internal_id FROM telemetry_events INDEXED BY telemetry_received_idx
+             WHERE received_at < ? ORDER BY received_at, internal_id LIMIT ?
+         )",
+    )
+    .bind(received_before)
+    .bind(limit.clamp(1, 5_000))
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 async fn insert_batch_in_transaction(
     conn: &mut SqliteConnection,
     events: &[(String, ValidatedTelemetry)],

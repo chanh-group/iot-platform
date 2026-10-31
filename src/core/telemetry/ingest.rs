@@ -5,6 +5,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use crate::config::runtime::RuntimeConfigStore;
 use crate::core::events::{EventBus, TelemetryCommitted};
 use crate::observability::metrics::{IngestRejectReason, Metrics};
 
@@ -74,9 +75,8 @@ pub fn spawn_worker(
     repository: Arc<dyn TelemetryRepository>,
     events: EventBus,
     capacity: usize,
-    batch_size: usize,
     max_batch_bytes: usize,
-    flush_interval: Duration,
+    runtime_config: RuntimeConfigStore,
     control: IngestWorkerControl,
 ) -> (IngestHandle, tokio::task::JoinHandle<()>) {
     let (sender, receiver) = mpsc::channel(capacity);
@@ -85,9 +85,8 @@ pub fn spawn_worker(
         repository,
         events,
         receiver,
-        batch_size,
         max_batch_bytes,
-        flush_interval,
+        runtime_config,
         control,
     ));
     (handle, task)
@@ -97,9 +96,8 @@ async fn run_worker(
     repository: Arc<dyn TelemetryRepository>,
     events: EventBus,
     mut receiver: mpsc::Receiver<Work>,
-    batch_size: usize,
     max_batch_bytes: usize,
-    flush_interval: Duration,
+    runtime_config: RuntimeConfigStore,
     control: IngestWorkerControl,
 ) {
     let IngestWorkerControl {
@@ -123,6 +121,9 @@ async fn run_worker(
             },
         };
         let Some(first) = first else { break };
+        let settings = runtime_config.load();
+        let batch_size = settings.config.telemetry.batch_size as usize;
+        let flush_interval = Duration::from_millis(settings.config.telemetry.flush_interval_ms);
         let mut batch = vec![first];
         let mut bytes = batch[0].event.raw_bytes;
         Metrics::global()
@@ -206,9 +207,14 @@ async fn run_worker(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use serde_json::{Map, json};
+    use tempfile::TempDir;
+    use tokio::sync::{Notify, mpsc};
 
     use super::*;
+    use crate::config;
 
     fn event() -> ValidatedTelemetry {
         ValidatedTelemetry {
@@ -230,5 +236,90 @@ mod tests {
             ingest.try_submit("device".to_owned(), event()),
             Err(IngestSubmitError::Full)
         ));
+    }
+
+    struct RecordingRepository {
+        calls: mpsc::Sender<usize>,
+        call_count: AtomicUsize,
+        first_call_entered: Notify,
+        release_first_call: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl TelemetryRepository for RecordingRepository {
+        async fn insert_batch(
+            &self,
+            events: &[(String, ValidatedTelemetry)],
+        ) -> anyhow::Result<Vec<TelemetryInsertResult>> {
+            self.calls.send(events.len()).await?;
+            if self.call_count.fetch_add(1, Ordering::Relaxed) == 0 {
+                self.first_call_entered.notify_one();
+                self.release_first_call.notified().await;
+            }
+            Ok(vec![TelemetryInsertResult::Stored; events.len()])
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_reads_batch_and_flush_settings_at_each_batch() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("conf.toml");
+        std::fs::write(
+            &config_path,
+            "config_version = 1\n\
+             [server]\n\
+             data_dir = \"./data\"\n\
+             [database]\n\
+             url = \"sqlite://./data/test.db\"\n\
+             [telemetry]\n\
+             batch_size = 1\n\
+             flush_interval_ms = 1000\n",
+        )
+        .unwrap();
+        let loaded = config::load(&config_path).unwrap();
+        let (calls, mut call_results) = mpsc::channel(4);
+        let repository = Arc::new(RecordingRepository {
+            calls,
+            call_count: AtomicUsize::new(0),
+            first_call_entered: Notify::new(),
+            release_first_call: Notify::new(),
+        });
+        let (handle, task) = spawn_worker(
+            repository.clone(),
+            EventBus::new(),
+            8,
+            65_536,
+            loaded.runtime_config.clone(),
+            IngestWorkerControl {
+                cancellation: CancellationToken::new(),
+                readiness: Arc::new(AtomicBool::new(true)),
+            },
+        );
+
+        handle.try_submit("device".to_owned(), event()).unwrap();
+        repository.first_call_entered.notified().await;
+        loaded
+            .runtime_config
+            .update(
+                0,
+                &json!({"telemetry":{"batch_size":2,"flush_interval_ms":20}}),
+            )
+            .await
+            .unwrap();
+        repository.release_first_call.notify_one();
+        assert_eq!(call_results.recv().await, Some(1));
+
+        handle.try_submit("device".to_owned(), event()).unwrap();
+        handle.try_submit("device".to_owned(), event()).unwrap();
+        assert_eq!(call_results.recv().await, Some(2));
+
+        handle.try_submit("device".to_owned(), event()).unwrap();
+        let flushed = tokio::time::timeout(Duration::from_millis(500), call_results.recv())
+            .await
+            .expect("updated flush interval should apply to the next batch");
+        assert_eq!(flushed, Some(1));
+        drop(handle);
+        task.abort();
+        let _ = task.await;
     }
 }

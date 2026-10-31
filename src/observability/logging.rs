@@ -2,31 +2,70 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::reload;
 
 use crate::config::LoadedConfig;
 use crate::config::schema::{LogFormat, LogLevel};
 
+type FilterHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
+
+static FILTER_HANDLE: OnceLock<FilterHandle> = OnceLock::new();
+
 /// Installs the global subscriber from `[logging]`. `try_init` also installs `LogTracer`.
 pub fn init(loaded: &LoadedConfig) -> anyhow::Result<()> {
-    let filter = EnvFilter::try_new(level_name(loaded.config.logging.level))?;
-    let builder = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_ansi(false);
+    let filter = filter_for_level(loaded.runtime_config.load().config.logging.level)?;
+    let (filter_layer, handle) = reload::Layer::new(filter);
+    let subscriber = tracing_subscriber::registry().with(filter_layer);
     match loaded.config.logging.format {
-        LogFormat::Json => builder.json().try_init().map_err(anyhow::Error::msg)?,
-        LogFormat::Text => builder.try_init().map_err(anyhow::Error::msg)?,
+        LogFormat::Json => subscriber
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_target(false)
+                    .with_ansi(false),
+            )
+            .try_init()
+            .map_err(anyhow::Error::msg)?,
+        LogFormat::Text => subscriber
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_target(false)
+                    .with_ansi(false),
+            )
+            .try_init()
+            .map_err(anyhow::Error::msg)?,
     }
+    FILTER_HANDLE
+        .set(handle)
+        .map_err(|_| anyhow::anyhow!("logging filter already initialized"))?;
     Ok(())
+}
+
+/// Parses the new filter before file commit and returns its infallible apply step.
+pub fn prepare_reload(level: LogLevel) -> Result<Box<dyn FnOnce() + Send>, String> {
+    let filter = filter_for_level(level).map_err(|error| error.to_string())?;
+    let prepared: Box<dyn FnOnce() + Send> = if let Some(handle) = FILTER_HANDLE.get() {
+        Box::new(move || {
+            // The process-global subscriber is installed once and outlives runtime config.
+            handle
+                .reload(filter)
+                .expect("the process-global tracing subscriber remains installed");
+        })
+    } else {
+        Box::new(|| {})
+    };
+    Ok(prepared)
 }
 
 /// Startup fields only; secrets stay in `LoadedConfig` and are never logged.
 pub fn startup(config_path: &Path, loaded: &LoadedConfig, http_listen: SocketAddr) {
     tracing::info!(
         config = %config_path.display(),
-        revision = loaded.revision,
+        revision = loaded.runtime_config.load().revision,
         http_listen = %http_listen,
         "server starting"
     );
@@ -45,6 +84,10 @@ fn level_name(level: LogLevel) -> &'static str {
         LogLevel::Warn => "warn",
         LogLevel::Error => "error",
     }
+}
+
+fn filter_for_level(level: LogLevel) -> Result<EnvFilter, tracing_subscriber::filter::ParseError> {
+    EnvFilter::try_new(level_name(level))
 }
 
 #[cfg(test)]
@@ -122,5 +165,28 @@ mod tests {
         assert_eq!(level_name(LogLevel::Info), "info");
         assert_eq!(level_name(LogLevel::Warn), "warn");
         assert_eq!(level_name(LogLevel::Error), "error");
+    }
+
+    #[test]
+    fn reload_changes_the_filter_for_subsequent_events() {
+        let buffer = Buffer::default();
+        let (filter, handle) = reload::Layer::new(filter_for_level(LogLevel::Info).unwrap());
+        let subscriber = tracing_subscriber::registry().with(filter).with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(buffer.clone()),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!("hidden before reload");
+            handle
+                .reload(filter_for_level(LogLevel::Debug).unwrap())
+                .unwrap();
+            tracing::debug!("visible after reload");
+        });
+
+        let output = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert!(!output.contains("hidden before reload"));
+        assert!(output.contains("visible after reload"));
     }
 }

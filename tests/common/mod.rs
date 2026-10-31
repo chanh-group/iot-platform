@@ -4,6 +4,7 @@
 
 use std::fs;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
@@ -73,9 +74,11 @@ pub struct TestApp {
     pub base: String,
     pub pool: SqlitePool,
     pub config: Arc<LoadedConfig>,
+    pub config_path: PathBuf,
     pub mqtt_addr: SocketAddr,
     pub presence: Arc<Presence>,
     pub events: EventBus,
+    pub mqtt_config: MqttConfig,
     mqtt: MqttServer,
     telemetry_task: JoinHandle<()>,
     telemetry_cancel: CancellationToken,
@@ -220,7 +223,7 @@ impl TestApp {
 
     /// Restarts the test broker with a fresh in-memory retained store.
     pub async fn restart_mqtt(&mut self) {
-        self.restart_mqtt_with_config(self.config.config.mqtt.clone())
+        self.restart_mqtt_with_config(self.mqtt_config.clone())
             .await;
     }
 
@@ -246,6 +249,7 @@ impl TestApp {
         .expect("restart test MQTT server");
         self.mqtt_addr = mqtt.local_addr();
         self.mqtt = mqtt;
+        self.mqtt_config = config;
         self.command_cancel = CancellationToken::new();
         self.command_task = spawn_dispatcher(
             Arc::new(SqliteCommandRepository::new(self.pool.clone())),
@@ -275,6 +279,7 @@ pub struct TestAppBuilder {
     cookie_secure: bool,
     metrics_token: Option<String>,
     max_body_bytes: u64,
+    request_timeout_ms: u64,
     login_max_attempts: u64,
     max_ws_connections: u64,
     ws_queue_capacity: u64,
@@ -292,6 +297,7 @@ impl Default for TestAppBuilder {
             cookie_secure: false,
             metrics_token: None,
             max_body_bytes: 262_144,
+            request_timeout_ms: 30_000,
             login_max_attempts: 5,
             max_ws_connections: 100,
             ws_queue_capacity: 256,
@@ -322,6 +328,11 @@ impl TestAppBuilder {
 
     pub fn max_body_bytes(mut self, bytes: u64) -> Self {
         self.max_body_bytes = bytes;
+        self
+    }
+
+    pub fn request_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.request_timeout_ms = timeout_ms;
         self
     }
 
@@ -382,44 +393,71 @@ impl TestAppBuilder {
                  metrics = {}\n\
                  {}\
                  max_body_bytes = {}\n\
+                 request_timeout_ms = {}\n\
+                 max_ws_connections = {}\n\
+                 ws_queue_capacity = {}\n\
                  [mqtt]\n\
                  listen = \"127.0.0.1:0\"\n\
                  max_retained_messages = {}\n\
                  max_retained_bytes = {}\n\
                  [database]\n\
                  url = \"sqlite://./data/iot.db\"\n\
+                 [telemetry]\n\
+                 queue_capacity = {}\n\
+                 batch_size = {}\n\
+                 max_batch_bytes = {}\n\
+                 flush_interval_ms = {}\n\
+                 retention_days = {}\n\
+                 max_future_skew_ms = {}\n\
+                 max_past_skew_ms = {}\n\
+                 max_payload_bytes = {}\n\
+                 max_keys = {}\n\
+                 max_string_bytes = {}\n\
                  [auth]\n\
                  login_max_attempts = {}\n\
                  [commands]\n\
-                 max_ttl_ms = {}\n",
+                 max_ttl_ms = {}\n\
+                 dispatch_interval_ms = {}\n\
+                 retry_initial_ms = {}\n\
+                 retry_max_ms = {}\n",
                 self.dashboard,
                 self.cookie_secure,
                 self.metrics_token.is_some(),
                 metrics_token_env,
                 self.max_body_bytes,
+                self.request_timeout_ms,
+                self.max_ws_connections,
+                self.ws_queue_capacity,
                 self.mqtt_config.max_retained_messages,
                 self.mqtt_config.max_retained_bytes,
+                self.telemetry_config.queue_capacity,
+                self.telemetry_config.batch_size,
+                self.telemetry_config.max_batch_bytes,
+                self.telemetry_config.flush_interval_ms,
+                self.telemetry_config.retention_days,
+                self.telemetry_config.max_future_skew_ms,
+                self.telemetry_config.max_past_skew_ms,
+                self.telemetry_config.max_payload_bytes,
+                self.telemetry_config.max_keys,
+                self.telemetry_config.max_string_bytes,
                 self.login_max_attempts,
                 self.command_max_ttl_ms,
+                self.command_dispatch_interval_ms,
+                self.command_retry_initial_ms,
+                iot_server::config::schema::CommandsConfig::default().retry_max_ms,
             ),
         )
         .unwrap();
 
         let metrics_token = self.metrics_token.clone();
-        let mut loaded = config::load_with_env(&config_path, move |name| {
+        let loaded = config::load_with_env(&config_path, move |name| {
             (name == "TEST_METRICS_BEARER_TOKEN")
                 .then(|| metrics_token.clone())
                 .flatten()
         })
         .unwrap();
-        loaded.config.telemetry = self.telemetry_config;
-        loaded.config.commands.dispatch_interval_ms = self.command_dispatch_interval_ms;
-        loaded.config.commands.retry_initial_ms = self.command_retry_initial_ms;
-        loaded.config.http.max_ws_connections = self.max_ws_connections;
-        loaded.config.http.ws_queue_capacity = self.ws_queue_capacity;
         let mut mqtt_config = self.mqtt_config;
         mqtt_config.listen = loaded.config.mqtt.listen;
-        loaded.config.mqtt = mqtt_config;
         let loaded = Arc::new(loaded);
         let lock = DataDirLock::try_new(&loaded.data_dir).unwrap();
         let pool = pool::connect(&loaded).await.unwrap();
@@ -436,16 +474,15 @@ impl TestAppBuilder {
             Arc::new(SqliteTelemetryRepository::new(pool.clone())),
             events.clone(),
             telemetry.queue_capacity as usize,
-            telemetry.batch_size as usize,
             telemetry.max_batch_bytes as usize,
-            Duration::from_millis(telemetry.flush_interval_ms),
+            loaded.runtime_config.clone(),
             telemetry_core::IngestWorkerControl {
                 cancellation: telemetry_cancel.clone(),
                 readiness: Arc::clone(&telemetry_ready),
             },
         );
         let mut mqtt = MqttServer::start_with_ingest(
-            &loaded.config.mqtt,
+            &mqtt_config,
             Arc::clone(&mqtt_ready),
             pool.clone(),
             Arc::clone(&presence),
@@ -498,9 +535,11 @@ impl TestAppBuilder {
             base,
             pool,
             config: loaded,
+            config_path,
             mqtt_addr,
             presence,
             events,
+            mqtt_config,
             mqtt,
             telemetry_task,
             telemetry_cancel,

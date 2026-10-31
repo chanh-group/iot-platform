@@ -92,7 +92,7 @@ async fn max_inflight_per_client_limits_unacknowledged_qos1_deliveries() {
         ..MqttConfig::default()
     };
     let app = TestApp::builder().mqtt_config(config).start().await;
-    assert_eq!(app.config.config.mqtt.max_inflight_per_client, 1);
+    assert_eq!(app.mqtt_config.max_inflight_per_client, 1);
     let device = app.create_device("protocol-inflight", true).await;
     let ack_topic = format!("devices/{}/telemetry/ack", device.id);
     let telemetry_topic = format!("devices/{}/telemetry", device.id);

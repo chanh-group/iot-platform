@@ -82,6 +82,8 @@ async fn metrics_requires_its_bearer_token_and_exports_core_series() {
         "iot_telemetry_queue_depth",
         "iot_telemetry_commit_seconds_bucket",
         "iot_telemetry_commit_errors_total",
+        "iot_telemetry_retention_errors_total",
+        "iot_audit_write_errors_total",
         "iot_commands_pending",
         "iot_commands_expired_total",
         "iot_command_ack_dropped_total",

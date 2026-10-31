@@ -35,6 +35,7 @@ impl TelemetryCommitted {
 pub struct EventBus {
     telemetry: broadcast::Sender<TelemetryCommitted>,
     session_revocations: broadcast::Sender<String>,
+    config_revisions: broadcast::Sender<u64>,
 }
 
 impl EventBus {
@@ -42,9 +43,11 @@ impl EventBus {
     pub fn new() -> Self {
         let (telemetry, _) = broadcast::channel(EVENT_CAPACITY);
         let (session_revocations, _) = broadcast::channel(EVENT_CAPACITY);
+        let (config_revisions, _) = broadcast::channel(EVENT_CAPACITY);
         Self {
             telemetry,
             session_revocations,
+            config_revisions,
         }
     }
 
@@ -62,6 +65,14 @@ impl EventBus {
 
     pub fn publish_session_revocation(&self, session_id: &str) {
         let _ = self.session_revocations.send(session_id.to_owned());
+    }
+
+    pub fn subscribe_config_revisions(&self) -> broadcast::Receiver<u64> {
+        self.config_revisions.subscribe()
+    }
+
+    pub fn publish_config_revision(&self, revision: u64) {
+        let _ = self.config_revisions.send(revision);
     }
 }
 

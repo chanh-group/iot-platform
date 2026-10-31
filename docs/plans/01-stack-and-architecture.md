@@ -324,7 +324,8 @@ core -> không import axum/rmqtt/sqlx
 | DB không kết nối / disk full | `/readyz` 503; worker retry backoff; không application ACK; queue đầy thì drop có metric |
 | Migration fail | Startup fail, không mở listener |
 | Config/runtime parse fail | Startup fail; không fallback im lặng |
-| Runtime write fail | Giữ config cũ, trả lỗi; không swap snapshot |
+| Runtime write fail trước rename | Giữ file/snapshot cũ, trả lỗi |
+| Runtime directory open/fsync fail sau rename | File và snapshot mới cùng hiệu lực trong process; trả lỗi durability uncertain; sau crash có thể hồi phục file cũ hoặc mới |
 | MQTT listener chết | Readiness false, supervisor shutdown |
 | HTTP listener chết | Process exit có kiểm soát |
 | Telemetry worker panic | Process exit; không ACK item chưa commit |

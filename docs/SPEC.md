@@ -309,7 +309,7 @@ Precedence: default → `conf.toml` → `runtime.toml` đối với trường đ
 
 PATCH config runtime yêu cầu `expected_revision`. Xung đột trả 409. Trường không hỗ trợ đổi nóng trả 422 với danh sách `restart_required`; không ghi cấu hình nửa chừng.
 
-Quy trình update: khóa cập nhật → kiểm tra revision → tạo/validate toàn bộ snapshot → chuẩn bị tài nguyên cần thiết → ghi file tạm cùng filesystem, sync và atomic rename → thay snapshot trong RAM bằng thao tác không thất bại → trả revision mới. Worker đọc snapshot nhất quán; lỗi ghi file giữ cấu hình cũ. File runtime tồn tại nhưng lỗi parse phải làm startup fail rõ ràng, không bỏ qua âm thầm. Không hỗ trợ tự watch file ở MVP.
+Quy trình update: khóa cập nhật → kiểm tra revision → tạo/validate toàn bộ snapshot → chuẩn bị tài nguyên cần thiết → tạo parent directory còn thiếu từ ngoài vào trong → mỗi lần update fsync chuỗi ancestor của parent từ ngoài vào trong, kể cả directory đã tồn tại, để retry đảm bảo các entry còn lại từ lần lỗi trước → ghi file tạm cùng filesystem, sync và atomic rename → thay snapshot trong RAM bằng thao tác không thất bại → trả revision mới. Worker đọc snapshot nhất quán. Lỗi trước rename giữ file/snapshot cũ; nếu mở hoặc fsync thư mục lỗi sau rename, bản mới đã active trong process nhưng durability qua crash chưa chắc chắn. File runtime tồn tại nhưng lỗi parse phải làm startup fail rõ ràng, không bỏ qua âm thầm. Không hỗ trợ tự watch file ở MVP.
 
 ## 10. Vận hành và bảo mật
 
@@ -396,7 +396,7 @@ Bắt đầu bằng một Rust crate; chỉ tách workspace khi ranh giới modu
 | A10 | Node offline khi tạo command | Pending bền vững; reconnect nhận lệnh chưa hết hạn |
 | A11 | Command resend/ACK trùng | Command ID giữ nguyên; terminal state nhất quán |
 | A12 | Runtime update hợp lệ | Lưu revision; restart giữ thay đổi |
-| A13 | Config sai, revision cũ, lỗi ghi file | Từ chối toàn bộ update; cấu hình hiệu lực không bị cập nhật một phần |
+| A13 | Config sai, revision cũ, lỗi ghi file | Config sai/revision cũ/lỗi trước rename không đổi file/snapshot; lỗi mở/fsync thư mục sau rename trả lỗi với durability uncertain nhưng chỉ áp dụng snapshot mới hoàn chỉnh, không có cấu hình một phần |
 | A14 | Rotate token khi node đang online | Kết nối cũ bị đóng; token cũ không reconnect được |
 | A15 | WebSocket client chậm/reconnect | Queue hữu hạn; tải bù lịch sử qua REST được |
 | A16 | SIGTERM | Drain có deadline; restart không mất bản đã ACK |

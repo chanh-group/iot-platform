@@ -31,6 +31,8 @@ pub struct LoadedConfig {
     pub metrics_token: Option<String>,
     /// Applied `runtime.toml` revision; 0 when the file is absent.
     pub revision: u64,
+    /// Shared hot-config snapshot store.
+    pub runtime_config: runtime::RuntimeConfigStore,
 }
 
 impl fmt::Debug for LoadedConfig {

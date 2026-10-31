@@ -164,7 +164,7 @@ async fn reconnect_resends_with_the_persisted_command_id() {
 #[tokio::test]
 async fn clean_reconnect_redelivers_after_a_late_command_subscription() {
     let app = TestApp::builder()
-        .command_dispatch_timing(50, 10_000)
+        .command_dispatch_timing(100, 10_000)
         .start()
         .await;
     let device = app.create_device("command-late-subscription", true).await;

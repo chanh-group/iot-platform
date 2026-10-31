@@ -469,7 +469,7 @@ Không có bảng `schema_migrations` riêng, không có bảng projection lates
 | Tạo command | Insert command + audit trong một transaction; kiểm tra queue limit trong cùng transaction |
 | Dispatch | Publish broker; update `dispatched_at`, `attempts`, `next_attempt_at` chỉ khi command còn `pending`/`dispatched` |
 | ACK command | Update chỉ khi status `pending`/`dispatched`; terminal không đổi; ACK muộn ghi `late_ack_*` |
-| Config update | Ghi file tạm + fsync + rename; chỉ swap RAM sau khi ghi thành công; audit sau swap (hoặc trong transaction audit riêng) |
+| Config update | Serialize dưới mutex; temp cùng thư mục → fsync file → atomic rename → fsync thư mục; ArcSwap sau rename; audit sau swap (hoặc trong transaction audit riêng) |
 
 - `BEGIN IMMEDIATE` chỉ dùng cho telemetry batch và các mutation cần khóa ghi ngay; transaction phải ngắn, không chờ network/broker trong transaction.
 - Không giữ transaction khi publish MQTT/HTTP response.
@@ -530,7 +530,7 @@ LIMIT ?;
 - Không ghi token, password hash, params command, metadata values, payload telemetry.
 - `request_id`, `remote_ip`, `occurred_at` lấy từ request.
 - Device/credential/command mutation: audit trong cùng transaction với mutation; audit lỗi → rollback mutation.
-- Riêng `config.update`: file đã rename + RAM đã swap; audit lỗi chỉ log + metric, không rollback file (tránh file/RAM lệch).
+- Riêng `config.update`: file đã rename + RAM đã swap; audit lỗi chỉ log + metric, không rollback file (tránh file/RAM lệch). Audit attempt và broadcast revision sau commit chạy như một post-commit completion độc lập với HTTP future: request timeout/cancel không hủy chúng. Completion giữ khóa update đến khi audit attempt và broadcast xong, nên revision/audit giữ đúng thứ tự; chỉ một completion runtime config chạy cùng lúc, không có queue unbounded.
 - Login thất bại: chỉ log có rate limit, không ghi audit (tránh flood).
 - MQTT connect/disconnect/telemetry không ghi audit; chỉ metric/log.
 
@@ -819,15 +819,18 @@ Query: `limit` (mặc định 50, max 200), `cursor`, `status` (một giá trị
 ```
 
 - Chỉ cho phép: `logging.level`, `telemetry.retention_days`, `telemetry.batch_size`, `telemetry.flush_interval_ms`.
+- `settings` dùng JSON object lồng đúng schema; key có dấu chấm là key literal, không phải path alias. Không cho phép gửi cùng field ở dạng phẳng và lồng.
 - Field không tồn tại trong schema config → `400 validation_error`.
 - Field hợp lệ nhưng không hot-reload (kể cả `http.listen`, `database`, `mqtt`, `auth`) → `422 restart_required`, `details.restart_required` là danh sách path; **không ghi file**.
 - `settings` phải là object không rỗng.
 - `expected_revision` khác revision hiện tại → `409 revision_conflict`, `details.current_revision`.
 - Validate toàn bộ snapshot merge; lỗi → 400, không ghi.
-- Ghi `runtime.toml` bằng temp file cùng thư mục + `fsync` + atomic rename; lỗi ghi → `500 config_write_failed`, config cũ giữ nguyên.
+- Nếu parent directory còn thiếu, tạo từng directory từ ngoài vào trong. Mỗi lần PATCH, dù directory đã tồn tại hay vừa tạo, fsync chuỗi ancestor của parent từ ngoài vào trong trước khi tạo temp file để retry vẫn xác lập durability cho directory còn lại từ lần lỗi trước; lỗi create/open/fsync ở bước này là lỗi trước rename, file/snapshot/revision không đổi (directory vừa tạo có thể còn lại).
+- Ghi `runtime.toml` bằng temp file cùng thư mục + fsync file + atomic rename + fsync thư mục. Lỗi trước khi rename → `500 config_write_failed`, file đích/snapshot/revision cũ giữ nguyên và chỉ temp do request này tạo mới được dọn. Response có `details.applied: false`.
+- Rename là điểm commit trong process. Nếu mở hoặc fsync thư mục lỗi sau rename, file đích chứa toàn bộ bản mới và server publish snapshot/revision mới để file nhìn thấy và RAM nhất quán; audit/broadcast vẫn chạy. Trả `500 config_write_failed` với `details: {"applied":true,"revision":<new_revision>,"durability":"uncertain"}`. Không đảm bảo bản mới sống qua mất điện/crash trước lần sync thành công; khi restart filesystem có thể khôi phục nguyên file cũ hoặc nguyên file mới, không có trạng thái file nửa chừng. Client phải GET config trước khi retry.
 - 200 trả body như GET với revision mới.
 - Nếu settings không đổi gì: 200, revision giữ nguyên, không ghi file.
-- Update được serialize bằng mutex; check revision ở trong lock.
+- Update được serialize bằng mutex; check revision ở trong lock. Khóa được giữ qua post-commit audit attempt và revision broadcast; timeout/cancel HTTP không hủy phần này.
 
 ### 4.7. Overview và metrics
 
@@ -851,7 +854,7 @@ Query: `limit` (mặc định 50, max 200), `cursor`, `status` (một giá trị
 - Mặc định tắt (`[http] metrics = false` → 404).
 - Khi bật, **không** dùng session cookie: bắt buộc `http.metrics_bearer_token_env` trỏ tới environment variable có token ngẫu nhiên tối thiểu 32 byte. Yêu cầu `Authorization: Bearer <token>`; thiếu/sai trả 401. Token không bao giờ xuất hiện trong API, log hay `GET /config`.
 - Production đặt endpoint sau reverse proxy/mTLS hoặc network policy chỉ cho Prometheus. Không bật metrics nếu không có một trong các lớp mạng đó.
-- Tên metric tối thiểu: `iot_mqtt_connections_active`, `iot_mqtt_kick_failures_total`, `iot_ingest_accepted_total`, `iot_ingest_rejected_total{reason}`, `iot_retained_cap_rejected_total`, `iot_telemetry_queue_depth`, `iot_telemetry_commit_seconds` (histogram), `iot_telemetry_commit_errors_total`, `iot_commands_pending`, `iot_commands_expired_total`, `iot_command_ack_dropped_total`, `iot_command_ack_invalid_total`, `iot_command_ack_storage_errors_total`, `iot_command_publish_errors_total`, `iot_command_storage_errors_total`, `iot_command_dispatch_wake_dropped_total`, `iot_ws_clients`, `iot_ws_dropped_total`.
+- Tên metric tối thiểu: `iot_mqtt_connections_active`, `iot_mqtt_kick_failures_total`, `iot_ingest_accepted_total`, `iot_ingest_rejected_total{reason}`, `iot_retained_cap_rejected_total`, `iot_telemetry_queue_depth`, `iot_telemetry_commit_seconds` (histogram), `iot_telemetry_commit_errors_total`, `iot_telemetry_retention_errors_total`, `iot_audit_write_errors_total`, `iot_commands_pending`, `iot_commands_expired_total`, `iot_command_ack_dropped_total`, `iot_command_ack_invalid_total`, `iot_command_ack_storage_errors_total`, `iot_command_publish_errors_total`, `iot_command_storage_errors_total`, `iot_command_dispatch_wake_dropped_total`, `iot_ws_clients`, `iot_ws_dropped_total`.
 - Không dùng device ID làm label.
 
 ### 4.8. WebSocket
@@ -1107,6 +1110,7 @@ format = "json"
 - Validate toàn bộ trước khi mở DB/listener; lỗi in tất cả path + lý do, exit 3.
 - `check` không sửa DB/file; chỉ đọc config + env + kiểm tra path syntax/quyền đọc.
 - `run`/`migrate`/`admin create` lấy exclusive lock `<data_dir>/.lock`; không được thì exit 5. Lock giữ đến khi process thoát.
+- `run` có thể đọc config trước lock để xác định `data_dir`; sau khi lấy lock phải nạp lại và validate `conf.toml` + `runtime.toml` trước logging/listener/worker. Nếu `data_dir` sau khi nạp lại khác thư mục đang lock, startup lỗi config; revision runtime hiệu lực luôn lấy từ lần đọc dưới lock.
 - Không watch file; sửa `conf.toml` cần restart.
 
 ### 5.4. `runtime.toml`
@@ -1127,7 +1131,7 @@ flush_interval_ms = 500
 - `revision` bắt buộc nếu file tồn tại; integer ≥ 0; file thiếu → revision 0, không override.
 - File tồn tại nhưng parse/validate lỗi → startup fail (exit 3), không bỏ qua.
 - Không chứa secret, không chứa `database`, `mqtt`, `http`, `server`, `auth`.
-- Ghi atomic: temp cùng thư mục → fsync file → rename → fsync thư mục. Lỗi giữ file cũ.
+- Ghi atomic: tạo parent directory mới từ ngoài vào trong → mỗi lần update fsync chuỗi ancestor của parent từ ngoài vào trong (kể cả directory đã tồn tại) → temp cùng thư mục → fsync file → rename → mở/fsync thư mục. Lỗi trước rename giữ file/snapshot cũ; lỗi mở/fsync thư mục sau rename giữ file mới + snapshot mới trong process và báo `config_write_failed` với durability uncertain như §4.6. Không tuyên bố file cũ còn nguyên sau rename.
 - Revision tăng 1 mỗi lần ghi; không reuse/giảm.
 - PATCH validate **toàn bộ** snapshot sau merge, không chỉ field thay đổi.
 

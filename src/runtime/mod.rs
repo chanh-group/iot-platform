@@ -1,6 +1,7 @@
 //! Startup, supervisor, shutdown, and the data dir lock.
 
 pub mod data_dir_lock;
+pub mod retention;
 pub mod shutdown;
 pub mod supervisor;
 

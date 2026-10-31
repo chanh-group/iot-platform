@@ -4,6 +4,7 @@ pub mod api_error;
 pub mod assets;
 pub mod auth;
 pub mod commands;
+pub mod config;
 pub mod devices;
 pub mod events;
 pub mod metrics;

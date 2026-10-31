@@ -98,10 +98,11 @@ pub fn load_with_env(
         }
     }
 
-    let mut revision = 0;
-    if runtime_inside_data_dir {
-        revision = runtime::apply_file(&runtime_path, &mut config)?;
-    }
+    let (revision, overlay) = if runtime_inside_data_dir {
+        runtime::apply_file(&runtime_path, &mut config)?
+    } else {
+        (0, runtime::RuntimeFile::default())
+    };
 
     errors.extend(validate::validate(&config));
     if !errors.is_empty() {
@@ -112,6 +113,8 @@ pub fn load_with_env(
         ConfigError::Invalid(vec!["database: url could not be resolved".to_owned()])
     })?;
 
+    let runtime_config =
+        runtime::RuntimeConfigStore::new(runtime_path.clone(), config.clone(), revision, overlay);
     Ok(LoadedConfig {
         config,
         data_dir,
@@ -119,5 +122,6 @@ pub fn load_with_env(
         runtime_settings_path: runtime_path,
         metrics_token,
         revision,
+        runtime_config,
     })
 }

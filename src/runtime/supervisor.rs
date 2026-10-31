@@ -14,7 +14,7 @@ use tokio::signal::unix::{self, SignalKind};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::LoadedConfig;
+use crate::config::{self, LoadedConfig};
 use crate::core::command::spawn_dispatcher;
 use crate::core::events::EventBus;
 use crate::core::presence::Presence;
@@ -23,25 +23,43 @@ use crate::http::{AppState, ServiceReadiness, router};
 use crate::mqtt::server::MqttServer;
 use crate::observability::logging;
 use crate::runtime::data_dir_lock::DataDirLock;
-use crate::runtime::{EXIT_LOCK, EXIT_MIGRATION, EXIT_RUNTIME, shutdown};
+use crate::runtime::retention;
+use crate::runtime::{EXIT_CONFIG, EXIT_LOCK, EXIT_MIGRATION, EXIT_RUNTIME, shutdown};
 use crate::storage::sqlite::commands::SqliteCommandRepository;
 use crate::storage::sqlite::telemetry::SqliteTelemetryRepository;
 use crate::storage::sqlite::{migrate, pool};
 
 /// Runs the server until SIGINT/SIGTERM, then drains HTTP within the deadline.
 pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
+    #[cfg(debug_assertions)]
+    pause_before_data_dir_lock_for_test().await;
+
+    let locked_data_dir = loaded.data_dir.clone();
+    let lock = match DataDirLock::try_new(&loaded.data_dir) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("iot-server: cannot acquire data dir lock: {error}");
+            return ExitCode::from(EXIT_LOCK);
+        }
+    };
+
+    let loaded = match config::load(config_path) {
+        Ok(loaded) if loaded.data_dir == locked_data_dir => loaded,
+        Ok(_) => {
+            eprintln!(
+                "iot-server: server.data_dir changed while acquiring its lock; retry startup"
+            );
+            return ExitCode::from(EXIT_CONFIG);
+        }
+        Err(error) => {
+            eprintln!("iot-server: cannot reload config under data dir lock: {error}");
+            return ExitCode::from(EXIT_CONFIG);
+        }
+    };
     if let Err(error) = logging::init(&loaded) {
         eprintln!("iot-server: cannot initialize logging: {error}");
         return ExitCode::FAILURE;
     }
-
-    let lock = match DataDirLock::try_new(&loaded.data_dir) {
-        Ok(lock) => lock,
-        Err(error) => {
-            tracing::error!(%error, "cannot acquire data dir lock");
-            return ExitCode::from(EXIT_LOCK);
-        }
-    };
 
     let pool = match pool::connect(&loaded).await {
         Ok(pool) => pool,
@@ -73,9 +91,8 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
         Arc::new(SqliteTelemetryRepository::new(pool.clone())),
         events.clone(),
         telemetry_config.queue_capacity as usize,
-        telemetry_config.batch_size as usize,
         telemetry_config.max_batch_bytes as usize,
-        Duration::from_millis(telemetry_config.flush_interval_ms),
+        loaded.runtime_config.clone(),
         telemetry::IngestWorkerControl {
             cancellation: telemetry_cancel.clone(),
             readiness: Arc::clone(&telemetry_ready),
@@ -157,6 +174,12 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
         presence,
         mqtt.control(),
     );
+    let retention_cancel = CancellationToken::new();
+    let mut retention_task = retention::spawn(
+        pool.clone(),
+        state.config.runtime_config.clone(),
+        retention_cancel.clone(),
+    );
     let app = router::build(state.clone());
 
     let cancel = CancellationToken::new();
@@ -174,6 +197,7 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
         Ok(signal) => signal,
         Err(error) => {
             tracing::error!(%error, "cannot listen for SIGTERM");
+            stop_retention_worker(&mut retention_task, &retention_cancel, shutdown_timeout).await;
             command_cancel.cancel();
             command_task.abort();
             let _ = command_task.await;
@@ -190,6 +214,7 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
         Ok(signal) => signal,
         Err(error) => {
             tracing::error!(%error, "cannot listen for SIGINT");
+            stop_retention_worker(&mut retention_task, &retention_cancel, shutdown_timeout).await;
             command_cancel.cancel();
             command_task.abort();
             let _ = command_task.await;
@@ -218,15 +243,35 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
         process::exit(i32::from(EXIT_RUNTIME));
     });
 
-    match wait_for_exit(
-        &mut server,
-        mqtt.wait(),
-        &mut ingest_task,
-        &mut command_task,
-        &mut signal_rx,
-    )
-    .await
-    {
+    let task_exit = loop {
+        match wait_for_exit(
+            &mut server,
+            mqtt.wait(),
+            &mut ingest_task,
+            &mut command_task,
+            &mut retention_task,
+            &mut signal_rx,
+        )
+        .await
+        {
+            TaskExit::Retention(result) => {
+                match result {
+                    Ok(()) => tracing::warn!("retention task stopped unexpectedly"),
+                    Err(error) => tracing::error!(%error, "retention task failed"),
+                }
+                crate::observability::metrics::Metrics::global()
+                    .telemetry_retention_errors_total
+                    .inc();
+                retention_task = retention::spawn(
+                    pool.clone(),
+                    state.config.runtime_config.clone(),
+                    retention_cancel.clone(),
+                );
+            }
+            exit => break exit,
+        }
+    };
+    match task_exit {
         TaskExit::Signal => {}
         TaskExit::Http(result) => {
             match result {
@@ -235,6 +280,12 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
                 Err(error) => tracing::error!(%error, "http server task panicked"),
             }
             let deadline = Instant::now() + shutdown_timeout;
+            stop_retention_worker(
+                &mut retention_task,
+                &retention_cancel,
+                shutdown_remaining(deadline),
+            )
+            .await;
             stop_command_worker(
                 &mut command_task,
                 &command_cancel,
@@ -259,6 +310,12 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
                 Err(error) => tracing::error!(%error, "mqtt listener failed"),
             }
             let deadline = Instant::now() + shutdown_timeout;
+            stop_retention_worker(
+                &mut retention_task,
+                &retention_cancel,
+                shutdown_remaining(deadline),
+            )
+            .await;
             stop_command_worker(
                 &mut command_task,
                 &command_cancel,
@@ -285,6 +342,12 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
         TaskExit::Telemetry(result) => {
             let deadline = Instant::now() + shutdown_timeout;
             command_cancel.cancel();
+            stop_retention_worker(
+                &mut retention_task,
+                &retention_cancel,
+                shutdown_remaining(deadline),
+            )
+            .await;
             telemetry_cancel.cancel();
             let exit = shutdown_after_telemetry_worker_exit(
                 &state.telemetry_ready,
@@ -314,6 +377,12 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
             }
             let deadline = Instant::now() + shutdown_timeout;
             command_cancel.cancel();
+            stop_retention_worker(
+                &mut retention_task,
+                &retention_cancel,
+                shutdown_remaining(deadline),
+            )
+            .await;
             telemetry_cancel.cancel();
             drop(ingest);
             if tokio::time::timeout(shutdown_remaining(deadline), &mut ingest_task)
@@ -329,10 +398,20 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
             drop(lock);
             return ExitCode::FAILURE;
         }
+        TaskExit::Retention(_) => {
+            tracing::error!("retention task escaped its supervisor restart loop");
+            return ExitCode::FAILURE;
+        }
     }
 
     let deadline = Instant::now() + shutdown_timeout;
     command_cancel.cancel();
+    let retention_stopped = stop_retention_worker(
+        &mut retention_task,
+        &retention_cancel,
+        shutdown_remaining(deadline),
+    )
+    .await;
     let command_stopped = stop_command_worker(
         &mut command_task,
         &command_cancel,
@@ -363,29 +442,49 @@ pub async fn run(config_path: &Path, loaded: LoadedConfig) -> ExitCode {
     match (
         outcome,
         command_stopped,
+        retention_stopped,
         mqtt_workers_stopped,
         telemetry_stopped,
     ) {
-        (Ok(()), true, true, true) => {
+        (Ok(()), true, true, true, true) => {
             logging::shutdown("signal");
             ExitCode::SUCCESS
         }
-        (Err(error), _, _, _) => {
+        (Err(error), _, _, _, _) => {
             tracing::error!(%error, "shutdown failed");
             ExitCode::FAILURE
         }
-        (_, false, _, _) => {
+        (_, _, false, _, _) => {
+            tracing::error!("retention worker did not stop before shutdown deadline");
+            ExitCode::FAILURE
+        }
+        (_, false, _, _, _) => {
             tracing::error!("command dispatcher did not stop before shutdown deadline");
             ExitCode::FAILURE
         }
-        (_, _, false, _) => {
+        (_, _, _, false, _) => {
             tracing::error!("MQTT workers did not drain before shutdown deadline");
             ExitCode::FAILURE
         }
-        (_, _, _, false) => {
+        (_, _, _, _, false) => {
             tracing::error!("telemetry worker did not drain before shutdown deadline");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(debug_assertions)]
+async fn pause_before_data_dir_lock_for_test() {
+    let Some(marker) = std::env::var_os("IOT_TEST_PAUSE_BEFORE_DATA_DIR_LOCK") else {
+        return;
+    };
+    let marker = std::path::PathBuf::from(marker);
+    if let Err(error) = std::fs::write(&marker, b"paused") {
+        eprintln!("iot-server: cannot create test startup marker: {error}");
+        return;
+    }
+    while marker.exists() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -405,6 +504,7 @@ enum TaskExit {
     Mqtt(anyhow::Result<()>),
     Telemetry(Result<(), tokio::task::JoinError>),
     Command(Result<(), tokio::task::JoinError>),
+    Retention(Result<(), tokio::task::JoinError>),
 }
 
 async fn wait_for_exit<MqttExit>(
@@ -412,6 +512,7 @@ async fn wait_for_exit<MqttExit>(
     mqtt: MqttExit,
     ingest_task: &mut tokio::task::JoinHandle<()>,
     command_task: &mut tokio::task::JoinHandle<()>,
+    retention_task: &mut tokio::task::JoinHandle<()>,
     signal_rx: &mut mpsc::Receiver<()>,
 ) -> TaskExit
 where
@@ -424,6 +525,27 @@ where
         result = mqtt => TaskExit::Mqtt(result),
         result = &mut *ingest_task => TaskExit::Telemetry(result),
         result = &mut *command_task => TaskExit::Command(result),
+        result = &mut *retention_task => TaskExit::Retention(result),
+    }
+}
+
+async fn stop_retention_worker(
+    task: &mut tokio::task::JoinHandle<()>,
+    cancel: &CancellationToken,
+    timeout: Duration,
+) -> bool {
+    cancel.cancel();
+    match tokio::time::timeout(timeout, &mut *task).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            tracing::error!(%error, "retention task failed during shutdown");
+            false
+        }
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            false
+        }
     }
 }
 
@@ -488,6 +610,7 @@ mod tests {
         });
         let mut ingest_task = tokio::spawn(async {});
         let mut command_task = tokio::spawn(std::future::pending::<()>());
+        let mut retention_task = tokio::spawn(std::future::pending::<()>());
         let (_signal_tx, mut signal_rx) = mpsc::channel(1);
         let mqtt_exit = std::future::pending::<anyhow::Result<()>>();
 
@@ -496,6 +619,7 @@ mod tests {
             mqtt_exit,
             &mut ingest_task,
             &mut command_task,
+            &mut retention_task,
             &mut signal_rx,
         )
         .await;
@@ -519,6 +643,7 @@ mod tests {
         assert!(mqtt_stopped.load(Ordering::Acquire));
         assert!(http_stopped.load(Ordering::Acquire));
         assert!(!http_readiness.load(Ordering::Acquire));
+        retention_task.abort();
     }
 
     #[tokio::test]
@@ -527,6 +652,7 @@ mod tests {
         let mqtt_exit = std::future::pending::<anyhow::Result<()>>();
         let mut ingest_task = tokio::spawn(std::future::pending::<()>());
         let mut command_task = tokio::spawn(async {});
+        let mut retention_task = tokio::spawn(std::future::pending::<()>());
         let (_signal_tx, mut signal_rx) = mpsc::channel(1);
 
         let exit = wait_for_exit(
@@ -534,12 +660,14 @@ mod tests {
             mqtt_exit,
             &mut ingest_task,
             &mut command_task,
+            &mut retention_task,
             &mut signal_rx,
         )
         .await;
         assert!(matches!(exit, TaskExit::Command(Ok(()))));
         server.abort();
         ingest_task.abort();
+        retention_task.abort();
     }
 
     #[tokio::test]
@@ -569,6 +697,7 @@ mod tests {
             let mut http = tokio::spawn(std::future::pending::<io::Result<()>>());
             let mut ingest = tokio::spawn(std::future::pending::<()>());
             let mut command = tokio::spawn(std::future::pending::<()>());
+            let mut retention_task = tokio::spawn(std::future::pending::<()>());
             let (_signal_tx, mut signal_rx) = mpsc::channel(1);
             let exit = tokio::time::timeout(
                 Duration::from_secs(2),
@@ -577,6 +706,7 @@ mod tests {
                     mqtt.wait(),
                     &mut ingest,
                     &mut command,
+                    &mut retention_task,
                     &mut signal_rx,
                 ),
             )
@@ -591,6 +721,7 @@ mod tests {
             http.abort();
             ingest.abort();
             command.abort();
+            retention_task.abort();
         }
     }
 }
