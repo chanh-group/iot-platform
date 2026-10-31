@@ -173,6 +173,8 @@ Nếu gate fail: không sang Phase 2; ghi lỗi vào `docs/todos/TODO_1.md` và 
 - Docker, backup, load test, security suite (Phase 4).
 - PostgreSQL/MySQL (Phase 5).
 
+> Đây là kế hoạch Phase 1 ban đầu; framework dashboard hiện tại được đổi theo ADR-007 trong `docs/plans/01-stack-and-architecture.md`.
+
 ## 14. Commit
 
 - [x] Commit theo từng nhóm task; mỗi commit build/test được.

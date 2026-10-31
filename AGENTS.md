@@ -47,7 +47,7 @@ Nếu crate spike không nằm trong workspace root, chạy các lệnh trên tr
 - Không dùng `unbounded_channel` cho dữ liệu nghiệp vụ.
 - Không log token, password, payload telemetry, database URL đầy đủ.
 - Giữ hướng phụ thuộc: `core` không import `axum`/`rmqtt`/`sqlx`; adapter map sang domain type.
-- Pin exact cho `rmqtt`, `sqlx`, `axum`, `svelte`, `vite`. Commit `Cargo.lock` (và `package-lock.json` khi có `web/`).
+- Pin exact cho `rmqtt`, `sqlx`, `axum`, `solid-js`, `vite-plugin-solid`, `vite`. Commit `Cargo.lock` (và `web/bun.lock` khi có `web/`).
 - Không thêm dependency ngoài danh sách `01` nếu chưa ghi lý do.
 - Comment chỉ để giải thích "vì sao"; shortcut có giới hạn dùng `shortcut: <giới hạn>, <khi nào nâng cấp>`.
 

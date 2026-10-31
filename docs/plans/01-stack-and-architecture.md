@@ -1,7 +1,7 @@
 # 01 — Stack và kiến trúc đã chốt
 
 - Trạng thái: **CHỐT cho MVP**. Thay đổi phải có ADR mới trong tài liệu này.
-- Mục tiêu: một binary `iot-server`, một process, cấu hình `conf.toml`, SQLite mặc định, không cần broker hay Node.js bên ngoài.
+- Mục tiêu: một binary `iot-server`, một process, cấu hình `conf.toml`, SQLite mặc định, không cần broker hay runtime JavaScript bên ngoài khi chạy.
 
 ## 1. Nguyên tắc kiến trúc
 
@@ -15,7 +15,7 @@
 
 ## 2. Stack và version
 
-Các version dưới đây là version đã kiểm tra tại thời điểm lập kế hoạch (2026-10-28). `Cargo.lock` và `package-lock.json` phải được commit.
+Các version dưới đây là version đã kiểm tra tại thời điểm lập kế hoạch (2026-10-28), trừ Bun được chọn sau theo ADR-006. `Cargo.lock` và `web/bun.lock` phải được commit.
 
 | Thành phần | Lựa chọn | Version | Vai trò / ghi chú |
 | --- | --- | --- | --- |
@@ -41,11 +41,11 @@ Các version dưới đây là version đã kiểm tra tại thời điểm lậ
 | Trait async | `async-trait` | 0.1.92 | repository/port object-safe |
 | Error | `thiserror` / `anyhow` | 2.0.21 / 1.0.104 | lỗi domain/API; lỗi CLI/bootstrap |
 | Password prompt | `rpassword` | 7.5.4 | `admin create` không nhận password qua argv |
-| Frontend | `svelte` | 5.57.3 | SPA, runes |
-| Build frontend | `vite` / `@sveltejs/vite-plugin-svelte` | 8.3.5 / 7.3.1 | build `web/dist` |
-| Type check | `typescript` / `svelte-check` | 7.0.2 / 4.7.7 | strict mode |
+| Frontend | `solid-js` | 1.9.18 | SolidJS SPA, fine-grained signals |
+| Build frontend | `vite` / `vite-plugin-solid` | 8.3.5 / 2.11.15 | build `web/dist`; plugin peer ranges include Vite 8 and Solid 1 |
+| Type check | `typescript` | 7.0.2 | strict mode; `tsc --noEmit` |
 | Chart | `uplot` | 1.6.32 | time-series nhẹ, không cần framework chart |
-| Node build | Node.js | 24 LTS | chỉ dùng trong CI/Docker build, không dùng runtime |
+| Frontend build | Bun | 1.4.2 | runtime và package manager cho build/CI; native install/test/build verified in sprint 8.1 |
 
 ### Dev-only
 
@@ -132,6 +132,8 @@ Nếu spike fail: dừng triển khai, mở ADR mới và chọn lại **một b
 
 ## 4. ADR-002 — Frontend: Svelte SPA + uPlot
 
+> Historical decision, superseded for the current frontend by ADR-007. Kept to preserve the original stack decision.
+
 ### Quyết định
 
 - **Svelte 5 + Vite 8 + TypeScript strict**, build ra `web/dist`.
@@ -155,6 +157,19 @@ Nếu spike fail: dừng triển khai, mở ADR mới và chọn lại **một b
 | SvelteKit SSR | Cần Node runtime hoặc adapter; không cần SEO/SSR |
 | Leptos/WASM toàn bộ | Tăng độ phức tạp Rust/WASM; SPEC định hướng TypeScript |
 | ECharts | Mạnh nhưng nặng; MVP không cần dashboard builder |
+
+### ADR-006 — Bun native cho frontend build
+
+- Thay Node.js/npm bằng Bun 1.4.2 làm runtime và package manager cho frontend; tại thời điểm ADR, giữ nguyên các version Svelte/Vite/TypeScript/uPlot đã chốt.
+- Dùng `web/bun.lock`, `bun install --frozen-lockfile` và `bun run --bun` để chạy script bằng Bun kể cả khi CLI có Node shebang. CI và Docker dùng cùng version Bun; không cần `.nvmrc` hoặc `package-lock.json`.
+- Compatibility was initially a Section 8 verification item; SolidJS compatibility evidence belongs to the later framework change in ADR-007.
+
+### ADR-007 — SolidJS thay Svelte cho frontend
+
+- Thay Svelte bằng SolidJS **1.9.18**, stable Solid 1.x; dùng `vite-plugin-solid` **2.11.15**. Metadata package công bố peer range gồm `solid-js ^1.7.2` và Vite `^8.0.0`.
+- Giữ Vite **8.3.5**, TypeScript **7.0.2** strict và Bun **1.4.2**. Peer metadata xác nhận plugin hỗ trợ Solid 1 và Vite 8; frozen install, strict check, frontend tests và build được ghi ở `docs/todos/TODO_3.md` §8. Đây không phải bằng chứng cho UI↔Rust API/MQTT end-to-end hoặc A20; các gate đó vẫn để mở.
+- Giữ SPA client-only với Vite; không SolidStart/SSR, router, state library, UI framework hoặc chart library mới. Dùng lifecycle cleanup của Solid và native accessible controls.
+- ADR này thay lựa chọn framework trong ADR-002; HTTP/API/session contract không đổi.
 
 ## 5. ADR-003 — Storage: SQLx + SQLite WAL
 
@@ -291,7 +306,7 @@ src/
   http/                   # Axum router, auth, devices, telemetry, commands, config, ws, assets
   observability/          # logging, metrics, request id
 migrations/sqlite/        # SQLx migrations
-web/                      # Svelte source, dist build
+web/                      # SolidJS source, dist build
 deploy/                   # Dockerfile, compose, config mẫu
 tests/                    # integration, protocol, crash, e2e
 ```
@@ -351,7 +366,7 @@ core -> không import axum/rmqtt/sqlx
 | SQLite write contention | Trung bình | Một telemetry writer; transaction ngắn; WAL; busy timeout |
 | Presence/`last_seen_at` ghi inline trong MQTT hook | Thấp (MVP) | DB chậm chỉ làm chậm hook/CONNACK của client đó; log + metric khi lỗi, không đổi readiness. Đo connect/CONNACK p95 và hook backlog ở Phase 4; chuyển sang channel khi xấu. |
 | Latest query chậm | Trung bình | Index; benchmark; chỉ thêm projection khi có số liệu |
-| Frontend version mới (Svelte 5/Vite 8/TS 7) | Thấp | Pin lockfile; `svelte-check`; build trong CI |
+| Frontend version mới (SolidJS 1/Vite 8/TS 7) | Thấp | Pin lockfile; strict TypeScript check; build trong CI |
 | Không có số liệu throughput | Cao | Không cam kết số; load test Phase 4/5 ghi hardware/rõ điều kiện |
 | Proxy TLS cấu hình sai | Trung bình | Compose/docs mẫu; checklist production; cookie secure |
 | Rò secret qua log/API | Cao | Redaction test; audit; không log payload; review |
@@ -363,7 +378,7 @@ core -> không import axum/rmqtt/sqlx
 | Broker library | RMQTT 0.24.0, library mode, feature `retain` |
 | Session/retained qua restart | Không cam kết; session/retained trong RAM; telemetry/command đã commit bền trong SQL |
 | TLS tích hợp | Không; dùng reverse proxy/TLS proxy, tài liệu hóa |
-| Frontend framework/chart | Svelte 5 + Vite 8 + TypeScript 7 + uPlot |
+| Frontend framework/chart | SolidJS 1 + Vite 8 + TypeScript 7 + uPlot |
 | Phần cứng/hiệu năng | Chưa cam kết; baseline test 4 vCPU/8 GB/1000 connection; công bố sau benchmark |
 | Command/audit retention | MVP giữ vô thời hạn; telemetry mặc định 30 ngày; session hết hạn + 7 ngày; review sau load test |
 | Retained/session limit | 10.000 retained / 16 MiB; session expiry tối đa 1h; 8 subscription/client; 32 inflight; 256 queue/client |
@@ -373,9 +388,9 @@ core -> không import axum/rmqtt/sqlx
 
 ## 13. Chính sách version
 
-- Commit `Cargo.lock`, `web/package-lock.json`, `rust-toolchain.toml`, `.nvmrc` (Node 24).
-- Pin exact cho `rmqtt`, `sqlx`, `axum`, `svelte`, `vite`; các crate 1.x dùng semver range và khóa bằng lockfile.
-- Nâng version theo lô tháng; chạy `cargo test`, protocol suite, `svelte-check`, Docker smoke.
+- Commit `Cargo.lock`, `web/bun.lock`, `rust-toolchain.toml`; pin Bun 1.4.2 nhất quán trong CI/Docker.
+- Pin exact cho `rmqtt`, `sqlx`, `axum`, `solid-js`, `vite-plugin-solid`, `vite`; các crate 1.x dùng semver range và khóa bằng lockfile.
+- Nâng version theo lô tháng; chạy `cargo test`, protocol suite, strict TypeScript check, Docker smoke.
 - `cargo deny` cho license/duplicate; `cargo audit` cho advisory. Release chỉ chấp nhận vulnerability exception có owner, lý do, mitigation và ngày hết hạn.
 - Release tạo SBOM từ lockfile và image, quét dependency + OS image, rồi ký image và provenance/checksum. Artifact SBOM, kết quả scan và chữ ký/provenance phải lưu cùng release.
 - Không dùng git dependency trong release.

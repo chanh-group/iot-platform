@@ -22,7 +22,7 @@ Xây dựng một IoT platform thu gọn bằng Rust, lấy cảm hứng từ m�
 - Tạo, xem, cập nhật, vô hiệu hóa thiết bị và xoay vòng credential.
 - Nhận telemetry JSON, lưu SQLite, truy vấn lịch sử và xem realtime.
 - Gửi lệnh có `command_id`, theo dõi xác nhận từ thiết bị.
-- Dashboard nhúng trong binary, không cần Node.js khi chạy.
+- Dashboard nhúng trong binary, không cần runtime JavaScript khi chạy.
 - Cấu hình TOML, kiểm tra trước khởi động và cập nhật runtime có revision.
 - Log có cấu trúc, health/readiness, graceful shutdown, Docker image.
 

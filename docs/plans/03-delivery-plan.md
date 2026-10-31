@@ -133,8 +133,8 @@ Nếu fail: dừng, cập nhật ADR-001 và `02` §9. Không tự viết broker
 | P3-06 | Runtime config store + PATCH atomic + apply hot fields | `src/config/runtime.rs`, `src/http/config.rs` | P1-04, P1-11 | T-A12/A13 |
 | P3-07 | Audit events + redaction; gắn vào mutation | `src/core/audit.rs`, `src/storage/sqlite/audit.rs` | P3-01..P3-06 | `tests/audit.rs` (real MQTT/WS sentinel with test subscriber at INFO; context/details/update rollback), `src/observability/logging.rs` (synthetic RMQTT/WebSocket target filters and warn/error reload), `tests/device_api.rs`, `tests/credential_rotate.rs`, `tests/command_api.rs` (mutation rollback/replay), `tests/runtime_config.rs` (post-publish audit failure/cancel); no real-protocol DEBUG/TRACE evidence |
 | P3-08 | Overview endpoint + WS command/presence/config/system/reported_status + metrics | `src/http/overview.rs`, `src/core/events.rs`, `src/http/events.rs`, `src/observability/metrics.rs` | P3-04, P3-06 | `tests/overview.rs`, `tests/ws_events.rs`, `tests/metrics.rs` |
-| P3-09 | Frontend shell: login, overview, devices, device detail, chart, commands, config | `web/src/*`, `web/package.json`, `web/vite.config.ts` | P3-01..P3-08 | `npm run check`, `npm run build` |
-| P3-10 | uPlot telemetry chart: range picker, key selector, latest; REST refetch | `web/src/lib/TelemetryChart.svelte` | P3-09, P2-10 | manual checklist |
+| P3-09 | SolidJS frontend shell: login, overview, devices, device detail, chart, commands, config | `web/src/*`, `web/package.json`, `web/vite.config.ts` | P3-01..P3-08 | `bun run --bun typecheck`, `bun run --bun test`, `bun run --bun build` |
+| P3-10 | uPlot telemetry chart: range picker, key selector, latest; REST refetch | `web/src/lib/TelemetryChart.tsx` | P3-09, P2-10 | manual checklist |
 | P3-11 | WS client: subscribe device/overview, reconnect + REST backfill | `web/src/lib/ws.ts` | P3-08 | manual + unit |
 | P3-12 | Asset embed/fallback; cache headers; dashboard=false | `src/http/assets.rs`, `src/http/router.rs` | P3-09 | `tests/assets.rs` |
 
@@ -145,7 +145,7 @@ Nếu fail: dừng, cập nhật ADR-001 và `02` §9. Không tự viết broker
 - runtime `PATCH`: revision conflict 409; field không tồn tại 400 `validation_error`; field tồn tại nhưng cần restart 422 `restart_required`; lỗi trước rename giữ config cũ, lỗi mở/fsync thư mục sau rename báo durability uncertain và config mới đã áp dụng trong process theo `02` §4.6.
 - Credential rotate đóng connection cũ; token cũ không reconnect.
 - Không có secret trong audit/log/response (test redaction).
-- `svelte-check` sạch; build `web/dist` tái lập được.
+- Strict TypeScript check sạch; login dùng native labelled controls và smoke test keyboard Enter. Đánh giá keyboard/accessibility đầy đủ vẫn là gate; build `web/dist` tái lập được.
 
 ## 7. Phase 4 — Tin cậy, bảo mật, đóng gói
 
@@ -176,7 +176,7 @@ Nếu fail: dừng, cập nhật ADR-001 và `02` §9. Không tự viết broker
 - Alert rules đã được kiểm thử cho DB/readiness lỗi, disk gần đầy, queue saturation, ingest rejection và backup lỗi; diễn tập restore pass.
 - Mỗi release có SBOM, kết quả scan dependency/OS image và image signature/provenance; không có critical/high vulnerability chưa có exception còn hạn.
 - Không còn `unbounded_channel` cho dữ liệu nghiệp vụ.
-- `cargo fmt --check`, `clippy -D warnings`, toàn bộ test, `svelte-check`, Docker smoke pass.
+- `cargo fmt --check`, `clippy -D warnings`, toàn bộ test, strict TypeScript check, Docker smoke pass.
 
 ## 8. Phase 5 — Backend bổ sung (sau MVP)
 
@@ -251,13 +251,13 @@ GitHub Actions (hoặc CI tương đương), các job song song khi có thể:
 | Job | Bước |
 | --- | --- |
 | `rust` | `cargo fmt --check`; `cargo clippy --all-targets --all-features -- -D warnings`; `cargo test --all` |
-| `frontend` | `npm ci`; `npm run check`; `npm run build`; upload `web/dist` |
+| `frontend` | `bun install --frozen-lockfile`; `bun run --bun typecheck`; `bun run --bun test`; `bun run --bun build`; upload `web/dist` |
 | `integration` | Build web; `cargo test --test mqtt_protocol --test telemetry_flow ...` (SQLite) |
 | `docker` | Build image; chạy container; `/healthz`; recreate volume; chạy A17 smoke |
 | `audit` | `cargo deny check`; `cargo audit`; quét dependency + OS image; advisory chỉ được bỏ qua với exception có owner/expiry |
 | `release` | Tag: build release; tạo SBOM; ký image + provenance/checksum; publish image và lưu artifact |
 
-- Cache Cargo registry/target và npm; cache key theo lockfile.
+- Cache Cargo registry/target và Bun; cache key theo lockfile.
 - Không cần service Postgres/MySQL ở MVP.
 - Build order: frontend trước `cargo build --release` vì `rust-embed`.
 - Artifact: binary Linux x86_64 + image; không commit `web/dist`.
@@ -268,7 +268,7 @@ GitHub Actions (hoặc CI tương đương), các job song song khi có thể:
 ### 11.1. Image
 
 - Multi-stage:
-  1. `node:24-bookworm-slim`: `npm ci && npm run build`.
+  1. `oven/bun:1.4.2`: `bun install --frozen-lockfile && bun run --bun build`.
   2. `rust:1.98-bookworm`: copy web dist + source; `cargo build --release --locked`.
   3. `debian:bookworm-slim`: `ca-certificates`, `curl` (healthcheck), user `iot` UID 10001.
 - Binary `/usr/local/bin/iot-server`; workdir `/app`; config `/app/conf.toml`; data `/app/data`.
@@ -329,7 +329,7 @@ Không cắt: auth, ACL, token rotate, ACK sau commit, retention cap, shutdown, 
 | RMQTT hook/API khác tài liệu | Chặn Phase 2 | Phase 0 bắt buộc; adapter cô lập |
 | Session expiry v3.1.1 không có sẵn | Rò session | Wrapper cleanup + test; ghi ADR |
 | SQLite write contention | Chậm/khóa | Một writer batch; transaction ngắn; WAL |
-| Frontend Svelte 5/Vite 8/TS 7 mới | Build lỗi | Pin lockfile; CI sớm; fallback chart thuần |
+| Frontend SolidJS 1/Vite 8/TS 7 mới | Build lỗi | Pin lockfile; CI sớm; fallback chart thuần |
 | Crash test flaky | Không chứng minh A08 | Test hook pause xác định; chạy nightly |
 | Docker healthcheck thiếu curl | Không probe | Cài curl hoặc bỏ healthcheck, dùng orchestrator |
 | Không có số liệu phần cứng | Không cam kết | Baseline Phase 4; ghi rõ điều kiện |

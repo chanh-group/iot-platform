@@ -1,0 +1,23 @@
+{
+  "name": "thingsboard-rust-dashboard",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "packageManager": "bun@1.4.2",
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "solid-js": "1.9.18",
+    "uplot": "1.6.32"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2",
+    "typescript": "7.0.2",
+    "vite-plugin-solid": "2.11.15",
+    "vite": "8.3.5"
+  }
+}

@@ -680,6 +680,7 @@ Query bắt buộc: `from`, `to` (ms, `from < to`, range ≤ 31 ngày). Tùy ch�
 
 - Sort `(ts, internal_id)` tăng dần.
 - `keys` lọc values trả về; event không có key nào vẫn có thể xuất hiện với `values:{}`? **Không**: chỉ trả event có ít nhất một key khớp.
+- Lọc khoảng theo event timestamp `ts`, không theo `received_at`; event đến muộn có `ts < from` không được trả về dù `received_at` nằm trong khoảng.
 - `next_cursor` null khi hết.
 - 404 device; 400 `validation_error`/`invalid_cursor`.
 
@@ -886,6 +887,7 @@ Client gửi (tối đa 4 096 byte):
 - Queue mỗi client `http.ws_queue_capacity` (256); đầy → đóng 1013 `slow_consumer`; client reconnect và REST refetch.
 - Tối đa `http.max_ws_connections` kết nối; vượt → HTTP 503 trước upgrade.
 - Không replay; không đảm bảo thứ tự giữa các loại event.
+- REST refetch telemetry sau reconnect chỉ truy vấn theo event-time range; không thể chứng minh đã khôi phục mọi event bị lỡ vì event đến muộn có thể có `ts` trước lower bound dù `received_at` mới hơn. Client phải trình bày kết quả có giới hạn mà không tuyên bố đã đồng bộ đầy đủ.
 
 Envelope event:
 

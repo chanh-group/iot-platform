@@ -23,7 +23,7 @@
 | Database | SQLx 0.9 + SQLite WAL; PostgreSQL/MySQL sau MVP |
 | CLI | Clap 4.6 |
 | Config | Serde + TOML 1.1; precedence default → `conf.toml` → `runtime.toml` |
-| Frontend | Svelte 5.57 + Vite 8.3 + TypeScript 7.0 + uPlot 1.6; nhúng bằng `rust-embed` |
+| Frontend | SolidJS 1.9 + Vite 8.3 + TypeScript 7.0 + uPlot 1.6; Bun 1.4 native; nhúng bằng `rust-embed` |
 | Auth admin | Argon2id; session cookie HttpOnly/SameSite=Strict |
 | Auth thiết bị | Token 32 byte ngẫu nhiên, lưu SHA-256; một credential active/thiết bị |
 | TLS | MVP dùng reverse proxy cho HTTPS và MQTT TLS; TLS tích hợp sau MVP |

@@ -3,6 +3,8 @@ TODO dựa trên contract hiện tại; mọi khác biệt RMQTT phải cập nh
 
 Mục tiêu: hoàn thành luồng **device → MQTT 3.1.1 → validate → SQLite commit → application ACK → REST/WebSocket** với ACL kín và tài nguyên hữu hạn. Phase này đạt A03, A05–A07 và matrix A19; A04 phải pass ở unit + integration. **Chưa làm** device CRUD/rotate credential, command, runtime PATCH, dashboard Svelte, Docker hay crash/shutdown gate đầy đủ — chúng thuộc Phase 3/4.
 
+> Đây là hồ sơ kế hoạch Phase 2 ban đầu; framework frontend hiện tại được đổi theo ADR-007 trong `docs/plans/01-stack-and-architecture.md`.
+
 Nguồn sự thật:
 
 - `docs/plans/01-stack-and-architecture.md` — RMQTT 0.24.0, kiến trúc adapter/core, bounded channel và ADR.

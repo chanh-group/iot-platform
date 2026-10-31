@@ -110,24 +110,24 @@ Nguồn sự thật:
 
 ## 8. Dashboard và WebSocket client — P3-09, P3-10, P3-11
 
-- [ ] Tạo `web/` Svelte **5.57.3**, Vite **8.3.5**, TypeScript **7.0.2** strict, uPlot **1.6.32**, các tool còn lại theo `01` §2; pin exact Svelte/Vite, commit `web/package-lock.json` và `.nvmrc` Node 24. Không đổi version nếu chưa có ADR.
-- [ ] SPA dùng tab state overview/devices/device detail/config; reload về overview. Không SvelteKit/SSR, UI framework, router/state library hoặc chart library khác.
-- [ ] API client same-origin cookie; JSON mutation có `X-IoT-CSRF: 1`; xử lý error envelope/request_id, 401 về login, loading/empty/error/disabled states. Không lưu session/device token trong localStorage hoặc log console.
-- [ ] Login/logout/me; overview hiển thị online, số liệu command/ingest, cảnh báo storage unavailable. Có label input, điều khiển được bằng bàn phím và thông báo lỗi dễ đọc; không bỏ qua accessibility warnings.
-- [ ] Device list search/filter/pagination, create/get/edit metadata/name, enable/disable/rotate. Token mới chỉ hiện trong kết quả thao tác và bị xóa khỏi state khi đóng; cảnh báo không thể xem lại, không tự gửi lại rotate/create chỉ vì timeout.
-- [ ] Device detail: trạng thái kết nối/last_seen, attributes latest, telemetry latest/history theo khoảng và key; command create/list/detail/status/result. Không thêm dashboard builder hoặc API quản trị attributes.
-- [ ] uPlot chỉ vẽ numeric values, đổi Unix ms sang đơn vị trục thời gian phù hợp; boolean/string vẫn hiển thị ở latest/detail. Xử lý timestamp trùng, dữ liệu rỗng, pagination và range ≤31 ngày; không tự aggregation/downsampling ngoài contract.
-- [ ] WS client subscribe/unsubscribe theo tab/device, reconnect có backoff, không mở socket/timer vô hạn; reconnect REST refetch/backfill telemetry và command/overview/config cần thiết. Không coi WS có replay; chống event trùng hoặc response cũ ghi đè device/range mới.
-- [ ] Hủy request/subscription/timer/socket/chart khi đổi view/logout/unmount; không gửi command đã hết TTL hoặc đổi command ID để xử lý resend phía device.
-- [ ] `npm run check` chạy svelte-check; `npm run build` tái lập được từ `npm ci`. Logic TS không trivial có unit test/assert-based self-check chạy được; không thêm test framework chỉ cho một helper nếu công cụ hiện có đáp ứng.
-- [ ] Evidence frontend: kiểm tra login → tạo device → MQTT telemetry → chart/latest → command/ACK → disable/rotate → runtime PATCH → reconnect REST backfill, gồm lỗi storage/session hết hạn. Ghi lại cách chạy và kết quả; manual UI không thay thế integration test Rust/MQTT.
+- [x] Tạo `web/` SolidJS **1.9.18**, `vite-plugin-solid` **2.11.15**, Vite **8.3.5**, TypeScript **7.0.2** strict, uPlot **1.6.32**, Bun **1.4.2** native; pin exact frontend versions và tạo `web/bun.lock`. Commit được deferred theo yêu cầu không commit/push. ADR-007 thay Svelte; compatibility evidence phải chạy trước khi tick. Evidence 2026-11-01: frozen install, strict typecheck, tests và build đều pass bằng Bun 1.4.2.
+- [x] SPA dùng tab state overview/devices/device detail/config; reload về overview. Không SolidStart/SSR, UI framework, router/state library hoặc chart library khác. Evidence: `tests/ui-smoke.test.ts` đi qua Devices/Config rồi reload về Overview.
+- [x] API client same-origin cookie; JSON mutation có `X-IoT-CSRF: 1`; xử lý error envelope/request_id, 401 về login, loading/empty/error/disabled states. Không lưu session/device token trong localStorage hoặc log console. Evidence: `tests/api.test.ts` (CSRF, request ID, stale 401, abort, malformed JSON); browser smoke kiểm tra cookie flow và `localStorage` rỗng.
+- [ ] Login/logout/me; overview hiển thị online, số liệu command/ingest, cảnh báo storage unavailable. Có label input, điều khiển được bằng bàn phím và thông báo lỗi dễ đọc; review JSX semantics/ARIA và keyboard operation bằng native controls. Smoke hiện chỉ chứng minh login bằng Enter, overview shell và logout; chưa hoàn tất keyboard/accessibility review và UI error-state flow.
+- [ ] Device list search/filter/pagination, create/get/edit metadata/name, enable/disable/rotate. Token mới chỉ hiện trong kết quả thao tác và bị xóa khỏi state khi đóng; cảnh báo không thể xem lại, không tự gửi lại rotate/create chỉ vì timeout. Frontend đã typecheck/build; backend CRUD/rotation tests pass, nhưng thao tác UI create/edit/disable/rotate chưa được browser-tested.
+- [ ] Device detail: trạng thái kết nối/last_seen, attributes latest, telemetry latest/history theo khoảng và key; command create/list/detail/status/result. Không thêm dashboard builder hoặc API quản trị attributes. UI smoke bao phủ chart/history paging và telemetry realtime; chưa bao phủ attributes, command lifecycle/ACK hoặc command-expiry trên app.
+- [x] uPlot chỉ vẽ numeric values, đổi Unix ms sang đơn vị trục thời gian phù hợp; boolean/string vẫn hiển thị ở latest/detail. Xử lý timestamp trùng, dữ liệu rỗng, pagination và range ≤31 ngày; không tự aggregation/downsampling ngoài contract. Evidence: `tests/chart.test.ts` và browser smoke kiểm tra selected key, duplicate REST/live event, numeric filtering, latest boolean/string, empty-history live chart, fixed range và manual cursor paging.
+- [ ] WS client subscribe/unsubscribe theo tab/device, reconnect có backoff, không mở socket/timer vô hạn; reconnect REST refetch/backfill telemetry và command/overview/config cần thiết. Không coi WS có replay; history lọc theo `ts`, nên backfill bounded không chứng minh đã khôi phục mọi event bị lỡ khi event đến muộn có `ts` trước range. `tests/ws.test.ts` và browser fixture kiểm tra reconnect/subscription, refresh scope, 5 trang tối đa mỗi lần (`limit=200`; fixture trả 1 row/trang), cursor và trạng thái giới hạn; chưa có kiểm chứng UI↔Rust API/MQTT hoặc đầy đủ command/overview/config reconnect (xem dòng 123).
+- [ ] Hủy request/subscription/timer/socket/chart khi đổi view/logout/unmount; không gửi command đã hết TTL hoặc đổi command ID để xử lý resend phía device. `tests/request.test.ts`, `tests/ws.test.ts` và browser fixture xác nhận cancellation/cleanup của request, chart host, subscription và socket; UI chưa có regression command-expiry/ACK nên hành vi command hết TTL chưa được chứng minh.
+- [x] `bun run --bun typecheck` chạy TypeScript `tsc --noEmit` ở strict mode; `bun run --bun test`; `bun run --bun build` tái lập được từ `bun install --frozen-lockfile`. Logic TS không trivial có unit test/assert-based self-check chạy được; không thêm test framework chỉ cho một helper nếu công cụ hiện có đáp ứng. Evidence 2026-11-01: frozen install, strict typecheck, 21 tests/8 files và production build pass với Bun 1.4.2 sau các sửa đổi review.
+- [ ] Evidence frontend: kiểm tra login → tạo device → MQTT telemetry → chart/latest → command/ACK/expiry → disable/rotate → runtime PATCH → reconnect REST backfill, gồm lỗi storage/session hết hạn. `tests/ui-smoke.test.ts` kiểm tra app Solid thật qua in-memory API fixture (chart selection/live/pagination, latest tie REST refetch, scoped WS refresh, config conflict và bounded event-time backfill); không chạy browser end-to-end với Rust API/MQTT, không kiểm tra command ACK/expiry, và không chứng minh đã phục hồi late event có `ts` ngoài range. Backend Rust integration suite pass riêng nhưng không thay thế các evidence UI/backend này.
 
 ## 9. Asset embed và build — P3-12
 
 - [ ] `src/http/assets.rs`/router dùng rust-embed + mime_guess theo stack; build frontend trước Rust release. Debug thiếu dist trả hướng dẫn build, release thiếu dist làm build fail rõ ràng.
 - [ ] `/` và fallback path không thuộc API trả index; asset thật đúng MIME; asset không tồn tại không giả làm JS thành công. Giữ API 404/405 JSON và health/metrics không bị SPA nuốt.
 - [ ] `index.html` no-store; asset tên có hash cache immutable 1 năm. Dashboard=false tắt static nhưng API/MQTT vẫn hoạt động.
-- [ ] `tests/assets.rs`: index/fallback/MIME/cache/asset thiếu/dashboard=false/API isolation; smoke binary release phục vụ bundle mà không cần Node runtime hoặc thư mục source.
+- [ ] `tests/assets.rs`: index/fallback/MIME/cache/asset thiếu/dashboard=false/API isolation; smoke binary release phục vụ bundle mà không cần runtime JavaScript hoặc thư mục source.
 - [ ] Kiểm tra build order/CI frontend nếu đã có workflow; không commit `web/dist`, `node_modules` hoặc thêm Docker/release pipeline Phase 4 vào task này.
 
 ## 10. Kiểm tra cuối Phase 3
@@ -144,9 +144,10 @@ git diff --check
 Khi `web/` đã được thêm, chạy tại `web/`:
 
 ```sh
-npm ci
-npm run check
-npm run build
+bun install --frozen-lockfile
+bun run --bun typecheck
+bun run --bun test
+bun run --bun build
 ```
 
 Sau build frontend, ở repo root:
@@ -166,7 +167,7 @@ Checklist gate (ghi tên test/evidence thực tế khi tick):
 - [ ] Audit đúng transaction/redaction; metrics/config/log/WS không lộ secret; error response không trả SQL/DB URL/stack trace.
 - [ ] Task dispatcher mới được supervise/cancel; readiness không bị báo healthy giả khi task trọng yếu lỗi; queue ACK command và WS hữu hạn.
 - [ ] A03–A07 và A19 Phase 2 không regression; không thay durability, broker/session/retained contract.
-- [ ] Rust fmt/Clippy/tests, frontend check/build, release asset smoke và diff check sạch; task không có evidence vẫn để mở. Không đổi test để che lỗi kết nối không ổn định từng ghi nhận ở Phase 2; lưu reproduction nếu tái xuất hiện.
+- [ ] Rust fmt/Clippy/tests, frontend strict TypeScript check/tests/build, release asset smoke và diff check sạch; task không có evidence vẫn để mở. Không đổi test để che lỗi kết nối không ổn định từng ghi nhận ở Phase 2; lưu reproduction nếu tái xuất hiện.
 - [ ] Chỉ kết luận Phase 3 PASS khi toàn bộ gate trên đạt; chưa claim MVP/release hoặc A01–A17 đầy đủ.
 
 ## 11. Rà Rust style và giữ thay đổi tối thiểu
@@ -189,6 +190,6 @@ Checklist gate (ghi tên test/evidence thực tế khi tick):
 ## 13. Commit và hồ sơ bàn giao
 
 - [ ] Commit nhỏ, mỗi commit build/test được; gợi ý: `feat(device): admin and credential rotation`, `feat(command): lifecycle and dispatcher`, `feat(config): atomic runtime updates`, `feat(http): overview and events`, `feat(web): dashboard and embedded assets`.
-- [ ] Commit Cargo.lock khi dependency thay đổi, web/package-lock.json và .nvmrc; không commit dist/target/node_modules/data/log/token thật. Không chỉnh migration đã chạy để né migration mới.
+- [ ] Commit Cargo.lock khi dependency thay đổi và web/bun.lock; không commit dist/target/node_modules/data/log/token thật. Không chỉnh migration đã chạy để né migration mới.
 - [ ] Rà mọi caller/test/fixture/config/export khi đổi signature hoặc snapshot; giữ regression suite Phase 1/2. Nếu có migration mới, ghi backup/rollback theo delivery plan.
 - [ ] Cập nhật checkbox bằng evidence thực, ghi rõ giới hạn và việc chuyển Phase 4; đối chiếu tài liệu trạng thái hiện hành khi bàn giao, không sửa hồ sơ PASS lịch sử để che phần chưa kiểm chứng.
