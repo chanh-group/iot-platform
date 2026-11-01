@@ -8,3 +8,5 @@ pub mod mqtt;
 pub mod observability;
 pub mod runtime;
 pub mod storage;
+#[cfg(debug_assertions)]
+pub(crate) mod test_hooks;

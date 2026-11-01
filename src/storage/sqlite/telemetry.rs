@@ -37,13 +37,17 @@ pub async fn insert_batch(
     sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
     let result = insert_batch_in_transaction(&mut conn, events).await;
     match result {
-        Ok(outcomes) => match sqlx::query("COMMIT").execute(&mut *conn).await {
-            Ok(_) => Ok(outcomes),
-            Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                Err(error)
+        Ok(outcomes) => {
+            #[cfg(debug_assertions)]
+            crate::test_hooks::pause("IOT_TEST_PAUSE_BEFORE_COMMIT").await;
+            match sqlx::query("COMMIT").execute(&mut *conn).await {
+                Ok(_) => Ok(outcomes),
+                Err(error) => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    Err(error)
+                }
             }
-        },
+        }
         Err(error) => {
             let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
             Err(error)

@@ -193,7 +193,11 @@ async fn run_worker(
         let mut notified_storage_error = false;
         let results = loop {
             match repository.insert_batch(&rows).await {
-                Ok(results) => break results,
+                Ok(results) => {
+                    #[cfg(debug_assertions)]
+                    crate::test_hooks::pause("IOT_TEST_PAUSE_AFTER_COMMIT").await;
+                    break results;
+                }
                 Err(error) => {
                     if readiness.swap(false, Ordering::AcqRel) {
                         events.publish_storage_unavailable();

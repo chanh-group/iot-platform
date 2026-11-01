@@ -54,13 +54,13 @@ Nguồn sự thật:
 
 ## 3. Crash recovery — P4-03
 
-- [ ] Implement hook `IOT_TEST_PAUSE_BEFORE_COMMIT` và `IOT_TEST_PAUSE_AFTER_COMMIT` trong telemetry worker chỉ compile khi `#[cfg(debug_assertions)]`. Hook chờ signal/file sentinel để resume; không dùng trong release.
-- [ ] Test: kill -9 trước commit → restart → thiết bị retry → không mất dữ liệu, không tạo bản trùng trong retention window.
-- [ ] Test: kill -9 sau commit nhưng trước ACK → restart → ACK không đến → thiết bị retry cùng event_id → nhận `duplicate` ACK, không tạo thêm bản ghi.
-- [ ] Test: kill -9 sau commit + ACK → restart → không mất dữ liệu; command pending phục hồi từ SQL.
-- [ ] Dùng binary thật (`cargo build`, không `--release`) với `IOT_TEST_PAUSE_*` env; spawn child, send SIGKILL, restart, verify.
-- [ ] Evidence: `tests/crash_recovery.rs` — ít nhất ba scenario trên; mỗi scenario ghi rõ hook, kill point và assertion.
-- [ ] Đây là A08.
+- [x] Implement hook `IOT_TEST_PAUSE_BEFORE_COMMIT` và `IOT_TEST_PAUSE_AFTER_COMMIT` trong telemetry worker chỉ compile khi `#[cfg(debug_assertions)]`. Hook chờ signal/file sentinel để resume; không dùng trong release.
+- [x] Test: kill -9 trước commit → restart → thiết bị retry → không mất dữ liệu, không tạo bản trùng trong retention window.
+- [x] Test: kill -9 sau commit nhưng trước ACK → restart → ACK không đến → thiết bị retry cùng event_id → nhận `duplicate` ACK, không tạo thêm bản ghi.
+- [x] Test: kill -9 sau commit + ACK → restart → không mất dữ liệu; command pending phục hồi từ SQL.
+- [x] Dùng binary thật (`cargo build`, không `--release`) với `IOT_TEST_PAUSE_*` env; spawn child, send SIGKILL, restart, verify.
+- [x] Evidence 2026-11-02T00:15:12+07:00: `tests/crash_recovery.rs::kill_before_commit_recovers_without_losing_or_duplicating_event`, `::kill_after_commit_before_ack_retries_as_duplicate`, `::kill_after_ack_preserves_telemetry_and_recovers_pending_command` pass. `cargo build`, `cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all` (253 passed, 0 failed across 31 suites) và `git diff --check` PASS.
+- [x] Đây là A08.
 
 ## 4. Graceful shutdown — P4-04
 
@@ -210,7 +210,7 @@ Checklist gate — ghi tên test và timestamp thực tế khi tick:
 
 - [ ] A01: `tests/e2e_boot.rs` (hoặc tương đương) pass — binary mới với SQLite: migrate, dashboard/API và MQTT sẵn sàng.
 - [ ] A04 đầy đủ: `tests/mqtt_acl.rs` wildcard/cross-device và `tests/security.rs` ACL regression pass.
-- [ ] A08: `tests/crash_recovery.rs` — kill trước commit, sau commit trước ACK, sau ACK — tất cả pass.
+- [x] A08: `tests/crash_recovery.rs` — kill trước commit, sau commit trước ACK, sau ACK — tất cả pass (evidence §3).
 - [ ] A09: `tests/storage_failure.rs` — DB lỗi (readiness false, không ACK), disk full, queue đầy (bounded RAM, metric), phục hồi — pass.
 - [ ] A15 release gate: `tests/ws_slow.rs` hoặc `tests/ws_telemetry.rs` — slow consumer close 1013, reconnect backfill, logout close 4401 — pass.
 - [ ] A16: `tests/shutdown.rs` — SIGTERM drain, không mất ACK, lock release, exit 0 — pass.
