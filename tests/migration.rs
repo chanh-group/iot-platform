@@ -177,6 +177,44 @@ fn second_process_exits_5_while_lock_is_held() {
 }
 
 #[test]
+fn run_exits_5_while_lock_is_held() {
+    let dir = TempDir::new().unwrap();
+    let path = write_config(&dir);
+    let loaded = config::load_with_env(&path, |_| None).unwrap();
+    let _lock = DataDirLock::try_new(&loaded.data_dir).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_iot-server"))
+        .args(["run", "--config"])
+        .arg(&path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("iot-server run kept running while the data dir lock was held");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "run must propagate the supervisor exit code; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("cannot acquire data dir lock"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn invalid_config_exits_3_without_creating_data_dir() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("conf.toml");
