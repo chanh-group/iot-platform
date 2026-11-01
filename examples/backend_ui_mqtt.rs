@@ -2,15 +2,20 @@ use std::error::Error;
 use std::io::{BufRead, Write};
 use std::time::Duration;
 
-use rumqttc::{AsyncClient, ConnectReturnCode, ConnectionError, Event, MqttOptions, Packet, QoS};
+use rumqttc::{
+    AsyncClient, ConnectReturnCode, ConnectionError, Event, MqttOptions, Outgoing, Packet, QoS,
+};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 #[tokio::main]
-async fn main() {
-    if let Err(error) = run().await {
-        emit(json!({ "event": "error", "message": error.to_string() }));
-        std::process::exit(1);
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            emit(json!({ "event": "error", "message": error.to_string() }));
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 
@@ -50,6 +55,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
     let mut connected = false;
     let mut pending_subscriptions = Vec::new();
+    let mut closing = None;
     loop {
         tokio::select! {
             line = input_rx.recv() => {
@@ -70,8 +76,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     }
                     Some("close") => {
                         client.disconnect().await?;
-                        emit(json!({ "id": id, "ok": true }));
-                        break;
+                        closing = Some(id);
                     }
                     _ => emit(json!({ "id": id, "error": "unknown MQTT helper action" })),
                 }
@@ -110,6 +115,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         emit(json!({ "event": "disconnected" }));
                         break;
                     }
+                    Ok(Event::Outgoing(Outgoing::Disconnect)) if let Some(id) = closing.take() => {
+                        emit(json!({ "id": id, "ok": true }));
+                        break;
+                    }
                     Ok(_) => {}
                     Err(ConnectionError::ConnectionRefused(code)) if !connected => {
                         emit(json!({ "event": "connack", "code": code as u8 }));
@@ -126,6 +135,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     }
 
     poll_task.abort();
+    let _ = poll_task.await;
     Ok(())
 }
 

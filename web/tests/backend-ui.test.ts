@@ -539,7 +539,19 @@ url = "sqlite://./data/iot.db"
     expect(await click(deviceName)).toBe(true);
     await waitForBrowser("document.querySelector('#device-title')?.textContent?.trim()", (value) => value === "Device detail", "device detail");
     expect(await evaluate(`([...document.querySelectorAll('input,select,textarea')].every((field) => field.labels?.length || field.getAttribute('aria-label')) && [...document.querySelectorAll('button')].every((button) => button.getAttribute('aria-label') || button.textContent?.trim()))`)).toBe(true);
-    const timestamp = Date.now();
+    const historyToInput = await evaluate(`(() => {
+      const date = new Date(Date.now());
+      const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+      return local.toISOString().slice(0, 23);
+    })()`) as string;
+    await setValue("#history-to", historyToInput);
+    const timestamp = Date.now() - 1_000;
+    const historyFromInput = await evaluate(`(() => {
+      const date = new Date(${timestamp - 1_000});
+      const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+      return local.toISOString().slice(0, 23);
+    })()`) as string;
+    await setValue("#history-from", historyFromInput);
     const firstEvent = { event_id: `ui-${timestamp}`, ts: timestamp, values: { temperature: 22, humidity: 61, relay: true } };
     await deviceMqtt.publish(`devices/${deviceId}/telemetry`, firstEvent);
     expect((await deviceMqtt.waitPublish(`devices/${deviceId}/telemetry/ack`)).status).toBe("stored");
@@ -550,6 +562,17 @@ url = "sqlite://./data/iot.db"
     await waitForBrowser("document.querySelector('.chart-host')?.getAttribute('role')", (value) => value === "img", "accessible telemetry chart");
     await setValue("#telemetry-key", "temperature", "change");
     await waitForBrowser("document.querySelector('.chart-host')?.getAttribute('aria-label')", (value) => typeof value === "string" && value.includes("Telemetry chart for temperature"), "selected telemetry key");
+    await deviceMqtt.publish(`devices/${deviceId}/telemetry`, {
+      event_id: `out-of-range-${timestamp}`,
+      ts: timestamp - 1_500,
+      values: { temperature: 99 },
+    });
+    expect((await deviceMqtt.waitPublish(`devices/${deviceId}/telemetry/ack`)).status).toBe("stored");
+    await waitForBrowser(
+      "document.querySelector('.chart-host')?.getAttribute('aria-label')",
+      (value) => value === "Telemetry chart for temperature, 1 numeric sample",
+      "real MQTT event outside the selected chart range",
+    );
     const chartNode = await call("DOM.getDocument");
     const chartRoot = (chartNode.result?.root as { nodeId?: number } | undefined)?.nodeId;
     if (chartRoot === undefined) throw new Error("Could not inspect the browser accessibility tree.");
@@ -647,12 +670,29 @@ url = "sqlite://./data/iot.db"
     await setValue("#telemetry-key", "temperature", "change");
     await waitForBrowser("document.querySelector('#telemetry-key')?.value", (value) => value === "temperature", "selected temperature key");
 
+    const historyReadsBeforeRangeUpdate = requestCount(requestUrls, `/api/v1/devices/${deviceId}/telemetry`);
+    await setValue("#history-from", historyFromInput);
+    const reconnectHistoryToInput = await evaluate(`(() => {
+      const date = new Date(Date.now());
+      const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+      return local.toISOString().slice(0, 23);
+    })()`) as string;
+    await setValue("#history-to", reconnectHistoryToInput);
+    const reconnectHistoryFrom = await evaluate("new Date(document.querySelector('#history-from')?.value ?? '').getTime()") as number;
+    const reconnectHistoryTo = await evaluate("new Date(document.querySelector('#history-to')?.value ?? '').getTime()") as number;
+    await waitFor(() => requestUrls.some((url) => {
+      const request = new URL(url);
+      return request.pathname === `/api/v1/devices/${deviceId}/telemetry`
+        && request.searchParams.get("from") === String(reconnectHistoryFrom)
+        && request.searchParams.get("to") === String(reconnectHistoryTo);
+    }), "updated telemetry range request");
+    expect(requestCount(requestUrls, `/api/v1/devices/${deviceId}/telemetry`)).toBeGreaterThan(historyReadsBeforeRangeUpdate);
     const beforeDetailReconnect = requestCounts(requestUrls);
     const beforeCommandDetailReconnect = requestCountPrefix(requestUrls, "/api/v1/commands/");
     await call("Network.emulateNetworkConditions", { offline: true, latency: 0, downloadThroughput: -1, uploadThroughput: -1 });
     await evaluate("window.__iotSockets.at(-1)?.close(4000, 'detail reconnect')");
     await waitForBrowser("document.querySelector('.connection')?.textContent?.trim()", (value) => value === "Live updates reconnecting", "detail WebSocket disconnect");
-    const missedAt = Date.now();
+    const missedAt = reconnectHistoryTo - 1_000;
     await activeMqtt.publish(`devices/${deviceId}/telemetry`, {
       event_id: `reconnect-${missedAt}`,
       ts: missedAt,
@@ -669,7 +709,7 @@ url = "sqlite://./data/iot.db"
     expect(requestCount(requestUrls, `/api/v1/devices/${deviceId}/commands`)).toBeGreaterThan(beforeDetailReconnect.commands);
     expect(requestCountPrefix(requestUrls, "/api/v1/commands/")).toBeGreaterThan(beforeCommandDetailReconnect);
     expect(await evaluate("document.querySelector('#telemetry-key')?.value")).toBe("temperature");
-    expect(await evaluate("document.querySelector('.chart-host')?.getAttribute('aria-label')")).toContain("Telemetry chart for temperature, 2 numeric samples");
+    expect(await evaluate("document.querySelector('.chart-host')?.getAttribute('aria-label')")).toBe("Telemetry chart for temperature, 2 numeric samples");
 
     const beforeOverviewReconnect = requestCount(requestUrls, "/api/v1/overview");
     await click("Overview");

@@ -33,6 +33,8 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
   let lateEventSample: TelemetryRow | undefined;
   let lateEventReturned = false;
   let latestItems: LatestValue[] = [];
+  let holdNextLatestResponse = false;
+  let releaseHeldLatestResponse: (() => void) | undefined;
   let configRevision = 7;
   let configLevel = "info";
   let retentionDays = 30;
@@ -222,6 +224,10 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
       }
       if (url.pathname === `/api/v1/devices/${deviceId}/telemetry/latest`) {
         latestReads += 1;
+        if (holdNextLatestResponse) {
+          holdNextLatestResponse = false;
+          await new Promise<void>((resolve) => { releaseHeldLatestResponse = resolve; });
+        }
         return Response.json({ items: latestItems });
       }
       if (url.pathname === `/api/v1/devices/${deviceId}/telemetry`) {
@@ -662,6 +668,20 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
     await evaluate(`[...document.querySelectorAll('button')].find((button) => button.textContent?.trim() === 'smoke-sensor')?.click()`);
     await waitFor("document.querySelector('#device-title')?.textContent?.trim()", (value) => value === "Device detail", "device detail");
     await waitForFixture(() => historyRequests.length > 0, "initial empty history request");
+    const historyToInput = await evaluate(`(() => {
+      const date = new Date(Date.now());
+      const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+      return local.toISOString().slice(0, 23);
+    })()`) as string;
+    expect(await evaluate(`(() => {
+      const input = document.querySelector('#history-to');
+      if (!input) return false;
+      input.value = ${JSON.stringify(historyToInput)};
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      return true;
+    })()`)).toBe(true);
+    const selectedToMs = await evaluate("new Date(document.querySelector('#history-to')?.value ?? '').getTime()") as number;
+    await waitForFixture(() => historyRequests.some((query) => query.to === String(selectedToMs)), "selected history upper bound");
     const initialRangeTo = historyRequests.at(-1)?.to;
     expect(initialRangeTo).toBeString();
     const initialRangeToMs = Number(initialRangeTo);
@@ -704,21 +724,41 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
       { key: "temperature", value: 22, ts: firstLiveTimestamp, received_at: firstReceivedAt, event_id: "live-1" },
     ];
     const latestReadsBeforeTie = latestReads;
+    holdNextLatestResponse = true;
     broadcast("telemetry", {
       event_id: "live-3",
       ts: firstLiveTimestamp,
       received_at: firstReceivedAt,
       values: { temperature: 23, humidity: 63 },
     }, deviceId);
-    await waitForFixture(() => latestReads > latestReadsBeforeTie, "REST latest tie-break refetch");
+    await waitForFixture(() => latestReads === latestReadsBeforeTie + 1 && releaseHeldLatestResponse !== undefined, "REST latest tie-break refetch");
+    await waitFor("document.querySelector('section[aria-labelledby=\"latest-title\"] .loading')?.textContent", Boolean, "latest tie refetch loading state");
+    const manyTieEvents: Array<Record<string, unknown>> = [];
+    for (let group = 0; group < 80; group += 1) {
+      for (let index = 0; index < 2; index += 1) {
+        const event = {
+          event_id: `tie-burst-${group}-${index}`,
+          ts: firstLiveTimestamp + 5_000,
+          received_at: firstReceivedAt + 5_000,
+          values: { [`tie_key_${group}`]: group * 10 + index },
+        };
+        manyTieEvents.push(event);
+        broadcast("telemetry", event, deviceId);
+      }
+    }
+    await waitFor(`[...document.querySelectorAll('#telemetry-key option')].some((option) => option.value === "tie_key_79")`, Boolean, "all latest tie groups arrive during loading");
+    expect(latestReads).toBe(latestReadsBeforeTie + 1);
+    releaseHeldLatestResponse?.();
+    releaseHeldLatestResponse = undefined;
+    await waitForFixture(() => latestReads === latestReadsBeforeTie + 2, "one coalesced refresh for newly observed tie groups");
     await waitFor(
       "[...document.querySelectorAll('section[aria-labelledby=\\\"latest-title\\\"] tbody tr')].find((row) => row.firstElementChild?.textContent === 'temperature')?.children[1]?.textContent",
       (value) => value === "22",
       "REST-resolved latest value",
     );
-    expect(latestReads).toBe(latestReadsBeforeTie + 1);
+    expect(latestReads).toBe(latestReadsBeforeTie + 2);
     await Bun.sleep(300);
-    expect(latestReads).toBe(latestReadsBeforeTie + 1);
+    expect(latestReads).toBe(latestReadsBeforeTie + 2);
     expect(await evaluate("[...document.querySelectorAll('section[aria-labelledby=\\\"latest-title\\\"] tbody tr')].find((row) => row.firstElementChild?.textContent === 'firmware')?.children[1]?.textContent")).toBe("1.4.2");
     expect(await evaluate("[...document.querySelectorAll('section[aria-labelledby=\\\"latest-title\\\"] tbody tr')].find((row) => row.firstElementChild?.textContent === 'relay')?.children[1]?.textContent")).toBe("true");
     await waitFor(
@@ -737,8 +777,8 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
     }, deviceId);
     await waitFor(
       "document.querySelector('.chart-host')?.getAttribute('aria-label')",
-      (value) => value === "Telemetry chart for humidity, 4 numeric samples",
-      "live chart update",
+      (value) => value === "Telemetry chart for humidity, 3 numeric samples",
+      "out-of-range live event excluded from selected history range",
     );
     expect(historyRequests).toHaveLength(liveQueryCount);
     expect(await evaluate("document.querySelector('#history-to')?.value")).toBe(displayedTo);
@@ -778,7 +818,7 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
     expect(historyRequests.at(-1)?.limit).toBe("200");
     await waitFor(
       "document.querySelector('.chart-host')?.getAttribute('aria-label')",
-      (value) => value === "Telemetry chart for temperature, 4 numeric samples",
+      (value) => value === "Telemetry chart for temperature, 3 numeric samples",
       "REST/live duplicate telemetry deduplication",
     );
     expect(historyRequests.filter((query) => query.cursor === "history-cursor-2")).toHaveLength(0);
@@ -830,6 +870,7 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
 
     const backfillToControl = await evaluate("document.querySelector('#history-to')?.value");
     const previousSocketCount = websocketOpened;
+    const latestReadsBeforeReconnect = latestReads;
     backfillEnabled = true;
     for (const socket of [...sockets]) socket.close(1012, "smoke reconnect");
     await waitForFixture(() => websocketOpened > previousSocketCount, "WebSocket reconnect");
@@ -848,6 +889,13 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
     expect(lateEventReturned).toBe(false);
     expect(await evaluate("document.body.innerText.includes('complete recovery cannot be established')")).toBe(true);
     expect(await evaluate("document.querySelector('#history-to')?.value")).toBe(backfillToControl);
+    await waitForFixture(() => latestReads > latestReadsBeforeReconnect, "latest REST refetch after reconnect");
+    await waitFor("document.querySelector('section[aria-labelledby=\"latest-title\"] .loading') === null", Boolean, "latest response after reconnect");
+    const latestReadsBeforeReplayedTie = latestReads;
+    for (const event of manyTieEvents.slice(0, 2)) broadcast("telemetry", event, deviceId);
+    await waitForFixture(() => latestReads > latestReadsBeforeReplayedTie, "same tie group refresh after old groups are pruned");
+    await Bun.sleep(300);
+    expect(latestReads).toBe(latestReadsBeforeReplayedTie + 1);
 
     expect(await evaluate("document.querySelector('.chart-host') !== null")).toBe(true);
     await evaluate(`[...document.querySelectorAll('button')].find((button) => button.textContent?.trim() === 'Devices')?.click()`);
@@ -920,6 +968,7 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
     expect(websocketOpened).toBeGreaterThan(1);
     expect(websocketClosed).toBeGreaterThanOrEqual(websocketOpened);
   } finally {
+    releaseHeldLatestResponse?.();
     devtools?.close();
     if (chrome) {
       chrome.kill();

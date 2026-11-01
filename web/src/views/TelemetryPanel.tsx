@@ -41,7 +41,7 @@ export function TelemetryPanel(props: {
 
       <section class="panel" aria-labelledby="telemetry-title">
         <div class="heading-row">
-          <div><h2 id="telemetry-title">Telemetry history</h2><p>History uses [from, to); live and reconnect-backfill samples overlay separately without changing that range.</p></div>
+          <div><h2 id="telemetry-title">Telemetry history</h2><p>The chart and history use event timestamps in the selected [from, to) range. Latest values above are not range-filtered.</p></div>
         </div>
         <div class="toolbar">
           <div class="field"><label for="history-from">From</label><input id="history-from" type="datetime-local" step="0.001" value={telemetry.from()} onInput={(event) => telemetry.changeFrom(event.currentTarget.value)} /></div>
@@ -77,10 +77,10 @@ export function TelemetryPanel(props: {
           <button class="button" type="button" onClick={telemetry.retryBackfill}>Retry backfill</button>
         </Show>
         <Show keyed when={telemetry.chartKey()}>
-          {(key) => <TelemetryChart telemetryKey={key} history={telemetry.historyRows} live={telemetry.live} />}
+          {(key) => <TelemetryChart telemetryKey={key} history={telemetry.historyRows} live={telemetry.chartLive} />}
         </Show>
         <Show when={telemetry.key() && !telemetry.chartKey()}>
-          <p class="empty-state">No numeric samples for this key on the current page or in the live stream.</p>
+          <p class="empty-state">No numeric samples for this key in the selected range or on the current history page.</p>
         </Show>
         <Show when={telemetry.history.state().data}>
           {(page) => <>

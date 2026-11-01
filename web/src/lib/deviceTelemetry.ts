@@ -79,18 +79,23 @@ export function useDeviceTelemetry(
   const latestValues = createMemo<LatestValue[]>(() => latestMerge().items);
   const checkedTieEvents = new Map<string, Set<string>>();
   createEffect(() => {
+    const requestState = latest.state();
+    // Refresh clears the REST data temporarily; retain tie checks until its response settles.
+    if (requestState.loading) return;
     const groups = latestMerge().ambiguous;
+    const activeSignatures = new Set(groups.map((group) => `${group.key}\0${group.ts}\0${group.receivedAt ?? "unknown"}`));
+    for (const signature of checkedTieEvents.keys()) {
+      if (!activeSignatures.has(signature)) checkedTieEvents.delete(signature);
+    }
+    if (!requestState.data) return;
+
     let needsRefresh = false;
     for (const group of groups) {
-      const signature = `${group.key}:${group.ts}:${group.receivedAt ?? "unknown"}`;
+      const signature = `${group.key}\0${group.ts}\0${group.receivedAt ?? "unknown"}`;
       const checkedEvents = checkedTieEvents.get(signature) ?? new Set<string>();
-      for (const eventId of group.eventIds) {
-        if (!checkedEvents.has(eventId)) needsRefresh = true;
-        checkedEvents.add(eventId);
-      }
-      checkedTieEvents.set(signature, checkedEvents);
+      if (group.eventIds.some((eventId) => !checkedEvents.has(eventId))) needsRefresh = true;
+      checkedTieEvents.set(signature, new Set(group.eventIds));
     }
-    // Keep attempts through the loading state, when the REST data temporarily disappears.
     if (needsRefresh) latest.refresh();
   });
 
@@ -192,13 +197,19 @@ export function useDeviceTelemetry(
     },
   );
   const historyRows = createMemo(() => history.state().data?.items ?? []);
+  const chartLive = createMemo(() => {
+    const fromMs = timestampFromInput(from());
+    const toMs = timestampFromInput(to());
+    if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || fromMs >= toMs) return [];
+    return live().filter((event) => event.ts >= fromMs && event.ts < toMs);
+  });
   const chartKey = createMemo(() => {
     const selected = key();
     if (!selected) return undefined;
     const hasHistory = historyRows().some((row) =>
       typeof row.values[selected] === "number" && Number.isFinite(row.values[selected])
     );
-    const hasLive = live().some((event) =>
+    const hasLive = chartLive().some((event) =>
       typeof event.values[selected] === "number" && Number.isFinite(event.values[selected])
     );
     return hasHistory || hasLive ? selected : undefined;
@@ -218,6 +229,7 @@ export function useDeviceTelemetry(
     to,
     key,
     live,
+    chartLive,
     latest,
     latestValues,
     history,
