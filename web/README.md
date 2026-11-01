@@ -22,9 +22,10 @@ Start the backend on `127.0.0.1:8080`, then run `bun run --bun dev`. Vite proxie
 backend CSRF checks still apply. The frontend never persists session or device
 tokens in browser storage.
 
-`bun test` runs API/request/chart/WebSocket regressions and a headless Chrome test
-of the actual Solid app. The in-memory API fixture covers duplicate/latest event
-ordering, chart selection with empty history, bounded history and reconnect
-backfill, scoped WebSocket refreshes, concurrent config edits, and unmount/logout
-cleanup. It does not replace a browser run against the Rust API/MQTT backend. Set
-`CHROME_BIN` if Chrome is not on PATH.
+`bun test` runs API/request/chart/WebSocket regressions, a headless Chrome test
+with an in-memory API fixture, and `backend-ui.test.ts`, which builds and runs a
+temporary Rust server and drives the Solid app in Chrome against its HTTP API and
+MQTT broker. MQTT traffic uses the focused `examples/backend_ui_mqtt.rs` helper
+with `rumqttc`, not a browser-test packet implementation. The backend test requires
+Cargo and Chrome; set `CHROME_BIN` if Chrome is not on PATH. Both browser tests
+clean up their temporary server/profile.

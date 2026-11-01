@@ -46,6 +46,7 @@ export function TelemetryChart(props: {
   return (
     <div
       class="chart-host"
+      role="img"
       aria-label={`Telemetry chart for ${props.telemetryKey}, ${pointCount()} numeric ${pointCount() === 1 ? "sample" : "samples"}`}
       ref={host}
     />

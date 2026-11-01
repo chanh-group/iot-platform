@@ -8,7 +8,7 @@ import { mergeLatestValues } from "./latestTelemetry";
 function localDateTime(value: number): string {
   const date = new Date(value);
   const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
-  return local.toISOString().slice(0, 16);
+  return local.toISOString().slice(0, 23);
 }
 
 function timestampFromInput(value: string): number {
@@ -125,9 +125,15 @@ export function useDeviceTelemetry(
       let cursor: string | undefined;
       let pages = 0;
       while (pages < BACKFILL_MAX_PAGES) {
+        if (controller.signal.aborted || generation !== backfillGeneration) {
+          return { rows, pages, nextCursor: cursor };
+        }
         const query = new URLSearchParams({ from: String(fromMs), to: String(toMs), limit: String(HISTORY_PAGE_SIZE) });
         if (cursor) query.set("cursor", cursor);
         const page = await api.get<Page<TelemetryRow>>(`/api/v1/devices/${deviceId}/telemetry?${query}`, controller.signal);
+        if (controller.signal.aborted || generation !== backfillGeneration) {
+          return { rows, pages, nextCursor: cursor };
+        }
         rows.push(...page.items);
         pages += 1;
         cursor = page.next_cursor ?? undefined;

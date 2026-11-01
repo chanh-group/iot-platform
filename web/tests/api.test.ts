@@ -34,7 +34,7 @@ describe("API client", () => {
     }));
     const api = new ApiClient(() => {});
 
-    expect(api.get("/api/v1/overview")).rejects.toMatchObject({
+    await expect(api.get("/api/v1/overview")).rejects.toMatchObject({
       code: "invalid_response",
       requestId: "request-123",
     });
@@ -45,7 +45,7 @@ describe("API client", () => {
     stubFetch(async () => { throw abort; });
     const api = new ApiClient(() => {});
 
-    expect(api.get("/api/v1/overview", new AbortController().signal)).rejects.toBe(abort);
+    await expect(api.get("/api/v1/overview", new AbortController().signal)).rejects.toBe(abort);
   });
 
   it("preserves AbortError while reading a response body", async () => {
@@ -55,7 +55,19 @@ describe("API client", () => {
     stubFetch(async () => response);
     const api = new ApiClient(() => {});
 
-    expect(api.get("/api/v1/overview")).rejects.toBe(abort);
+    await expect(api.get("/api/v1/overview")).rejects.toBe(abort);
+  });
+
+  it("preserves AbortError while reading an error response body", async () => {
+    const abort = new DOMException("cancelled", "AbortError");
+    const response = new Response("ignored", { status: 401 });
+    Object.defineProperty(response, "text", { value: () => Promise.reject(abort) });
+    stubFetch(async () => response);
+    let expired = 0;
+    const api = new ApiClient(() => { expired += 1; });
+
+    await expect(api.get("/api/v1/overview")).rejects.toBe(abort);
+    expect(expired).toBe(0);
   });
 
   it("does not let an older unauthorized response expire a newer session", async () => {
@@ -72,7 +84,7 @@ describe("API client", () => {
       request_id: "stale-request",
     }), { status: 401, headers: { "Content-Type": "application/json" } }));
 
-    expect(pending).rejects.toBeInstanceOf(ApiError);
+    await expect(pending).rejects.toBeInstanceOf(ApiError);
     expect(expired).toBe(0);
   });
 
@@ -84,6 +96,6 @@ describe("API client", () => {
     }), { status: 400, headers: { "Content-Type": "application/json" } }));
     const api = new ApiClient(() => {});
 
-    expect(api.get("/api/v1/devices")).rejects.toMatchObject({ requestId: "api-request-42" });
+    await expect(api.get("/api/v1/devices")).rejects.toMatchObject({ requestId: "api-request-42" });
   });
 });

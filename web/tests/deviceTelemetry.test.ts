@@ -16,10 +16,15 @@ describe("device telemetry backfill lifecycle", () => {
       const oldResponse = deferred<Page<TelemetryRow>>();
       let holdNextRequest = false;
       let oldSignal: AbortSignal | undefined;
+      let staleContinuationRequests = 0;
       const api = {
         get<T>(path: string, signal?: AbortSignal): Promise<T> {
           if (path.endsWith("/telemetry/latest")) {
             return Promise.resolve({ items: [] } as T);
+          }
+          if (path.includes("cursor=stale-cursor")) {
+            staleContinuationRequests += 1;
+            return Promise.resolve({ items: [], next_cursor: null } as T);
           }
           if (holdNextRequest) {
             holdNextRequest = false;
@@ -55,12 +60,13 @@ describe("device telemetry backfill lifecycle", () => {
           received_at: 1,
           values: { temperature: 20 },
         }],
-        next_cursor: null,
+        next_cursor: "stale-cursor",
       });
       await Bun.sleep(0);
 
       expect(telemetry.backfill().status).toBe("error");
       expect(telemetry.backfill().error).toBeInstanceOf(ApiError);
+      expect(staleContinuationRequests).toBe(0);
       dispose();
     }
   });

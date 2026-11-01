@@ -2,8 +2,9 @@ import { expect, it } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import type { ServerWebSocket } from "bun";
 import { createServer } from "vite";
+import solid from "vite-plugin-solid";
 import { resolve } from "node:path";
-import type { LatestValue, TelemetryRow } from "../src/lib/models";
+import type { Command, Device, LatestValue, TelemetryRow } from "../src/lib/models";
 
 interface DevtoolsTarget {
   type: string;
@@ -21,6 +22,7 @@ const otherDeviceId = "018f3e20-8b00-7000-8000-000000000002";
 
 it("tests live telemetry selection, paged history, scoped refreshes, config conflicts, and logout cleanup in Solid", async () => {
   let authenticated = false;
+  let sessionExpired = false;
   let logoutRequests = 0;
   let websocketOpened = 0;
   let websocketClosed = 0;
@@ -40,6 +42,14 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
   let attributeReads = 0;
   let latestReads = 0;
   let commandReads = 0;
+  let failOverviewOnce = true;
+  let overviewStorageOk = true;
+  let createdDevice: Device | undefined;
+  let commandSequence = 0;
+  let commandRecords: Command[] = [];
+  const devicePatches: Array<{ id: string; patch: Record<string, unknown> }> = [];
+  let deviceCreateRequests = 0;
+  let credentialRotations = 0;
   const historyRequests: Array<{ from: string | null; to: string | null; limit: string | null; cursor: string | null; key: string | null }> = [];
   const backfillRequests: Array<{ from: string | null; to: string | null; limit: string | null; cursor: string | null; key: string | null }> = [];
   const configPatches: Array<{ expected_revision: number; settings: Record<string, unknown> }> = [];
@@ -56,7 +66,7 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
     });
     for (const socket of sockets) socket.send(message);
   };
-  const device = () => ({
+  const baseDevice: Device = {
     id: deviceId,
     name: "smoke-sensor",
     enabled: true,
@@ -66,7 +76,13 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
     updated_at: Date.now() - 10_000,
     last_seen_at: Date.now() - 1_000,
     credential: { id: "smoke-credential", created_at: Date.now() - 10_000 },
-  });
+  };
+  const device = (id = deviceId): Device => {
+    const value = id === otherDeviceId
+      ? createdDevice ?? { ...baseDevice, id, name: "created-sensor", credential: { ...baseDevice.credential } }
+      : baseDevice;
+    return { ...value, metadata: { ...value.metadata }, credential: { ...value.credential } };
+  };
   const configResponse = () => ({
     revision: configRevision,
     config: {
@@ -76,7 +92,7 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
     restart_required: [],
   });
   const waitForFixture = async (ready: () => boolean, label: string) => {
-    for (let attempt = 0; attempt < 100; attempt += 1) {
+    for (let attempt = 0; attempt < 500; attempt += 1) {
       if (ready()) return;
       await Bun.sleep(20);
     }
@@ -87,14 +103,14 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
     fetch: async (request, server) => {
       const url = new URL(request.url);
       if (url.pathname === "/api/v1/events") {
-        if (!request.headers.get("cookie")?.includes("iot_session=smoke")) {
+        if (sessionExpired || !authenticated || !request.headers.get("cookie")?.includes("iot_session=smoke")) {
           return Response.json({ code: "unauthenticated", message: "unauthenticated", request_id: "smoke-ws-401" }, { status: 401 });
         }
         server.upgrade(request, { data: { fixture: true } });
         return undefined;
       }
       if (url.pathname === "/api/v1/auth/me") {
-        return authenticated
+        return authenticated && !sessionExpired
           ? Response.json({ id: "smoke-admin-id", username: "smoke-admin", expires_at: Date.now() + 60_000 })
           : Response.json({ code: "unauthenticated", message: "unauthenticated", request_id: "smoke-me-401" }, { status: 401 });
       }
@@ -104,6 +120,7 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
           return Response.json({ code: "invalid_credentials", message: "invalid credentials", request_id: "smoke-login-401" }, { status: 401 });
         }
         authenticated = true;
+        sessionExpired = false;
         return Response.json({
           user: { id: "smoke-admin-id", username: "smoke-admin" },
           expires_at: Date.now() + 60_000,
@@ -117,25 +134,91 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
           headers: { "Set-Cookie": "iot_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0" },
         });
       }
+      if (sessionExpired && url.pathname.startsWith("/api/v1/")) {
+        return Response.json({ code: "unauthenticated", message: "session expired", request_id: "smoke-session-401" }, { status: 401 });
+      }
       if (url.pathname === "/api/v1/overview") {
+        if (failOverviewOnce) {
+          failOverviewOnce = false;
+          return Response.json({
+            code: "storage_unavailable",
+            message: "storage unavailable",
+            request_id: "smoke-storage-503",
+          }, { status: 503 });
+        }
         return Response.json({
           devices: { total: 0, online: 0, disabled: 0 },
           telemetry: { events_24h: 0, last_received_at: null },
           commands: { pending: 0, dispatched: 0, failed_24h: 0, expired_24h: 0 },
           ingest: { queue_depth: 0, queue_capacity: 4_096, rejected_24h: 0 },
-          storage_ok: true,
+          storage_ok: overviewStorageOk,
         });
       }
       if (url.pathname === "/api/v1/devices") {
-        return Response.json({ items: [device()], next_cursor: null });
+        if (request.method === "POST") {
+          deviceCreateRequests += 1;
+          const body = await request.json() as { name: string; metadata: Record<string, unknown>; enabled: boolean };
+          createdDevice = {
+            ...device(otherDeviceId),
+            name: body.name,
+            metadata: body.metadata,
+            enabled: body.enabled,
+            updated_at: Date.now(),
+          };
+          return Response.json({
+            device: device(otherDeviceId),
+            credential: { id: "created-credential", token: "iot_created_one_time_token", created_at: Date.now() },
+          }, { status: 201 });
+        }
+        const query = url.searchParams.get("q")?.toLowerCase() ?? "";
+        const enabledFilter = url.searchParams.get("enabled");
+        const all = [device(), ...(createdDevice ? [device(otherDeviceId)] : [])]
+          .filter((item) => !query || item.name.toLowerCase().includes(query) || item.id.includes(query))
+          .filter((item) => enabledFilter === null || String(item.enabled) === enabledFilter);
+        const cursor = url.searchParams.get("cursor");
+        if (cursor === "devices-cursor-2") return Response.json({ items: all.slice(1), next_cursor: null });
+        const hasNext = !query && enabledFilter === null && all.length > 1;
+        return Response.json({ items: hasNext ? all.slice(0, 1) : all, next_cursor: hasNext ? "devices-cursor-2" : null });
       }
-      if (url.pathname === `/api/v1/devices/${deviceId}`) {
+      const devicePath = url.pathname.match(/^\/api\/v1\/devices\/([^/]+)$/);
+      if (devicePath && request.method === "PATCH") {
+        const id = devicePath[1] ?? "";
+        const patch = await request.json() as Record<string, unknown>;
+        devicePatches.push({ id, patch });
+        const current = id === otherDeviceId ? createdDevice : baseDevice;
+        if (!current) return Response.json({ code: "device_not_found", message: "device not found" }, { status: 404 });
+        if (typeof patch.name === "string") current.name = patch.name;
+        if (typeof patch.enabled === "boolean") current.enabled = patch.enabled;
+        if (typeof patch.metadata === "object" && patch.metadata !== null && !Array.isArray(patch.metadata)) {
+          current.metadata = patch.metadata as Record<string, unknown>;
+        }
+        current.updated_at = Date.now();
+        return Response.json(device(id));
+      }
+      if (devicePath && request.method === "GET") {
+        const id = devicePath[1] ?? "";
         deviceReads += 1;
-        return Response.json(device());
+        return Response.json(device(id));
+      }
+      const credentialPath = url.pathname.match(/^\/api\/v1\/devices\/([^/]+)\/credentials\/rotate$/);
+      if (credentialPath && request.method === "POST") {
+        credentialRotations += 1;
+        const id = credentialPath[1] ?? "";
+        const current = id === otherDeviceId ? createdDevice : baseDevice;
+        if (!current) return Response.json({ code: "device_not_found", message: "device not found" }, { status: 404 });
+        current.credential = { id: `rotated-credential-${credentialRotations}`, created_at: Date.now() };
+        return Response.json({
+          device_id: id,
+          credential: { ...current.credential, token: `iot_rotated_token_${credentialRotations}` },
+        });
       }
       if (url.pathname === `/api/v1/devices/${deviceId}/attributes`) {
         attributeReads += 1;
         return Response.json({ items: [], next_cursor: null });
+      }
+      if (url.pathname === `/api/v1/devices/${otherDeviceId}/attributes`) {
+        attributeReads += 1;
+        return Response.json({ items: [{ key: "firmware", value: "2.0", device_ts: null, updated_at: Date.now() }], next_cursor: null });
       }
       if (url.pathname === `/api/v1/devices/${deviceId}/telemetry/latest`) {
         latestReads += 1;
@@ -197,9 +280,46 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
           next_cursor: query.cursor ? null : "history-cursor-2",
         });
       }
-      if (url.pathname === `/api/v1/devices/${deviceId}/commands`) {
-        commandReads += 1;
+      if (url.pathname === `/api/v1/devices/${otherDeviceId}/telemetry/latest`) {
+        return Response.json({ items: [] });
+      }
+      if (url.pathname === `/api/v1/devices/${otherDeviceId}/telemetry`) {
         return Response.json({ items: [], next_cursor: null });
+      }
+      const commandsPath = url.pathname.match(/^\/api\/v1\/devices\/([^/]+)\/commands$/);
+      if (commandsPath && request.method === "POST") {
+        const id = commandsPath[1] ?? "";
+        const body = await request.json() as { name: string; params: Record<string, unknown>; ttl_ms?: number };
+        const now = Date.now();
+        const commandId = `smoke-command-${++commandSequence}`;
+        const command: Command = {
+          id: commandId,
+          device_id: id,
+          name: body.name,
+          params: body.params,
+          status: "pending",
+          created_at: now,
+          expires_at: now + (body.ttl_ms ?? 60_000),
+          dispatched_at: null,
+          completed_at: null,
+          result: null,
+          error: null,
+          attempts: 0,
+        };
+        commandRecords = [command, ...commandRecords];
+        return Response.json({ command_id: commandId, device_id: id, status: command.status, expires_at: command.expires_at }, { status: 202 });
+      }
+      if (commandsPath && request.method === "GET") {
+        commandReads += 1;
+        const id = commandsPath[1] ?? "";
+        return Response.json({ items: commandRecords.filter((command) => command.device_id === id), next_cursor: null });
+      }
+      const commandPath = url.pathname.match(/^\/api\/v1\/commands\/([^/]+)$/);
+      if (commandPath && request.method === "GET") {
+        const command = commandRecords.find((item) => item.id === commandPath[1]);
+        return command
+          ? Response.json(command)
+          : Response.json({ code: "command_not_found", message: "command not found" }, { status: 404 });
       }
       if (url.pathname === "/api/v1/config/runtime" && request.method === "PATCH") {
         const patch = await request.json() as { expected_revision: number; settings: Record<string, unknown> };
@@ -250,18 +370,30 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
     },
   });
 
-  const oldProxy = process.env.API_PROXY_TARGET;
   const chromePath = process.env.CHROME_BIN ?? "google-chrome";
   const profile = await mkdtemp("/tmp/opencode/iot-dashboard-smoke-");
   let vite: Awaited<ReturnType<typeof createServer>> | undefined;
   let chrome: ReturnType<typeof Bun.spawn> | undefined;
   let devtools: WebSocket | undefined;
   try {
-    process.env.API_PROXY_TARGET = `http://127.0.0.1:${fixture.port}`;
     const root = resolve(import.meta.dir, "..");
     vite = await createServer({
-      configFile: resolve(root, "vite.config.ts"),
-      server: { host: "127.0.0.1", port: 0, strictPort: true, hmr: false },
+      configFile: false,
+      root,
+      plugins: [solid()],
+      server: {
+        host: "127.0.0.1",
+        port: 0,
+        strictPort: true,
+        hmr: false,
+        proxy: {
+          "/api": {
+            target: `http://127.0.0.1:${fixture.port}`,
+            changeOrigin: false,
+            ws: true,
+          },
+        },
+      },
     });
     await vite.listen();
     const address = vite.httpServer?.address();
@@ -344,6 +476,16 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
       if (!username || !password) return false;
       username.value = "smoke-admin";
       username.dispatchEvent(new Event("input", { bubbles: true }));
+      password.value = "wrong-password";
+      password.dispatchEvent(new Event("input", { bubbles: true }));
+      document.querySelector('form[aria-label="Admin login"]')?.requestSubmit();
+      return true;
+    })()`);
+    await waitFor("document.body.innerText.includes('invalid credentials')", Boolean, "invalid login error");
+    expect(await evaluate("document.body.innerText.includes('smoke-login-401')")).toBe(true);
+    await evaluate(`(() => {
+      const password = document.querySelector('input[name="password"]');
+      if (!password) return false;
       password.value = "smoke-password";
       password.dispatchEvent(new Event("input", { bubbles: true }));
       document.querySelector('form button[type="submit"]')?.focus();
@@ -354,18 +496,179 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
     await waitFor("document.querySelector('#overview-title')?.textContent?.trim()", (value) => value === "System overview", "dashboard overview");
     await waitFor("document.querySelector('.connection')?.textContent?.trim()", (value) => value === "Live updates connected", "event socket");
     expect(await evaluate("localStorage.length")).toBe(0);
+    await waitFor("document.body.innerText.includes('storage unavailable')", Boolean, "overview storage error");
+    expect(await evaluate("document.body.innerText.includes('smoke-storage-503')")).toBe(true);
+    overviewStorageOk = false;
+    await evaluate(`[...document.querySelectorAll('button')].find((button) => button.textContent?.trim() === 'Refresh')?.click()`);
+    await waitFor("document.body.innerText.includes('Storage is unavailable. New telemetry may not be saved.')", Boolean, "storage warning");
+    overviewStorageOk = true;
+    await evaluate(`[...document.querySelectorAll('button')].find((button) => button.textContent?.trim() === 'Refresh')?.click()`);
+    await waitFor("document.body.innerText.includes('Devices online')", Boolean, "recovered overview data");
 
     await evaluate(`[...document.querySelectorAll('button')].find((button) => button.textContent?.trim() === 'Devices')?.click()`);
     await waitFor("document.querySelector('#devices-title')?.textContent?.trim()", (value) => value === "Devices", "devices view");
     await waitFor("document.body.innerText.includes('smoke-sensor')", Boolean, "device list result");
+
+    expect(await evaluate(`Array.from(document.querySelectorAll('input, textarea, select')).every((control) => control.labels?.length || control.getAttribute('aria-label'))`)).toBe(true);
+    await evaluate(`(() => {
+      const search = document.querySelector('#device-search');
+      if (!search) return false;
+      search.value = 'smoke';
+      search.dispatchEvent(new Event('input', { bubbles: true }));
+      search.closest('form')?.requestSubmit();
+      return true;
+    })()`);
+    await waitFor("document.querySelector('#device-search')?.value", (value) => value === "smoke", "device search filter");
+    await evaluate(`(() => {
+      const search = document.querySelector('#device-search');
+      if (!search) return false;
+      search.value = '';
+      search.dispatchEvent(new Event('input', { bubbles: true }));
+      search.closest('form')?.requestSubmit();
+      return true;
+    })()`);
+
+    await evaluate(`(() => {
+      const name = document.querySelector('#new-device-name');
+      const metadata = document.querySelector('#new-device-metadata');
+      if (!name || !metadata) return false;
+      name.value = 'created-sensor';
+      name.dispatchEvent(new Event('input', { bubbles: true }));
+      metadata.value = '{"zone":"west"}';
+      metadata.dispatchEvent(new Event('input', { bubbles: true }));
+      name.closest('form')?.requestSubmit();
+      return true;
+    })()`);
+    await waitFor("document.querySelector('#issued-token')?.value", (value) => value === "iot_created_one_time_token", "one-time create credential");
+    expect(deviceCreateRequests).toBe(1);
+    await evaluate(`[...document.querySelectorAll('button')].find((button) => button.textContent?.includes('Close and clear token'))?.click()`);
+    await waitFor("document.querySelector('#issued-token') === null", Boolean, "cleared create credential");
+    expect(await evaluate("localStorage.length")).toBe(0);
+    await evaluate(`[...document.querySelectorAll('button')].find((button) => button.textContent?.trim() === 'Next')?.click()`);
+    await waitFor("document.body.innerText.includes('created-sensor')", Boolean, "second device page");
+    await evaluate(`[...document.querySelectorAll('button')].find((button) => button.textContent?.trim() === 'created-sensor')?.click()`);
+    await waitFor("document.querySelector('#device-title')?.textContent?.trim()", (value) => value === "Device detail", "created device detail");
+    await waitFor("document.body.innerText.includes('2.0')", Boolean, "latest attributes");
+    await waitFor(`(() => {
+      const name = document.querySelector('#edit-device-name');
+      const metadata = document.querySelector('#edit-device-metadata');
+      const form = name?.closest('form');
+      return Boolean(form && metadata?.closest('form') === form && form.querySelector('button[type="submit"]')?.textContent?.trim() === 'Save name and metadata');
+    })()`, Boolean, "device edit form with name, metadata, and save controls");
+    const editFormSubmitted = await evaluate(`(() => {
+      const name = document.querySelector('#edit-device-name');
+      const metadata = document.querySelector('#edit-device-metadata');
+      const form = name?.closest('form');
+      if (!name || !metadata || !form || metadata.closest('form') !== form) return false;
+      name.value = 'edited-sensor';
+      name.dispatchEvent(new Event('input', { bubbles: true }));
+      metadata.value = '{"zone":"east"}';
+      metadata.dispatchEvent(new Event('input', { bubbles: true }));
+      form.requestSubmit();
+      return true;
+    })()`);
+    if (editFormSubmitted !== true) throw new Error("Device edit form controls disappeared before submission.");
+    await waitForFixture(() => devicePatches.some(({ id, patch }) => id === otherDeviceId && patch.name === "edited-sensor"), "device name and metadata PATCH");
+    await waitFor("document.querySelector('#device-summary-title')?.textContent?.trim()", (value) => value === "edited-sensor", "device name and metadata edit");
+    expect(devicePatches.some(({ id, patch }) => id === otherDeviceId && patch.name === "edited-sensor" && JSON.stringify(patch.metadata) === '{"zone":"east"}')).toBe(true);
+
+    await evaluate(`(() => {
+      const name = document.querySelector('#command-name');
+      const form = name?.closest('form');
+      if (!form) return false;
+      name.value = 'restart';
+      name.dispatchEvent(new Event('input', { bubbles: true }));
+      form.requestSubmit();
+      return true;
+    })()`);
+    await waitFor("document.body.innerText.includes('smoke-command-1')", Boolean, "command create and detail");
+    commandRecords[0] = { ...commandRecords[0]!, status: "succeeded", completed_at: Date.now(), result: { accepted: true } };
+    broadcast("command", {
+      command_id: "smoke-command-1",
+      device_id: otherDeviceId,
+      status: "succeeded",
+      state_version: 3,
+      completed_at: commandRecords[0]?.completed_at ?? null,
+      error: null,
+    }, otherDeviceId);
+    await waitFor("document.querySelector('section[aria-labelledby=\\\"commands-title\\\"]')?.innerText.toLowerCase().includes('succeeded')", Boolean, "command ACK state refresh");
+    await waitFor("document.querySelector('section[aria-labelledby=\\\"commands-title\\\"]')?.innerText.includes('accepted')", Boolean, "command result detail refresh");
+    const beforeStaleCommandEvent = commandReads;
+    broadcast("command", {
+      command_id: "smoke-command-1",
+      device_id: otherDeviceId,
+      status: "dispatched",
+      state_version: 2,
+      completed_at: null,
+      error: null,
+    }, otherDeviceId);
+    await waitForFixture(() => commandReads > beforeStaleCommandEvent, "stale command event REST invalidation");
+    await waitFor("document.querySelector('section[aria-labelledby=\\\"commands-title\\\"]')?.innerText.toLowerCase().includes('succeeded')", Boolean, "stale command event keeps REST terminal state");
+    const beforeDuplicateCommandEvent = commandReads;
+    const duplicateCommandEvent = JSON.stringify({
+      type: "command",
+      id: "duplicate-command-event",
+      ts: Date.now(),
+      device_id: otherDeviceId,
+      data: { command_id: "smoke-command-1", device_id: otherDeviceId, status: "pending", state_version: 1 },
+    });
+    for (const socket of sockets) socket.send(duplicateCommandEvent);
+    for (const socket of sockets) socket.send(duplicateCommandEvent);
+    await waitForFixture(() => commandReads > beforeDuplicateCommandEvent, "duplicate command event REST invalidation");
+    await Bun.sleep(200);
+    expect(commandReads).toBe(beforeDuplicateCommandEvent + 1);
+
+    await evaluate(`document.querySelector('#command-name')?.closest('form')?.requestSubmit()`);
+    await waitFor("document.body.innerText.includes('smoke-command-2')", Boolean, "second command create");
+    commandRecords[0] = { ...commandRecords[0]!, status: "expired", completed_at: Date.now() };
+    broadcast("command", {
+      command_id: "smoke-command-2",
+      device_id: otherDeviceId,
+      status: "expired",
+      state_version: 3,
+      completed_at: commandRecords[0]?.completed_at ?? null,
+      error: null,
+    }, otherDeviceId);
+    await waitFor("document.querySelector('section[aria-labelledby=\\\"commands-title\\\"]')?.innerText.toLowerCase().includes('expired')", Boolean, "expired command status");
+
+    await evaluate(`[...document.querySelectorAll('button')].find((button) => button.textContent?.trim() === 'Disable device')?.click()`);
+    await waitFor("[...document.querySelectorAll('button')].some((button) => button.textContent?.trim() === 'Enable device')", Boolean, "disable device action");
+    expect(device(otherDeviceId).enabled).toBe(false);
+    await evaluate("window.confirm = () => true");
+    await evaluate(`[...document.querySelectorAll('button')].find((button) => button.textContent?.trim() === 'Rotate token')?.click()`);
+    await waitFor("document.querySelector('#issued-token')?.value", (value) => value === "iot_rotated_token_1", "one-time rotated credential");
+    expect(credentialRotations).toBe(1);
+    await evaluate(`[...document.querySelectorAll('button')].find((button) => button.textContent?.includes('Close and clear token'))?.click()`);
+    await waitFor("document.querySelector('#issued-token') === null", Boolean, "cleared rotated credential");
+
+    await evaluate(`[...document.querySelectorAll('button')].find((button) => button.textContent?.trim() === 'Devices')?.click()`);
+    await waitFor("document.querySelector('#devices-title')?.textContent?.trim()", (value) => value === "Devices", "return to device list");
+    await evaluate(`(() => {
+      const filter = document.querySelector('#device-enabled');
+      if (!filter) return false;
+      filter.value = 'false';
+      filter.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    })()`);
+    await waitFor("document.body.innerText.includes('edited-sensor')", Boolean, "disabled-device filter");
+    await evaluate(`(() => {
+      const filter = document.querySelector('#device-enabled');
+      if (!filter) return false;
+      filter.value = 'all';
+      filter.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    })()`);
+    await waitFor("document.body.innerText.includes('smoke-sensor')", Boolean, "all-device filter");
     await evaluate(`[...document.querySelectorAll('button')].find((button) => button.textContent?.trim() === 'smoke-sensor')?.click()`);
     await waitFor("document.querySelector('#device-title')?.textContent?.trim()", (value) => value === "Device detail", "device detail");
     await waitForFixture(() => historyRequests.length > 0, "initial empty history request");
     const initialRangeTo = historyRequests.at(-1)?.to;
     expect(initialRangeTo).toBeString();
+    const initialRangeToMs = Number(initialRangeTo);
+    expect(Number.isFinite(initialRangeToMs)).toBe(true);
     expect(await evaluate("document.querySelector('.chart-host') === null")).toBe(true);
 
-    const firstLiveTimestamp = Number(initialRangeTo) - 1_000;
+    const firstLiveTimestamp = initialRangeToMs - 1_000;
     const firstReceivedAt = firstLiveTimestamp + 100;
     broadcast("telemetry", {
       event_id: "live-1",
@@ -428,8 +731,8 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
     const liveQueryCount = historyRequests.length;
     broadcast("telemetry", {
       event_id: "live-4",
-      ts: Number(initialRangeTo) + 1_000,
-      received_at: Number(initialRangeTo) + 1_100,
+      ts: initialRangeToMs + 1_000,
+      received_at: initialRangeToMs + 1_100,
       values: { temperature: 24, humidity: 64 },
     }, deviceId);
     await waitFor(
@@ -590,6 +893,24 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
     await waitFor("document.querySelector('#overview-title')?.textContent?.trim()", (value) => value === "System overview", "overview after reload");
     await waitFor("document.querySelector('.connection')?.textContent?.trim()", (value) => value === "Live updates connected", "event socket after reload");
 
+    sessionExpired = true;
+    for (const socket of [...sockets]) socket.close(4401, "session expired");
+    await waitFor("document.querySelector('form[aria-label=\\\"Admin login\\\"]') !== null", Boolean, "session-expired login screen");
+    await waitFor("document.body.innerText.includes('Your session has expired. Sign in again.')", Boolean, "session expiry notice");
+    sessionExpired = false;
+    await evaluate(`(() => {
+      const username = document.querySelector('input[name="username"]');
+      const password = document.querySelector('input[name="password"]');
+      if (!username || !password) return false;
+      username.value = 'smoke-admin';
+      username.dispatchEvent(new Event('input', { bubbles: true }));
+      password.value = 'smoke-password';
+      password.dispatchEvent(new Event('input', { bubbles: true }));
+      document.querySelector('form[aria-label="Admin login"]')?.requestSubmit();
+      return true;
+    })()`);
+    await waitFor("document.querySelector('#overview-title')?.textContent?.trim()", (value) => value === "System overview", "sign in after session expiry");
+
     await evaluate(`[...document.querySelectorAll('button')].find((button) => button.textContent?.trim() === 'Log out')?.click()`);
     await waitFor("document.querySelector('form[aria-label=\\\"Admin login\\\"]') !== null", Boolean, "logout and login screen");
     for (let attempt = 0; attempt < 50 && websocketClosed < websocketOpened; attempt += 1) await Bun.sleep(50);
@@ -606,8 +927,6 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
     }
     if (vite) await vite.close();
     fixture.stop(true);
-    if (oldProxy === undefined) delete process.env.API_PROXY_TARGET;
-    else process.env.API_PROXY_TARGET = oldProxy;
     await rm(profile, { recursive: true, force: true });
   }
-}, 45_000);
+}, 90_000);

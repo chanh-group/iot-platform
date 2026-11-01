@@ -22,17 +22,32 @@ interface WebSocketOptions {
 export class EventsSocket {
   private socket: Socket | undefined;
   private timer: ReturnType<typeof setTimeout> | undefined;
+  private stableTimer: ReturnType<typeof setTimeout> | undefined;
   private channels: string[];
   private attempt = 0;
   private stopped = false;
   private openedBefore = false;
+  private reconnectPending = false;
   private readonly seen = new Set<string>();
+  private readonly onOffline = () => this.socket?.close();
+  private readonly onOnline = () => {
+    if (this.stopped) return;
+    if (this.socket?.readyState === 0 || this.socket?.readyState === 1) return;
+    if (this.timer !== undefined) clearTimeout(this.timer);
+    this.timer = undefined;
+    this.socket = undefined;
+    this.connect();
+  };
 
   constructor(private readonly options: WebSocketOptions) {
     this.channels = [...new Set(options.channels)];
   }
 
   start(): void {
+    if (typeof window !== "undefined") {
+      window.addEventListener("offline", this.onOffline);
+      window.addEventListener("online", this.onOnline);
+    }
     this.connect();
   }
 
@@ -51,8 +66,14 @@ export class EventsSocket {
   stop(): void {
     if (this.stopped) return;
     this.stopped = true;
+    if (typeof window !== "undefined") {
+      window.removeEventListener("offline", this.onOffline);
+      window.removeEventListener("online", this.onOnline);
+    }
     if (this.timer !== undefined) clearTimeout(this.timer);
+    if (this.stableTimer !== undefined) clearTimeout(this.stableTimer);
     this.timer = undefined;
+    this.stableTimer = undefined;
     const socket = this.socket;
     this.socket = undefined;
     if (socket) {
@@ -72,11 +93,8 @@ export class EventsSocket {
     this.socket = socket;
     socket.onopen = () => {
       if (this.stopped || this.socket !== socket) return;
-      this.attempt = 0;
-      this.options.onStatus(true);
+      this.options.onStatus(false);
       if (this.channels.length) this.send({ action: "subscribe", channels: this.channels });
-      if (this.openedBefore) this.options.onReconnect();
-      this.openedBefore = true;
     };
     socket.onmessage = (message) => {
       if (this.stopped || this.socket !== socket || typeof message.data !== "string") return;
@@ -88,6 +106,20 @@ export class EventsSocket {
       }
       if (typeof value !== "object" || value === null) return;
       const event = value as Partial<RealtimeEvent>;
+      if (event.type === "subscribed") {
+        this.options.onStatus(true);
+        this.openedBefore = true;
+        if (this.reconnectPending) {
+          this.reconnectPending = false;
+          this.options.onReconnect();
+        }
+        if (this.stableTimer !== undefined) clearTimeout(this.stableTimer);
+        this.stableTimer = setTimeout(() => {
+          this.stableTimer = undefined;
+          this.attempt = 0;
+        }, 30_000);
+        return;
+      }
       if (typeof event.id !== "string" || typeof event.type !== "string") return;
       if (this.seen.has(event.id)) return;
       this.seen.add(event.id);
@@ -109,11 +141,14 @@ export class EventsSocket {
       if (this.stopped || this.socket !== socket) return;
       this.socket = undefined;
       this.options.onStatus(false);
+      if (this.stableTimer !== undefined) clearTimeout(this.stableTimer);
+      this.stableTimer = undefined;
       if (event.code === 4401) {
         this.options.onExpired();
         return;
       }
       if (this.openedBefore) this.options.onDisconnect();
+      this.reconnectPending = true;
       const delay = reconnectDelay(this.attempt++);
       this.timer = setTimeout(() => {
         this.timer = undefined;

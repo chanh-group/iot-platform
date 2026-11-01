@@ -17,7 +17,10 @@ export function AttributesPanel(props: { api: ApiClient; deviceId: string; recon
 
   return (
     <section class="panel" aria-labelledby="attributes-title">
-      <h2 id="attributes-title">Latest attributes</h2>
+      <div class="panel-head">
+        <h2 id="attributes-title">Latest attributes</h2>
+        <button class="button" onClick={attributes.refresh}>Refresh attributes</button>
+      </div>
       <Show when={attributes.state().loading}><p class="loading" role="status">Loading attributes…</p></Show>
       <Show when={attributes.state().error}><ErrorMessage error={attributes.state().error} /></Show>
       <Show when={attributes.state().data}>

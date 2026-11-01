@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import { startRequest } from "../src/lib/useRequest";
+import { createRoot } from "solid-js";
+import { startRequest, useActions } from "../src/lib/useRequest";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -53,5 +54,23 @@ describe("request lifecycle", () => {
     dispose();
 
     expect(signal?.aborted).toBe(true);
+  });
+
+  it("aborts an App action when its Solid owner is disposed", async () => {
+    const scope = createRoot((dispose) => ({ actions: useActions(), dispose }));
+    let signal: AbortSignal | undefined;
+    let started!: () => void;
+    const requestStarted = new Promise<void>((resolve) => { started = resolve; });
+    const pending = scope.actions((currentSignal) => new Promise<never>((_resolve, reject) => {
+      signal = currentSignal;
+      started();
+      currentSignal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+    }));
+
+    await requestStarted;
+    scope.dispose();
+
+    expect(signal?.aborted).toBe(true);
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
   });
 });

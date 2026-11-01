@@ -1,4 +1,4 @@
-import { For, Show } from "solid-js";
+import { For, Show, createEffect } from "solid-js";
 import { ApiClient } from "../lib/api";
 import type { RealtimeEvent } from "../lib/models";
 import { useDeviceTelemetry } from "../lib/deviceTelemetry";
@@ -17,6 +17,12 @@ export function TelemetryPanel(props: {
     () => props.reconnectKey,
     () => props.liveEvents,
   );
+  let keySelect!: HTMLSelectElement;
+  createEffect(() => {
+    const key = telemetry.key();
+    const keys = telemetry.latestValues();
+    if (keys.some((item) => item.key === key)) keySelect.value = key;
+  });
 
   return (
     <>
@@ -38,9 +44,9 @@ export function TelemetryPanel(props: {
           <div><h2 id="telemetry-title">Telemetry history</h2><p>History uses [from, to); live and reconnect-backfill samples overlay separately without changing that range.</p></div>
         </div>
         <div class="toolbar">
-          <div class="field"><label for="history-from">From</label><input id="history-from" type="datetime-local" value={telemetry.from()} onInput={(event) => telemetry.changeFrom(event.currentTarget.value)} /></div>
-          <div class="field"><label for="history-to">To</label><input id="history-to" type="datetime-local" value={telemetry.to()} onInput={(event) => telemetry.changeTo(event.currentTarget.value)} /></div>
-          <div class="field"><label for="telemetry-key">Value key</label><select id="telemetry-key" value={telemetry.key()} onChange={(event) => telemetry.changeKey(event.currentTarget.value)}>
+          <div class="field"><label for="history-from">From</label><input id="history-from" type="datetime-local" step="0.001" value={telemetry.from()} onInput={(event) => telemetry.changeFrom(event.currentTarget.value)} /></div>
+          <div class="field"><label for="history-to">To</label><input id="history-to" type="datetime-local" step="0.001" value={telemetry.to()} onInput={(event) => telemetry.changeTo(event.currentTarget.value)} /></div>
+          <div class="field"><label for="telemetry-key">Value key</label><select id="telemetry-key" ref={keySelect} value={telemetry.key()} onChange={(event) => telemetry.changeKey(event.currentTarget.value)}>
             <option value="">All values</option>
             <For each={telemetry.latestValues()}>{(item) => <option value={item.key}>{item.key}{typeof item.value === "number" ? " · numeric" : " · latest only"}</option>}</For>
           </select></div>
