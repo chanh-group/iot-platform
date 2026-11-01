@@ -184,6 +184,7 @@ pub struct Metrics {
     pub command_dispatch_wake_dropped_total: Counter,
     pub ws_clients: Gauge,
     pub ws_dropped_total: Counter,
+    pub http_rejected_total: Counter,
 }
 
 impl Metrics {
@@ -298,6 +299,11 @@ impl Metrics {
         );
         counter(
             &mut output,
+            "iot_telemetry_ack_dropped_total",
+            self.telemetry_ack_dropped_total.get(),
+        );
+        counter(
+            &mut output,
             "iot_audit_write_errors_total",
             self.audit_write_errors_total.get(),
         );
@@ -346,6 +352,11 @@ impl Metrics {
             &mut output,
             "iot_ws_dropped_total",
             self.ws_dropped_total.get(),
+        );
+        counter(
+            &mut output,
+            "iot_http_rejected_total",
+            self.http_rejected_total.get(),
         );
         output
     }

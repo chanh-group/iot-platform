@@ -73,6 +73,8 @@ pub struct AppState {
     pub mqtt_failure: MqttFailure,
     /// Limits active WebSocket connections before upgrade.
     pub ws_connections: Arc<Semaphore>,
+    /// Limits concurrent HTTP requests before handlers start.
+    pub http_requests: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -87,6 +89,8 @@ impl AppState {
     ) -> Self {
         let max_ws_connections =
             usize::try_from(config.config.http.max_ws_connections).unwrap_or(usize::MAX);
+        let max_concurrent_requests =
+            usize::try_from(config.config.http.max_concurrent_requests).unwrap_or(usize::MAX);
         let limiter = LoginRateLimiter::new(
             config.config.auth.login_max_attempts,
             Duration::from_millis(config.config.auth.login_window_ms),
@@ -108,6 +112,7 @@ impl AppState {
             presence,
             mqtt_failure: mqtt_control.failure,
             ws_connections: Arc::new(Semaphore::new(max_ws_connections)),
+            http_requests: Arc::new(Semaphore::new(max_concurrent_requests)),
         }
     }
 

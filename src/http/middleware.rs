@@ -4,19 +4,52 @@ use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-use axum::extract::{FromRequest, Request};
+use axum::extract::{FromRequest, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex;
 
+use crate::observability::metrics::Metrics;
 use crate::observability::request_id::RequestId;
 
+use super::AppState;
 use super::api_error::ApiError;
 
 const CSRF_HEADER: &str = "x-iot-csrf";
 const CLEANUP_THRESHOLD: usize = 1024;
+
+fn try_acquire_http_request(
+    requests: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, ()> {
+    requests.clone().try_acquire_owned().map_err(|_| ())
+}
+
+/// Rejects requests when the bounded in-flight HTTP budget is exhausted.
+pub async fn concurrency_limit(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let request_id = request_id(&request);
+    let permit = match try_acquire_http_request(&state.http_requests) {
+        Ok(permit) => permit,
+        Err(_) => {
+            Metrics::global().http_rejected_total.inc();
+            return ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "request_capacity_exceeded",
+                "request capacity exceeded".to_owned(),
+                request_id,
+            )
+            .into_response();
+        }
+    };
+    let response = next.run(request).await;
+    drop(permit);
+    response
+}
 
 /// Why a mutating request failed the CSRF gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -375,6 +408,15 @@ mod tests {
             rate_key(ip, &long),
             rate_key(ip, &format!("{}b", "a".repeat(64)))
         );
+    }
+
+    #[test]
+    fn http_request_budget_rejects_when_full() {
+        let requests = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = try_acquire_http_request(&requests).expect("first request fits");
+        assert!(try_acquire_http_request(&requests).is_err());
+        drop(permit);
+        assert!(try_acquire_http_request(&requests).is_ok());
     }
 
     #[tokio::test]

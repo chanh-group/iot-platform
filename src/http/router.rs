@@ -6,7 +6,7 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{Method, StatusCode, Uri};
-use axum::middleware::from_fn;
+use axum::middleware::{from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing;
 use axum::{Json, Router};
@@ -79,6 +79,10 @@ pub fn build(state: AppState) -> Router {
     router
         .layer(DefaultBodyLimit::max(
             usize::try_from(max_body_bytes).unwrap_or(usize::MAX),
+        ))
+        .layer(from_fn_with_state(
+            state.clone(),
+            middleware::concurrency_limit,
         ))
         .layer(from_fn(middleware::csrf))
         .layer(TimeoutLayer::with_status_code(

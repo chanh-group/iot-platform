@@ -12,6 +12,7 @@
 | --- | --- |
 | HTTP body | `http.max_body_bytes`, mặc định 262 144 byte |
 | HTTP request timeout | `http.request_timeout_ms`, mặc định 30 000 ms |
+| HTTP concurrent requests | `http.max_concurrent_requests`, mặc định 256; vượt giới hạn trả `503 request_capacity_exceeded` |
 | Telemetry payload | `telemetry.max_payload_bytes`, mặc định 65 536 byte |
 | Telemetry values | tối đa `telemetry.max_keys` = 128 key; string tối đa 4 096 byte |
 | Command params | 16 384 byte JSON object |
@@ -963,6 +964,7 @@ Envelope event:
 | 500 | `internal_error` | Lỗi không mong đợi |
 | 500 | `config_write_failed` | Ghi runtime.toml lỗi |
 | 503 | `not_ready` | Readiness false |
+| 503 | `request_capacity_exceeded` | Đã đủ HTTP request đang xử lý |
 | 503 | `storage_unavailable` | DB/disk lỗi khi xử lý request |
 
 ## 5. Contract cấu hình
@@ -983,6 +985,7 @@ dashboard = true
 max_body_bytes = 262144
 cookie_secure = false
 request_timeout_ms = 30000
+max_concurrent_requests = 256
 max_ws_connections = 100
 ws_queue_capacity = 256
 metrics = false
@@ -1058,6 +1061,7 @@ format = "json"
 | `http.max_body_bytes` | integer | 1 024..10 485 760, default 262 144 | |
 | `http.cookie_secure` | bool | default false | true khi HTTPS proxy |
 | `http.request_timeout_ms` | integer | 1 000..120 000, default 30 000 | |
+| `http.max_concurrent_requests` | integer | 1..16 384, default 256 | Request vượt giới hạn trả 503 |
 | `http.max_ws_connections` | integer | 1..10 000, default 100 | |
 | `http.ws_queue_capacity` | integer | 16..4 096, default 256 | |
 | `http.metrics` | bool | default false | Bật `/metrics` (bắt buộc Bearer token riêng) |

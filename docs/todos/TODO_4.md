@@ -1,0 +1,255 @@
+# TODO — Ngày 5 / Phase 4: Tin cậy, bảo mật, shutdown, Docker, backup
+
+TODO dựa trên contract hiện tại; không dùng checklist này để tự thay đổi contract hoặc stack.
+
+Mục tiêu: hoàn thiện A01, A04, A08, A09, A15–A17 và A19; đóng gói Docker single-binary; backup/restore SQLite đã test; tài liệu vận hành và release checklist đầy đủ. Phase này **chốt MVP** — khi tất cả gate pass, tiến hành release.
+
+Nguồn sự thật:
+
+- `docs/SPEC.md` — §5–§10, §13 acceptance A01–A17/A19/A20.
+- `docs/plans/01-stack-and-architecture.md` — stack/version, ADR, bounded queues, failure policy.
+- `docs/plans/02-contracts.md` — §2.10, §3, §4, §5, test vector C1–C10/H1–H8.
+- `docs/plans/03-delivery-plan.md` — §7 P4-01..P4-12, §9 test mapping, §10 CI, §11 Docker/vận hành, §12 Definition of Done.
+- `docs/RUST_STYLE_GUIDE.md` và `AGENTS.md` — chuẩn code và lệnh kiểm tra bắt buộc.
+- `docs/todos/TODO_3.md` — hồ sơ gate Phase 3, evidence đã ghi nhận và các giới hạn đã chấp nhận.
+
+## 0. Điều kiện vào và quy tắc thực thi
+
+- [x] Phase 3 gate đầu vào cho A10–A14, dashboard, runtime PATCH, credential rotate, audit/redaction và strict TypeScript đã có evidence tên test cụ thể trong `TODO_3.md §10`; đã đọc `TODO_3.md §10`. Không claim Phase 3 PASS vì hồ sơ đó vẫn còn các mục bàn giao mở.
+- [x] Chạy lại baseline trước khi bắt đầu:
+  ```sh
+  cargo fmt --all --check
+  cargo clippy --all-targets --all-features -- -D warnings
+  cargo test --all
+  git diff --check
+  # tại web/:
+  bun install --frozen-lockfile
+  bun run --bun typecheck
+  bun run --bun test
+  bun run --bun build
+  ```
+  Tất cả phải PASS. Ghi evidence (số lượng test, timestamp) trước khi tick.
+
+  Evidence 2026-11-01T23:35:52+07:00: Rust toolchain 1.98.0 — `cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all` (242 passed, 0 failed across 30 suites) và `git diff --check` PASS. Web — `bun install --frozen-lockfile` (Bun 1.4.4), `bun run --bun typecheck`, `bun run --bun test` (25 passed, 165 assertions, 0 failed) và `bun run --bun build` PASS. Không có dependency hay hành vi sản phẩm nào thay đổi.
+- [ ] Đọc lại contract liên quan trước mỗi task; cập nhật `02` trước khi đổi hành vi; thêm ADR trong `01` nếu đổi version/image/TLS/backup strategy.
+- [ ] Không thêm dependency ngoài `01` nếu chưa ghi ADR và lý do.
+- [ ] Mọi test crash/kill dùng binary thật + hook `cfg(debug_assertions)` — không bật trong `--release`.
+- [ ] Không làm PostgreSQL/MySQL (Phase 5). Không thêm cluster/HA/multi-tenancy.
+
+## 1. Rà soát bounded resources — P4-01
+
+- [x] Kiểm tra toàn repo: mọi channel/queue/WS/MQTT/HTTP phải có giới hạn kích thước. Đã đối chiếu với contract `02` §2.10 và stack `01`: ingest queue `telemetry.queue_capacity`; command ACK queue 4 096; dispatcher wake queue 4 096; WS queue theo `http.ws_queue_capacity` và tổng connection theo `http.max_ws_connections`; MQTT inflight/queued messages theo cấu hình RMQTT; HTTP body theo `http.max_body_bytes` và in-flight theo `http.max_concurrent_requests`.
+- [x] Thêm metric cho điểm reject/drop: ingest queue, ACK queue, dispatcher wake, WS/broadcast, retained cap, attribute queue và HTTP request capacity đều có counter tương ứng; không có `unbounded_channel` trong `src/`.
+- [x] Ghi audit checklist và test cho giới hạn HTTP; không thêm `unbounded_channel` mới.
+- [x] Evidence: `cargo test --all` PASS (245 passed, 0 failed); unit `http::middleware::tests::http_request_budget_rejects_when_full` và integration `config_validation::http_concurrent_request_limit_is_bounded` PASS. `cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `git diff --check` PASS. Thay đổi HTTP thêm `http.max_concurrent_requests` mặc định 256, reject `503 request_capacity_exceeded` và metric `iot_http_rejected_total`.
+
+## 2. DB failure, disk full và backpressure — P4-02
+
+- [ ] Kiểm tra `src/core/telemetry/worker.rs` và pool: khi DB mất kết nối hoặc ghi lỗi, readiness false và không gửi ACK `stored` giả. Retry với backoff có giới hạn theo config.
+- [ ] Disk full: test scenario SQLite từ chối ghi (`SQLITE_FULL`); không panic; không ACK; readiness false; recover khi disk có chỗ.
+- [ ] Queue đầy: test reject telemetry khi ingest queue saturated; metric `ingest_rejected_total{reason=queue_full}` đúng; không giảm RAM vô hạn.
+- [ ] Phục hồi sau lỗi DB tạm thời (simulated): readiness trở lại true sau lần ghi thành công tiếp theo.
+- [ ] Evidence: `tests/storage_failure.rs` — ít nhất ba scenario: DB lỗi (readiness false, không ACK), disk full (không panic, không ACK), queue đầy (bounded RAM, metric); và phục hồi tự động sau lỗi tạm.
+- [ ] Đây là A09; đối chiếu với acceptance criteria `SPEC.md §13 A09`.
+
+## 3. Crash recovery — P4-03
+
+- [ ] Implement hook `IOT_TEST_PAUSE_BEFORE_COMMIT` và `IOT_TEST_PAUSE_AFTER_COMMIT` trong telemetry worker chỉ compile khi `#[cfg(debug_assertions)]`. Hook chờ signal/file sentinel để resume; không dùng trong release.
+- [ ] Test: kill -9 trước commit → restart → thiết bị retry → không mất dữ liệu, không tạo bản trùng trong retention window.
+- [ ] Test: kill -9 sau commit nhưng trước ACK → restart → ACK không đến → thiết bị retry cùng event_id → nhận `duplicate` ACK, không tạo thêm bản ghi.
+- [ ] Test: kill -9 sau commit + ACK → restart → không mất dữ liệu; command pending phục hồi từ SQL.
+- [ ] Dùng binary thật (`cargo build`, không `--release`) với `IOT_TEST_PAUSE_*` env; spawn child, send SIGKILL, restart, verify.
+- [ ] Evidence: `tests/crash_recovery.rs` — ít nhất ba scenario trên; mỗi scenario ghi rõ hook, kill point và assertion.
+- [ ] Đây là A08.
+
+## 4. Graceful shutdown — P4-04
+
+- [ ] Mở rộng `src/runtime/shutdown.rs` và `src/runtime/supervisor.rs` để xử lý đầy đủ:
+  1. Nhận SIGTERM → readiness false → ngừng accept request HTTP mới.
+  2. Drain queue telemetry và commit trong deadline `shutdown_timeout_ms`.
+  3. Kick tất cả MQTT session đang kết nối.
+  4. Đóng HTTP listener, MQTT listener, DB pool.
+  5. Release data-dir lock.
+  6. Exit code 0 khi sạch; log số lượng item còn chờ nếu hết deadline.
+- [ ] Không ACK item chưa commit trước khi drain hoàn tất.
+- [ ] Tín hiệu thứ hai (SIGTERM/SIGINT trong khi đang shutdown) → exit ngay; không panic.
+- [ ] Test: SIGTERM khi có request in-flight → request hoàn tất (nếu trong deadline) hoặc trả 503; lock được release; exit 0. Test: SIGTERM khi ingest queue không rỗng → drain/commit → exit. Test: deadline hết → log và exit.
+- [ ] Evidence: `tests/shutdown.rs` (nếu chưa có) hoặc mở rộng `tests/shutdown_http.rs`; tên test cụ thể.
+- [ ] Đây là A16.
+
+## 5. Security suite — P4-05
+
+- [ ] Tổng hợp và chạy lại bộ test bảo mật đã có từ Phase 2/3; đảm bảo không có regression:
+  - ACL wildcard/cross-device: device A không đọc/ghi topic device B.
+  - Rotate/disable: token cũ từ chối sau rotate; connection bị kick sau disable.
+  - CSRF: mutation thiếu `X-IoT-CSRF` → 403.
+  - Cookie: HttpOnly, SameSite=Strict, không lộ token trong GET/list/WS.
+  - Rate limit: login sai nhiều lần → 429.
+  - Redaction: không lộ token/password/hash/SQL trong log/audit/response.
+  - Device token không dùng được cho HTTP admin.
+- [ ] Tạo `tests/security.rs` tổng hợp tất cả scenario trên nếu chưa có; hoặc ghi rõ test ở file nào đã cover.
+- [ ] Không thêm endpoint mới trong Phase 4; chỉ kiểm tra endpoint đã có.
+- [ ] Evidence: `tests/security.rs` pass hoặc list file+test_name cho từng scenario.
+
+## 6. WebSocket slow client và A15 release gate — P4-06
+
+- [ ] Kiểm tra lại `src/http/ws.rs`: khi per-client queue đầy → đóng connection với close code `1013 Try Again Later`; log; metric; không block broadcast cho client khác.
+- [ ] REST backfill sau WS reconnect: client nhận event mới nhất qua REST, không giả định WS có replay bền vững. Backfill telemetry, command và overview đúng `[from, to)` của khoảng thời gian ngắt kết nối.
+- [ ] Test: slow consumer không đọc → queue đầy → close 1013 → slot được release → kết nối mới được chấp nhận.
+- [ ] Test: WS disconnect/reconnect → REST backfill telemetry bù đúng số bản ghi; không replay bản đã nhận.
+- [ ] Test: session logout → WS đóng với close 4401.
+- [ ] Đây là A15 release gate; Phase 3 đã có evidence một phần (`tests/ws_telemetry.rs`). Tick khi full gate pass kể cả slow-client.
+- [ ] Evidence: `tests/ws_slow.rs` hoặc mở rộng `tests/ws_telemetry.rs` — slow_consumer_close_1013, reconnect_backfill, logout_close_4401.
+
+## 7. Dockerfile multi-stage — P4-07
+
+- [ ] Tạo `deploy/Dockerfile` multi-stage:
+  1. Stage 1 `oven/bun:1.4.2-alpine` (hoặc bookworm): `COPY web/ .` → `bun install --frozen-lockfile && bun run --bun build`.
+  2. Stage 2 `rust:1.98-bookworm` (hoặc slim): copy web/dist từ stage 1 + Cargo source; `cargo build --release --locked`.
+  3. Stage 3 `debian:bookworm-slim`: copy binary từ stage 2; cài `ca-certificates`, `curl` (healthcheck); tạo user non-root `iot` UID 10001; không copy source/target/node_modules.
+- [ ] Binary path `/usr/local/bin/iot-server`; workdir `/app`; config `/app/conf.toml`; data `/app/data`.
+- [ ] `ENTRYPOINT ["/usr/local/bin/iot-server"]`; `CMD ["run", "--config", "/app/conf.toml"]`; `STOPSIGNAL SIGTERM`.
+- [ ] `USER iot`; không chạy root; file không có setuid.
+- [ ] Tạo `.dockerignore`: loại trừ `target/`, `web/node_modules/`, `web/dist/`, `data/`, log, `.git`, `spikes/`.
+- [ ] Smoke test image build: `docker build -t iot-server:local .` thành công; image chạy `--version` không lỗi; file không chứa secret mẫu.
+- [ ] Evidence: `deploy/Dockerfile` và `deploy/.dockerignore` commit; image build PASS trong CI (hoặc record lệnh + output).
+
+## 8. Docker Compose SQLite và config mẫu — P4-08
+
+- [ ] Tạo `deploy/compose.sqlite.yml`:
+  - Service `iot-server` dùng image build local hoặc registry.
+  - Ports `8080:8080` và `1883:1883` (bind localhost hoặc note bảo mật).
+  - Volume `./data:/app/data`; config mount `./conf.docker.toml:/app/conf.toml:ro`.
+  - Healthcheck `curl -fsS http://127.0.0.1:8080/healthz`.
+  - `stop_grace_period: 20s`, `init: true`.
+- [ ] Tạo `deploy/conf.docker.toml`: bind `0.0.0.0`, `data_dir=/app/data`, `database.url=sqlite:///app/data/iot.db`, `cookie_secure=false` ghi chú rõ chỉ khi local.
+- [ ] Ghi chú cảnh báo: không publish MQTT plaintext ra Internet nếu không có TLS proxy.
+- [ ] Test A17: Docker recreate cùng volume → giữ device/credential/telemetry/runtime config. Script test: `docker compose -f deploy/compose.sqlite.yml up -d` → seed data → `docker compose down` → `docker compose up -d` → assert data còn.
+- [ ] Evidence: `tests/docker_smoke.sh` hoặc tương đương; A17 pass.
+
+## 9. Backup/restore SQLite — P4-09
+
+- [ ] Tạo `deploy/backup.sh`: dừng container (SIGTERM, chờ exit) → copy `iot.db` + `-wal` + `-shm` → ghi checksum; hoặc dùng `sqlite3 .backup` / `VACUUM INTO` khi app dừng.
+- [ ] Ghi rõ: **không copy riêng `.db` khi app đang chạy WAL** — coi là backup không đầy đủ; document cảnh báo.
+- [ ] Test restore: copy backup vào data dir mới → chạy `iot-server run` → kiểm tra device/telemetry/runtime revision còn đúng. Test này phải chạy được như integration test (không cần Docker nếu dùng SQLite backup API).
+- [ ] Tạo/cập nhật `docs/operations.md` với hướng dẫn backup/restore, kiểm tra WAL, monitoring disk.
+- [ ] Evidence: restore test pass; `docs/operations.md` commit.
+
+## 10. Load test baseline — P4-10
+
+- [ ] Thiết lập test tải tối thiểu: 1 000 connection MQTT đồng thời, gửi telemetry QoS 1 với event_id, kiểm tra ACK rate và latency p95.
+- [ ] Ghi rõ hardware (vCPU, RAM, disk type), engine SQLite, kích thước message, QoS, số connection, tốc độ ingest target, kết quả p95 latency, RAM peak và disk growth/phút.
+- [ ] Không commit throughput làm cam kết release; chỉ báo cáo số đo thực tế trên hardware đã ghi.
+- [ ] Định nghĩa alert rules cho: DB/readiness lỗi, disk gần đầy (≥80%), queue saturation, ingest rejection và backup lỗi; lưu tại `deploy/alerts/` hoặc doc.
+- [ ] Test alert rules: kiểm tra rule syntax (ví dụ PromQL nếu dùng Prometheus); mỗi rule có ít nhất một test case firing/non-firing.
+- [ ] Diễn tập restore: chạy `deploy/backup.sh` → phá file DB → restore → assert data đúng; record kết quả.
+- [ ] Evidence: `tests/load/` (script hoặc binary) + báo cáo kết quả; `deploy/alerts/` rules + test; restore drill log.
+
+## 11. Tài liệu — P4-11
+
+- [ ] `README.md`: quick start (Docker, SQLite); yêu cầu phần cứng tối thiểu; cảnh báo TLS; badge CI nếu có.
+- [ ] `docs/operations.md`: deploy (Docker/Compose), config mẫu, backup/restore, retention, log, shutdown, monitoring, alert/runbook.
+- [ ] API reference (hoặc đường dẫn đến contract `02`): endpoint, auth, WebSocket subscribe/unsubscribe, lỗi.
+- [ ] MQTT guide: topic, QoS, ACL, application ACK, command flow, LWT.
+- [ ] Troubleshooting: lock conflict (exit 5), migration fail (exit 4), admin đã tồn tại (exit 6), disk full, DB lỗi, MQTT refuse.
+- [ ] Không viết placeholder rỗng; mỗi section phải có nội dung đủ để vận hành.
+- [ ] Evidence: review từng tài liệu; commit; không còn mục TODO/placeholder trong doc.
+
+## 12. Release checklist, SBOM và scan — P4-12
+
+- [ ] Tạo `docs/release-checklist.md` với các bước:
+  1. Baseline: `cargo fmt --check`, `clippy -D warnings`, `cargo test --all`, frontend typecheck/test/build, `cargo build --release --locked`.
+  2. `cargo deny check`; `cargo audit`; không có advisory critical/high chưa có exception còn hạn.
+  3. Docker build; smoke image.
+  4. A01–A17/A19/A20 gate pass — ghi tên test và timestamp.
+  5. Backup/restore drill pass.
+  6. Alert/runbook review.
+  7. Tạo SBOM (`cargo sbom` hoặc `syft`).
+  8. Quét dependency/OS image (`trivy` hoặc tương đương); không có critical/high unmitigated.
+  9. Ký image và tạo provenance (cosign hoặc tương đương).
+  10. Tag semver, push image, tạo release artifact.
+- [ ] Implement CI workflow release (GitHub Actions hoặc tương đương) chạy khi tag semver: build, test, SBOM, scan, sign, publish image và artifact Linux x86_64.
+- [ ] Không có item TODO/P0/P1 trong `src/` khi release; backlog chỉ chứa mục sau MVP.
+- [ ] Evidence: `docs/release-checklist.md` commit; CI workflow file commit; ít nhất một dry-run (không push thật) pass.
+
+## 13. Kiểm tra cuối Phase 4
+
+Chạy ở repo root:
+
+```sh
+cargo fmt --all --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all
+cargo test --release --locked
+git diff --check
+```
+
+Tại `web/`:
+
+```sh
+bun install --frozen-lockfile
+bun run --bun typecheck
+bun run --bun test
+bun run --bun build
+```
+
+Sau build frontend, ở repo root:
+
+```sh
+cargo build --release --locked
+```
+
+Docker:
+
+```sh
+docker build -t iot-server:local .
+docker run --rm iot-server:local --version
+```
+
+Checklist gate — ghi tên test và timestamp thực tế khi tick:
+
+- [ ] A01: `tests/e2e_boot.rs` (hoặc tương đương) pass — binary mới với SQLite: migrate, dashboard/API và MQTT sẵn sàng.
+- [ ] A04 đầy đủ: `tests/mqtt_acl.rs` wildcard/cross-device và `tests/security.rs` ACL regression pass.
+- [ ] A08: `tests/crash_recovery.rs` — kill trước commit, sau commit trước ACK, sau ACK — tất cả pass.
+- [ ] A09: `tests/storage_failure.rs` — DB lỗi (readiness false, không ACK), disk full, queue đầy (bounded RAM, metric), phục hồi — pass.
+- [ ] A15 release gate: `tests/ws_slow.rs` hoặc `tests/ws_telemetry.rs` — slow consumer close 1013, reconnect backfill, logout close 4401 — pass.
+- [ ] A16: `tests/shutdown.rs` — SIGTERM drain, không mất ACK, lock release, exit 0 — pass.
+- [ ] A17: `tests/docker_smoke.sh` — Docker recreate cùng volume giữ data — pass.
+- [ ] A19 regression: `tests/mqtt_protocol.rs` — QoS/wildcard/retain/LWT/session/dup client/version matrix — pass.
+- [ ] Bounded resources: không còn `unbounded_channel` nghiệp vụ; audit checklist P4-01 hoàn tất.
+- [ ] Security: `tests/security.rs` tất cả scenario pass; không regression từ Phase 2/3.
+- [ ] Backup/restore drill: `deploy/backup.sh` + restore test pass; `docs/operations.md` có hướng dẫn.
+- [ ] Load test baseline: báo cáo có hardware/số liệu; alert rules commit; restore drill log.
+- [ ] Tài liệu: README, operations, API, MQTT, troubleshooting — không còn placeholder.
+- [ ] Release checklist: `docs/release-checklist.md` commit; CI workflow file; `cargo deny check` + `cargo audit` sạch; SBOM + scan dry-run pass.
+- [ ] `cargo fmt --check`, `clippy -D warnings`, `cargo test --all`, strict TypeScript, Docker smoke — tất cả PASS.
+- [ ] Không còn TODO/P0/P1 trong `src/`; backlog Phase 5 ghi rõ.
+
+## 14. Rà Rust style và giữ thay đổi tối thiểu
+
+- [ ] Chạy `cargo fmt --all --check` và `cargo clippy --all-targets --all-features -- -D warnings` sau mỗi task; không merge khi còn warning.
+- [ ] Không thêm `unwrap`/`expect` trên path runtime trừ invariant đã chứng minh có comment.
+- [ ] Không thêm dependency mới ngoài `01` nếu chưa ghi ADR; không tạo trait/module chỉ để đủ tên checklist.
+- [ ] Mỗi test dùng data dir riêng; không dùng chung DB; cleanup temp sau test.
+- [ ] Hook crash test chỉ compile trong `debug_assertions`; không bật trong release.
+
+## 15. Không làm trong Phase 4
+
+- PostgreSQL/MySQL (Phase 5).
+- MQTT 5, topic alias, `$share`, MQTT over WebSocket.
+- TLS MQTT listener tích hợp (nếu chưa có ADR; TCP proxy là đủ cho MVP với tài liệu).
+- Rule engine, dynamic plugin, export data, read-only account.
+- Cluster, HA, multi-tenancy, billing.
+- Tính năng dashboard mới ngoài những gì Phase 3 đã ship.
+- Thay đổi schema migration đã áp dụng.
+
+## 16. Commit và hồ sơ bàn giao
+
+- [ ] Commit theo nhóm task; mỗi commit build/test được.
+- [ ] Message gợi ý: `feat(reliability): bounded resources audit`, `feat(crash): crash recovery hooks`, `feat(shutdown): graceful drain and kick`, `feat(security): security suite`, `feat(ws): slow client and A15 gate`, `build(docker): multi-stage Dockerfile`, `docs: operations and release checklist`, `release: MVP v0.1.0`.
+- [ ] Không commit `target/`, `data/`, `web/dist/`, `web/node_modules/`, log, secret.
+- [ ] Hồ sơ bàn giao Phase 4: ghi vào phần này sau khi hoàn tất — timestamp chạy, số test pass, Docker image digest, SBOM artifact, kết quả load test và restore drill.
+
+---
+
+> **Phase 4 PASS** khi tất cả gate ở §13 tick, không còn placeholder doc, release checklist dry-run pass, và không còn item nào trong `src/` có tag TODO/P0/P1.

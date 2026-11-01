@@ -49,6 +49,13 @@ pub fn validate(config: &Config) -> Vec<String> {
     );
     range(
         &mut errors,
+        "http.max_concurrent_requests",
+        config.http.max_concurrent_requests,
+        1,
+        16_384,
+    );
+    range(
+        &mut errors,
         "http.max_ws_connections",
         config.http.max_ws_connections,
         1,

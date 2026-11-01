@@ -78,6 +78,23 @@ fn out_of_range_value_reports_its_path() {
 }
 
 #[test]
+fn http_concurrent_request_limit_is_bounded() {
+    let dir = TempDir::new().unwrap();
+    let path = write_config(
+        &dir,
+        &format!("{DB}\n[http]\nmax_concurrent_requests = 0\n"),
+    );
+
+    let error = config::load_with_env(&path, |_| None).unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("http.max_concurrent_requests"),
+        "{message}"
+    );
+    assert!(message.contains("must be in 1..=16384"), "{message}");
+}
+
+#[test]
 fn telemetry_batch_must_fit_one_maximum_payload() {
     let dir = TempDir::new().unwrap();
     let path = write_config(

@@ -11,6 +11,7 @@ dashboard = true
 max_body_bytes = 262144
 cookie_secure = false
 request_timeout_ms = 30000
+max_concurrent_requests = 256
 max_ws_connections = 100
 ws_queue_capacity = 256
 metrics = false
