@@ -407,6 +407,8 @@ impl TestAppBuilder {
                  batch_size = {}\n\
                  max_batch_bytes = {}\n\
                  flush_interval_ms = {}\n\
+                 retry_initial_ms = {}\n\
+                 retry_max_ms = {}\n\
                  retention_days = {}\n\
                  max_future_skew_ms = {}\n\
                  max_past_skew_ms = {}\n\
@@ -434,6 +436,8 @@ impl TestAppBuilder {
                 self.telemetry_config.batch_size,
                 self.telemetry_config.max_batch_bytes,
                 self.telemetry_config.flush_interval_ms,
+                self.telemetry_config.retry_initial_ms,
+                self.telemetry_config.retry_max_ms,
                 self.telemetry_config.retention_days,
                 self.telemetry_config.max_future_skew_ms,
                 self.telemetry_config.max_past_skew_ms,

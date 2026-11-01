@@ -186,7 +186,10 @@ async fn run_worker(
             .map(|work| (work.device_id.clone(), work.event.clone()))
             .collect();
         let started = std::time::Instant::now();
-        let mut backoff = Duration::from_millis(100);
+        let retry_initial_ms = settings.config.telemetry.retry_initial_ms;
+        let retry_max_ms = settings.config.telemetry.retry_max_ms;
+        let mut backoff = Duration::from_millis(retry_initial_ms);
+        let max_backoff = Duration::from_millis(retry_max_ms);
         let mut notified_storage_error = false;
         let results = loop {
             match repository.insert_batch(&rows).await {
@@ -206,7 +209,7 @@ async fn run_worker(
                         notified_storage_error = true;
                     }
                     tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                    backoff = (backoff * 2).min(max_backoff);
                 }
             }
         };

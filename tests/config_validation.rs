@@ -111,6 +111,22 @@ fn telemetry_batch_must_fit_one_maximum_payload() {
 }
 
 #[test]
+fn telemetry_retry_backoff_must_be_ordered() {
+    let dir = TempDir::new().unwrap();
+    let path = write_config(
+        &dir,
+        &format!("{DB}\n[telemetry]\nretry_initial_ms = 5000\nretry_max_ms = 100\n"),
+    );
+
+    let error = config::load_with_env(&path, |_| None).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("telemetry.retry_initial_ms: must be <= telemetry.retry_max_ms")
+    );
+}
+
+#[test]
 fn database_outside_data_dir_is_rejected() {
     let dir = TempDir::new().unwrap();
     let path = write_config(&dir, "[database]\nurl = \"sqlite://../outside.db\"\n");

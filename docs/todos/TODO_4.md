@@ -45,12 +45,12 @@ Nguồn sự thật:
 
 ## 2. DB failure, disk full và backpressure — P4-02
 
-- [ ] Kiểm tra `src/core/telemetry/worker.rs` và pool: khi DB mất kết nối hoặc ghi lỗi, readiness false và không gửi ACK `stored` giả. Retry với backoff có giới hạn theo config.
-- [ ] Disk full: test scenario SQLite từ chối ghi (`SQLITE_FULL`); không panic; không ACK; readiness false; recover khi disk có chỗ.
-- [ ] Queue đầy: test reject telemetry khi ingest queue saturated; metric `ingest_rejected_total{reason=queue_full}` đúng; không giảm RAM vô hạn.
-- [ ] Phục hồi sau lỗi DB tạm thời (simulated): readiness trở lại true sau lần ghi thành công tiếp theo.
-- [ ] Evidence: `tests/storage_failure.rs` — ít nhất ba scenario: DB lỗi (readiness false, không ACK), disk full (không panic, không ACK), queue đầy (bounded RAM, metric); và phục hồi tự động sau lỗi tạm.
-- [ ] Đây là A09; đối chiếu với acceptance criteria `SPEC.md §13 A09`.
+- [x] Kiểm tra `src/core/telemetry/ingest.rs` và pool: lỗi DB hạ readiness, không phát `stored` trước commit; retry exponential có trần cấu hình `telemetry.retry_initial_ms`/`telemetry.retry_max_ms`. Thêm validation `retry_initial_ms <= retry_max_ms`, mặc định 100/5 000 ms.
+- [x] Disk full: `tests/storage_failure.rs::sqlite_full_never_panics_or_publishes_stored_and_recovers` giới hạn SQLite thật bằng `PRAGMA max_page_count`; worker không panic/không phát `stored`, readiness false, sau khi mở rộng giới hạn thì ghi thành công và readiness hồi phục.
+- [x] Queue đầy: `tests/storage_failure.rs::saturated_ingest_queue_stays_bounded_and_exports_rejection_metric` xác nhận reject queue, metric `ingest_rejected_total{reason="queue_full"}`, queue depth không vượt capacity 16 và readiness degraded.
+- [x] Phục hồi sau lỗi DB tạm thời: `tests/storage_failure.rs::database_failure_never_publishes_stored_and_recovers` dùng trigger SQLite, xác nhận `retryable/storage_unavailable`, readiness 503 rồi `stored` và readiness 200 sau khi bỏ lỗi.
+- [x] Evidence 2026-11-01: `tests/storage_failure.rs` 3/3 pass; `tests/config_validation.rs::telemetry_retry_backoff_must_be_ordered` pass. Full `cargo test --all` 250 passed, 0 failed across 31 suites; fmt, Clippy `-D warnings` và `git diff --check` PASS.
+- [x] Đây là A09; đã đối chiếu acceptance criteria `SPEC.md §13 A09`.
 
 ## 3. Crash recovery — P4-03
 

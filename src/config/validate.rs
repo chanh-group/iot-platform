@@ -181,6 +181,20 @@ pub fn validate(config: &Config) -> Vec<String> {
     );
     range(
         &mut errors,
+        "telemetry.retry_initial_ms",
+        config.telemetry.retry_initial_ms,
+        10,
+        60_000,
+    );
+    range(
+        &mut errors,
+        "telemetry.retry_max_ms",
+        config.telemetry.retry_max_ms,
+        10,
+        300_000,
+    );
+    range(
+        &mut errors,
         "telemetry.max_batch_bytes",
         config.telemetry.max_batch_bytes,
         65_536,
@@ -315,6 +329,9 @@ pub fn validate(config: &Config) -> Vec<String> {
 
     if config.telemetry.batch_size > config.telemetry.queue_capacity {
         errors.push("telemetry.batch_size: must be <= telemetry.queue_capacity".to_owned());
+    }
+    if config.telemetry.retry_initial_ms > config.telemetry.retry_max_ms {
+        errors.push("telemetry.retry_initial_ms: must be <= telemetry.retry_max_ms".to_owned());
     }
     if config.commands.default_ttl_ms > config.commands.max_ttl_ms {
         errors.push("commands.default_ttl_ms: must be <= commands.max_ttl_ms".to_owned());

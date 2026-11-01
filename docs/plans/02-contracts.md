@@ -14,6 +14,7 @@
 | HTTP request timeout | `http.request_timeout_ms`, mặc định 30 000 ms |
 | HTTP concurrent requests | `http.max_concurrent_requests`, mặc định 256; vượt giới hạn trả `503 request_capacity_exceeded` |
 | Telemetry payload | `telemetry.max_payload_bytes`, mặc định 65 536 byte |
+| Telemetry retry backoff | `telemetry.retry_initial_ms`/`telemetry.retry_max_ms`, mặc định 100/5 000 ms |
 | Telemetry values | tối đa `telemetry.max_keys` = 128 key; string tối đa 4 096 byte |
 | Command params | 16 384 byte JSON object |
 | Device metadata | 8 192 byte JSON object, depth ≤ 8 |
@@ -1019,6 +1020,8 @@ queue_capacity = 4096
 batch_size = 500
 max_batch_bytes = 8388608
 flush_interval_ms = 1000
+retry_initial_ms = 100
+retry_max_ms = 5000
 retention_days = 30
 max_future_skew_ms = 300000
 max_past_skew_ms = 31536000000
@@ -1086,6 +1089,8 @@ format = "json"
 | `telemetry.batch_size` | integer | 1..2 000, default 500 | `<= queue_capacity` |
 | `telemetry.max_batch_bytes` | integer | 65 536..67 108 864, default 8 388 608 | Flush sớm theo byte |
 | `telemetry.flush_interval_ms` | integer | 10..60 000, default 1 000 | |
+| `telemetry.retry_initial_ms` | integer | 10..60 000, default 100 | Must be <= retry_max_ms |
+| `telemetry.retry_max_ms` | integer | 10..300 000, default 5 000 | |
 | `telemetry.retention_days` | integer | 1..3 650, default 30 | |
 | `telemetry.max_future_skew_ms` | integer | 0..86 400 000, default 300 000 | |
 | `telemetry.max_past_skew_ms` | integer | 0..31 536 000 000, default 31 536 000 000 (365 ngày) | |
