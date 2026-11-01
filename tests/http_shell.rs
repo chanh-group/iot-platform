@@ -75,9 +75,18 @@ async fn api_unknown_paths_and_methods_are_json_errors() {
 #[tokio::test]
 async fn dashboard_serves_index_and_spa_fallback_but_not_assets() {
     let server = TestApp::start().await;
+    let bundle_exists =
+        std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/web/dist/index.html")).is_file();
 
     let response = get(&server, "/").await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.status(),
+        if bundle_exists {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    );
     assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "no-store");
     assert!(
         response
@@ -88,11 +97,23 @@ async fn dashboard_serves_index_and_spa_fallback_but_not_assets() {
             .unwrap()
             .starts_with("text/html")
     );
-    assert!(response.text().await.unwrap().contains("IoT Server"));
+    let index = response.text().await.unwrap();
+    assert!(index.contains(if bundle_exists {
+        "IoT Server"
+    } else {
+        "Dashboard bundle missing"
+    }));
 
     let response = get(&server, "/devices/abc").await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert!(response.text().await.unwrap().contains("IoT Server"));
+    assert_eq!(
+        response.status(),
+        if bundle_exists {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    );
+    assert_eq!(response.text().await.unwrap(), index);
 
     let response = get(&server, "/assets/app.js").await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);

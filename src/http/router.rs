@@ -3,10 +3,11 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{Method, StatusCode, Uri, header};
+use axum::http::{Method, StatusCode, Uri};
 use axum::middleware::from_fn;
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing;
 use axum::{Json, Router};
 use serde_json::{Value, json};
@@ -132,15 +133,10 @@ async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
 }
 
 async fn index() -> Response {
-    let mut response = Html(assets::INDEX_HTML).into_response();
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        header::HeaderValue::from_static("no-store"),
-    );
-    response
+    assets::index()
 }
 
-/// Non-API GETs are the SPA; everything else gets the JSON error envelope.
+/// Non-API page routes are the SPA; missing asset paths remain 404s.
 async fn fallback(
     State(state): State<AppState>,
     RequestId(request_id): RequestId,
@@ -148,14 +144,35 @@ async fn fallback(
     uri: Uri,
 ) -> Response {
     let path = uri.path();
-    if state.config.config.http.dashboard
-        && matches!(method, Method::GET | Method::HEAD)
-        && !path.starts_with("/api")
-        && !path.starts_with("/assets")
-    {
-        return index().await;
+    if state.config.config.http.dashboard && matches!(method, Method::GET | Method::HEAD) {
+        if path == "/api" || path.starts_with("/api/") {
+            return not_found(RequestId(request_id)).await.into_response();
+        }
+
+        let asset_path = path.strip_prefix('/').unwrap_or(path);
+        let mut response = if let Some(response) = assets::asset(asset_path) {
+            response
+        } else if path == "/assets"
+            || path.starts_with("/assets/")
+            || looks_like_asset_request(path)
+        {
+            return not_found(RequestId(request_id)).await.into_response();
+        } else {
+            index().await
+        };
+        if method == Method::HEAD {
+            *response.body_mut() = Body::empty();
+        }
+        return response;
     }
     not_found(RequestId(request_id)).await.into_response()
+}
+
+fn looks_like_asset_request(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .and_then(|name| name.rsplit_once('.'))
+        .is_some_and(|(stem, extension)| !stem.is_empty() && !extension.is_empty())
 }
 
 async fn not_found(RequestId(request_id): RequestId) -> ApiError {

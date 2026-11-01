@@ -930,8 +930,8 @@ Envelope event:
 
 #### Static dashboard
 
-- `GET /` trả `index.html`; asset `/assets/*` từ bundle nhúng.
-- Fallback mọi path không bắt đầu `/api` về `index.html` (SPA).
+- `GET /` trả `index.html`; file nhúng được phục vụ theo đúng path trong `web/dist` (gồm `/assets/*` và public file ở root như `/favicon.svg`).
+- Fallback path không bắt đầu `/api` về `index.html` (SPA), sau khi kiểm tra asset nhúng; asset thiếu dưới `/assets/*` hoặc request file-like như `/missing.js` trả 404, không trả index làm asset.
 - `index.html`: `Cache-Control: no-store`; asset có hash: `public, max-age=31536000, immutable`.
 - `[http] dashboard = false`: `/` và asset trả 404; API vẫn chạy.
 - Thiếu `web/dist` trong debug: trả trang hướng dẫn build, không panic. Release thiếu asset là lỗi build.
