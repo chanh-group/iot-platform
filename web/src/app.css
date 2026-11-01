@@ -22,6 +22,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   outline: 3px solid #89b4ff;
   outline-offset: 2px;
 }
+h1[tabindex="-1"]:focus { outline: 3px solid #89b4ff; outline-offset: 2px; }
 a { color: #92b9ff; }
 h1, h2, h3, p { margin-top: 0; }
 h1, h2, h3, .brand { font-family: system-ui, sans-serif; }
@@ -37,13 +38,13 @@ small, .muted { color: var(--muted); }
 .login-card h1 { margin-top: 2rem; }
 .field { display: grid; gap: .45rem; margin: 1rem 0; }
 .field label, label { color: #c8d1e0; font-weight: 600; font-size: .9rem; }
-input, select, textarea { width: 100%; padding: .7rem .8rem; color: #f4f6fb; border: 1px solid #35425a; border-radius: 8px; background: #0e1624; }
+input, select, textarea { width: 100%; min-width: 0; padding: .7rem .8rem; color: #f4f6fb; border: 1px solid #35425a; border-radius: 8px; background: #0e1624; }
 textarea { resize: vertical; }
 input::placeholder, textarea::placeholder { color: #8290a8; }
 .button { min-height: 2.5rem; padding: .58rem .9rem; border: 1px solid #35425a; border-radius: 8px; background: #1a263a; cursor: pointer; font-weight: 600; }
 .button:hover:not(:disabled) { filter: brightness(1.15); }
 .button:disabled { cursor: not-allowed; opacity: .55; }
-.button-primary { color: white; border-color: #4383f5; background: #3473e5; }
+.button-primary { color: white; border-color: #4383f5; background: #326fdf; }
 .button-danger { border-color: #8c424d; background: #48252e; color: #ffd9dd; }
 .button-quiet { background: transparent; }
 .login-card form > .button { width: 100%; margin-top: .75rem; }

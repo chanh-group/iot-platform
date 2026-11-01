@@ -32,7 +32,7 @@ export function TelemetryPanel(props: {
         <Show when={telemetry.latest.state().error}><ErrorMessage error={telemetry.latest.state().error} /></Show>
         <Show when={telemetry.latest.state().data}>
           <Show when={telemetry.latestValues().length > 0} fallback={<p class="empty-state">No telemetry has been stored for this device.</p>}>
-            <div class="table-wrap"><table><thead><tr><th>Key</th><th>Value</th><th>Timestamp</th></tr></thead><tbody>
+            <div class="table-wrap"><table aria-label="Latest telemetry values"><thead><tr><th scope="col">Key</th><th scope="col">Value</th><th scope="col">Timestamp</th></tr></thead><tbody>
               <For each={telemetry.latestValues()}>{(item) => <tr><td>{item.key}</td><td>{formatValue(item.value)}</td><td>{formatTime(item.ts)}</td></tr>}</For>
             </tbody></table></div>
           </Show>
@@ -86,7 +86,7 @@ export function TelemetryPanel(props: {
           {(page) => <>
             <Show when={page().items.length === 0}><p class="empty-state">No stored telemetry on this history page.</p></Show>
             <Show when={page().items.length > 0}>
-              <div class="table-wrap"><table><thead><tr><th>Timestamp</th><th>Event</th><th>Values</th></tr></thead><tbody>
+              <div class="table-wrap"><table aria-label="Telemetry history"><thead><tr><th scope="col">Timestamp</th><th scope="col">Event</th><th scope="col">Values</th></tr></thead><tbody>
                 <For each={page().items}>{(row) => <tr><td>{formatTime(row.ts)}</td><td class="mono">{row.event_id}</td><td><code>{JSON.stringify(row.values)}</code></td></tr>}</For>
               </tbody></table></div>
             </Show>

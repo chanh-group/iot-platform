@@ -19,7 +19,7 @@ export function OverviewView(props: {
     <section aria-labelledby="overview-title">
       <div class="heading-row">
         <div>
-          <h1 id="overview-title">System overview</h1>
+          <h1 id="overview-title" tabIndex={-1}>System overview</h1>
           <p>Live device, ingest, and command health.</p>
         </div>
         <div class="inline-actions">

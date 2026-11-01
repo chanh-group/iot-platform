@@ -51,6 +51,8 @@ pub struct MqttServer {
     command_wakes: Option<mpsc::Receiver<String>>,
     command_wake_overflow: Arc<Notify>,
     attributes_task: Option<JoinHandle<()>>,
+    #[cfg(test)]
+    listener_stop_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 /// Reports fatal MQTT failures through the synchronized readiness path.
@@ -336,6 +338,14 @@ impl MqttServer {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_listener_stop_gate_for_test(
+        &mut self,
+        gate: (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>),
+    ) {
+        self.listener_stop_gate = Some(gate);
+    }
+
     /// Starts RMQTT in the current process and reports its bound address.
     ///
     /// Auth and presence hooks are registered before the listener runs.
@@ -366,6 +376,28 @@ impl MqttServer {
             Some((ingest, limits, attribute_queue_capacity)),
             None,
             None,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn start_with_ingest_and_test_kickers(
+        config: &MqttConfig,
+        readiness: Arc<AtomicBool>,
+        pool: SqlitePool,
+        presence: Arc<Presence>,
+        ingest: (IngestHandle, TelemetryPayload, usize),
+        primary_kicker: Arc<dyn DeviceChannel>,
+        emergency_kicker: Arc<dyn DeviceChannel>,
+    ) -> anyhow::Result<Self> {
+        Self::start_inner(
+            config,
+            readiness,
+            pool,
+            presence,
+            Some(ingest),
+            Some(primary_kicker),
+            Some(emergency_kicker),
         )
         .await
     }
@@ -570,6 +602,8 @@ impl MqttServer {
             command_wakes: Some(command_wakes),
             command_wake_overflow,
             attributes_task,
+            #[cfg(test)]
+            listener_stop_gate: None,
         })
     }
 
@@ -614,12 +648,16 @@ impl MqttServer {
         let Some(task) = self.task.as_mut() else {
             anyhow::bail!("MQTT listener task was already joined");
         };
+        #[cfg(test)]
+        let listener_stop_gate = self.listener_stop_gate.clone();
         let result = wait_for_task_or_mqtt_failure(
             task,
             &mut self.kick_task,
             &mut self.ack_task,
             &mut self.command_ack_task,
             self.connections.failure(),
+            #[cfg(test)]
+            listener_stop_gate.as_ref(),
         )
         .await;
         if self.task.as_ref().is_some_and(JoinHandle::is_finished) {
@@ -731,6 +769,7 @@ async fn wait_for_task_or_mqtt_failure(
     ack_task: &mut Option<JoinHandle<()>>,
     command_ack_task: &mut Option<JoinHandle<()>>,
     mqtt_failure: &CancellationToken,
+    #[cfg(test)] failure_gate: Option<&(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 ) -> anyhow::Result<()> {
     let result = tokio::select! {
         biased;
@@ -753,6 +792,11 @@ async fn wait_for_task_or_mqtt_failure(
     };
     match result {
         None => {
+            #[cfg(test)]
+            if let Some((reached, release)) = failure_gate {
+                reached.notify_one();
+                release.notified().await;
+            }
             task.abort();
             let _ = task.await;
             anyhow::bail!("MQTT failure; stopping listener")
@@ -1932,6 +1976,7 @@ mod tests {
             &mut ack_task,
             &mut command_ack_task,
             &mqtt_failure,
+            None,
         )
         .await;
 

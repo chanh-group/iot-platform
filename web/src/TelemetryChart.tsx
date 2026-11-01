@@ -14,7 +14,7 @@ export function TelemetryChart(props: {
 
   onMount(() => {
     const chart = new uPlot({
-      width: Math.max(host.clientWidth, 320),
+      width: Math.max(host.clientWidth, 1),
       height: 260,
       scales: { x: { time: true } },
       series: [
@@ -24,9 +24,10 @@ export function TelemetryChart(props: {
       axes: [{}, { stroke: "#6e7890" }],
       cursor: { drag: { setScale: false } },
     }, plotData(props.history(), props.live(), props.telemetryKey), host);
+    host.querySelector(".u-legend")?.setAttribute("aria-label", `Legend for ${props.telemetryKey} telemetry chart`);
     setPlot(chart);
     const observer = new ResizeObserver(() => {
-      chart.setSize({ width: Math.max(host.clientWidth, 320), height: 260 });
+      chart.setSize({ width: Math.max(host.clientWidth, 1), height: 260 });
     });
     observer.observe(host);
     onCleanup(() => {

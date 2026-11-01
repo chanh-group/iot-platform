@@ -48,6 +48,20 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
   ]).finally(() => clearTimeout(timer));
 }
 
+function contrastRatio(foreground: string, background: string): number {
+  const luminance = (color: string) => {
+    const channels = color.match(/[\d.]+/g)?.slice(0, 3).map(Number);
+    if (!channels || channels.length !== 3) throw new Error(`Unexpected computed color: ${color}`);
+    const linear = channels.map((channel) => {
+      const value = channel / 255;
+      return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+    });
+    return linear[0]! * 0.2126 + linear[1]! * 0.7152 + linear[2]! * 0.0722;
+  };
+  const values = [luminance(foreground), luminance(background)].sort((left, right) => right - left);
+  return (values[0]! + 0.05) / (values[1]! + 0.05);
+}
+
 class MqttDevice {
   private nextId = 0;
   private readonly pending = new Map<number, { resolve: (message: MqttHelperMessage) => void; reject: (error: Error) => void }>();
@@ -419,6 +433,126 @@ url = "sqlite://./data/iot.db"
       await call("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", text: "\r", unmodifiedText: "\r", windowsVirtualKeyCode: 13 });
       await call("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
     };
+    const space = async () => {
+      await call("Input.dispatchKeyEvent", { type: "keyDown", key: " ", code: "Space", text: " ", unmodifiedText: " ", windowsVirtualKeyCode: 32 });
+      await call("Input.dispatchKeyEvent", { type: "keyUp", key: " ", code: "Space", windowsVirtualKeyCode: 32 });
+    };
+    const escape = async () => {
+      await call("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+      await call("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+    };
+    const tab = async (shift = false) => {
+      const modifiers = shift ? 8 : 0;
+      await call("Input.dispatchKeyEvent", { type: "rawKeyDown", key: "Tab", code: "Tab", modifiers, windowsVirtualKeyCode: 9 });
+      await call("Input.dispatchKeyEvent", { type: "keyUp", key: "Tab", code: "Tab", modifiers, windowsVirtualKeyCode: 9 });
+    };
+    const focusableCount = `(() => {
+      const scope = document.querySelector('dialog[open]') ?? document;
+      return [...scope.querySelectorAll('a[href],button,input:not([type="hidden"]),select,textarea,[tabindex]')].filter((element) => {
+        const style = getComputedStyle(element);
+        return element.tabIndex >= 0 && !element.matches(':disabled') && style.display !== 'none' && style.visibility !== 'hidden' && element.getClientRects().length > 0;
+      }).length;
+    })()`;
+    const startKeyboardTraversal = () => evaluate(`(() => {
+      const dialog = document.querySelector('dialog[open]');
+      if (dialog) dialog.querySelector('textarea,button,input,select')?.focus();
+      else {
+        document.body.tabIndex = -1;
+        document.body.focus();
+      }
+      return {
+        isModal: dialog?.matches(':modal') ?? false,
+        active: document.activeElement instanceof HTMLElement ? document.activeElement.outerHTML.slice(0, 160) : String(document.activeElement),
+      };
+    })()`);
+    const tabToControl = async (predicate: string, label: string) => {
+      const count = await evaluate(focusableCount) as number;
+      await startKeyboardTraversal();
+      for (let index = 0; index < count * 8; index += 1) {
+        await tab();
+        if (await evaluate(`(() => { const active = document.activeElement; return ${predicate}; })()`)) {
+          await evaluate("document.body.removeAttribute('tabindex')");
+          return;
+        }
+      }
+      await evaluate("document.body.removeAttribute('tabindex')");
+      throw new Error(`Keyboard Tab could not reach ${label}.`);
+    };
+    const auditKeyboard = async (label: string) => {
+      const report = await evaluate(`(() => {
+        const scope = document.querySelector('dialog[open]') ?? document;
+        const controls = [...scope.querySelectorAll('a[href],button,input:not([type="hidden"]),select,textarea,[tabindex]')].filter((element) => {
+          const style = getComputedStyle(element);
+          return element.tabIndex >= 0 && !element.matches(':disabled') && style.display !== 'none' && style.visibility !== 'hidden' && element.getClientRects().length > 0;
+        });
+        const accessibleName = (element) => {
+          const labelledBy = element.getAttribute('aria-labelledby')?.split(/\\s+/).map((id) => document.getElementById(id)?.textContent?.trim() ?? '').filter(Boolean).join(' ');
+          const labels = 'labels' in element ? [...(element.labels ?? [])].map((item) => item.textContent?.trim() ?? '').filter(Boolean).join(' ') : '';
+          return element.getAttribute('aria-label')?.trim() || labelledBy || labels || element.getAttribute('title')?.trim() || element.innerText?.trim() || element.textContent?.trim() || element.value?.trim() || '';
+        };
+        const tableName = (table) => table.getAttribute('aria-label')?.trim()
+          || table.getAttribute('aria-labelledby')?.split(/\\s+/).map((id) => document.getElementById(id)?.textContent?.trim() ?? '').filter(Boolean).join(' ')
+          || table.querySelector('caption')?.textContent?.trim()
+          || '';
+        return {
+          count: controls.length,
+          names: controls.map(accessibleName),
+          unlabeled: controls.filter((element) => !accessibleName(element)).map((element) => element.outerHTML.slice(0, 160)),
+          unnamedTables: [...scope.querySelectorAll('table')].filter((table) => !table.closest('[role="img"]') && !tableName(table)).map((table) => table.outerHTML.slice(0, 160)),
+          mainCount: document.querySelectorAll('main').length,
+          h1Count: document.querySelectorAll('h1').length,
+          unnamedNavs: [...document.querySelectorAll('nav')].filter((nav) => !nav.getAttribute('aria-label') && !nav.getAttribute('aria-labelledby')).length,
+        };
+      })()` ) as { count: number; names: string[]; unlabeled: string[]; unnamedTables: string[]; mainCount: number; h1Count: number; unnamedNavs: number };
+      if (report.count === 0) throw new Error(`${label} has no keyboard controls to audit.`);
+      if (report.unlabeled.length) throw new Error(`${label} has unnamed controls: ${JSON.stringify(report.unlabeled)}`);
+      if (report.unnamedTables.length) throw new Error(`${label} has unnamed data tables: ${JSON.stringify(report.unnamedTables)}`);
+      if (report.mainCount !== 1 || report.h1Count !== 1 || report.unnamedNavs !== 0) {
+        throw new Error(`${label}: expected one main landmark, one page heading, and named navigation; got ${JSON.stringify(report)}.`);
+      }
+
+      const traversalStart = await startKeyboardTraversal();
+      const visited = new Set<number>();
+      const order: number[] = [];
+      for (let step = 0; step < report.count * 8 && visited.size < report.count; step += 1) {
+        await tab();
+        const focus = await evaluate(`(() => {
+          const scope = document.querySelector('dialog[open]') ?? document;
+          const controls = [...scope.querySelectorAll('a[href],button,input:not([type="hidden"]),select,textarea,[tabindex]')].filter((element) => {
+            const style = getComputedStyle(element);
+            return element.tabIndex >= 0 && !element.matches(':disabled') && style.display !== 'none' && style.visibility !== 'hidden' && element.getClientRects().length > 0;
+          });
+          return {
+            index: controls.indexOf(document.activeElement),
+            active: document.activeElement instanceof HTMLElement ? document.activeElement.outerHTML.slice(0, 160) : String(document.activeElement),
+          };
+        })()` ) as { index: number; active: string };
+        if (focus.index < 0) throw new Error(`${label}: Tab ${step + 1}/${report.count} left the page's focusable controls (${focus.active}); start=${JSON.stringify(traversalStart)}, order=${JSON.stringify(order)}, names=${JSON.stringify(report.names)}.`);
+        visited.add(focus.index);
+        order.push(focus.index);
+      }
+      if (visited.size !== report.count) {
+        throw new Error(`${label}: Tab traversal reached ${visited.size}/${report.count} controls; order=${JSON.stringify(order)}; names=${JSON.stringify(report.names)}.`);
+      }
+      if (await evaluate("Boolean(document.querySelector('dialog[open]'))")) {
+        await tab(true);
+        const reverseIndex = await evaluate(`(() => {
+          const dialog = document.querySelector('dialog[open]');
+          const controls = [...dialog.querySelectorAll('a[href],button,input:not([type="hidden"]),select,textarea,[tabindex]')].filter((element) => element.tabIndex >= 0 && !element.matches(':disabled') && element.getClientRects().length > 0);
+          return controls.indexOf(document.activeElement);
+        })()`);
+        if (reverseIndex !== report.count - 1) throw new Error(`${label}: Shift+Tab did not wrap to the last dialog control.`);
+        await tab();
+        const forwardIndex = await evaluate(`(() => {
+          const dialog = document.querySelector('dialog[open]');
+          const controls = [...dialog.querySelectorAll('a[href],button,input:not([type="hidden"]),select,textarea,[tabindex]')].filter((element) => element.tabIndex >= 0 && !element.matches(':disabled') && element.getClientRects().length > 0);
+          return controls.indexOf(document.activeElement);
+        })()`);
+        if (forwardIndex !== 0) throw new Error(`${label}: Tab did not wrap from the last to the first dialog control.`);
+      } else {
+        await evaluate("document.body.removeAttribute('tabindex')");
+      }
+    };
     const reconnectOffline = async () => {
       await call("Network.emulateNetworkConditions", { offline: true, latency: 0, downloadThroughput: -1, uploadThroughput: -1 });
       await evaluate("window.__iotSockets.at(-1)?.close(4000, 'integration disconnect')");
@@ -430,6 +564,7 @@ url = "sqlite://./data/iot.db"
     await call("Page.enable");
     await call("Runtime.enable");
     await call("Network.enable");
+    await call("Page.bringToFront");
     await call("Page.addScriptToEvaluateOnNewDocument", {
       source: `(() => {
         const sockets = [];
@@ -476,51 +611,71 @@ url = "sqlite://./data/iot.db"
     });
     await call("Page.navigate", { url: `http://127.0.0.1:${address.port}` });
     await waitForBrowser("document.querySelector('form[aria-label=\"Admin login\"]') !== null", Boolean, "login form");
+    const primaryColors = await evaluate(`(() => {
+      const style = getComputedStyle(document.querySelector('.button-primary'));
+      return { foreground: style.color, background: style.backgroundColor };
+    })()`) as { foreground: string; background: string };
+    expect(contrastRatio(primaryColors.foreground, primaryColors.background)).toBeGreaterThanOrEqual(4.5);
+    await auditKeyboard("admin login");
     expect(await evaluate(`([...document.querySelectorAll('input,select,textarea')].every((field) => field.labels?.length || field.getAttribute('aria-label')) && [...document.querySelectorAll('button')].every((button) => button.getAttribute('aria-label') || button.textContent?.trim()))`)).toBe(true);
     await setValue("input[name='username']", "ui-admin");
     await setValue("input[name='password']", password);
-    await evaluate("document.querySelector('input[name=\"password\"]')?.focus()");
+    await tabToControl("active.matches('form[aria-label=\\\"Admin login\\\"] button[type=\\\"submit\\\"]')", "login submit");
     await enter();
     await waitForBrowser("document.querySelector('#overview-title')?.textContent?.trim()", (value) => value === "System overview", "authenticated overview");
+    await waitForBrowser("document.activeElement?.id === 'overview-title'", Boolean, "focus moved to overview after login");
+    await auditKeyboard("overview");
     await waitForBrowser("document.querySelector('.connection')?.textContent?.trim()", (value) => value === "Live updates connected", "authenticated WebSocket");
     expect(await evaluate("document.querySelector('.connection')?.getAttribute('role')")).toBe("status");
     await waitForBrowser("window.__iotStableTimers.size === 1 && window.__iotOverviewIntervals.size === 1", Boolean, "overview timers started");
     expect(await evaluate("['Devices online', 'Telemetry events · 24h', 'Commands in progress', 'Ingest queue'].every((label) => document.body.innerText.includes(label))")).toBe(true);
     expect(await evaluate("localStorage.length")).toBe(0);
 
-    await evaluate("[...document.querySelectorAll('button')].find((button) => button.textContent?.trim() === 'Devices')?.focus()");
-    await enter();
+    await tabToControl("active instanceof HTMLButtonElement && active.textContent?.trim() === 'Devices'", "Devices navigation");
+    await space();
     await waitForBrowser("document.querySelector('#devices-title')?.textContent?.trim()", (value) => value === "Devices", "device list");
+    await waitForBrowser("document.activeElement?.id === 'devices-title'", Boolean, "focus moved to Devices after navigation");
+    await auditKeyboard("device list");
     await waitForBrowser("window.__iotOverviewIntervals.size === 0", Boolean, "overview interval cleanup");
     const deviceName = `browser-${Date.now()}`;
     await setValue("#new-device-name", deviceName);
     await setValue("#new-device-metadata", "[]");
-    await evaluate("document.querySelector('#new-device-name')?.focus()");
+    await tabToControl("active.matches('#new-device-submit')", "Create device submit");
     await enter();
     await waitForBrowser("document.querySelector('[role=alert]')?.textContent", (value) => typeof value === "string" && value.includes("Metadata must be a JSON object"), "create-device validation error");
     await setValue("#new-device-metadata", JSON.stringify({ room: "lab" }));
-    await evaluate("document.querySelector('#new-device-name')?.focus()");
+    await tabToControl("active.matches('#new-device-submit')", "Create device submit");
     await enter();
     await waitForBrowser("document.querySelector('.token-dialog[open]') !== null", Boolean, "one-time device token");
+    expect(await evaluate("document.querySelector('.token-dialog')?.getAttribute('aria-describedby')")).toBe("token-description");
+    await auditKeyboard("one-time token dialog");
     const deviceId = await evaluate(`document.querySelector('.table-wrap tbody tr')?.querySelector('small')?.textContent?.trim()`) as string;
     const initialToken = await evaluate("document.querySelector('#issued-token')?.value") as string;
     await waitForBrowser(`[...document.querySelectorAll('button')].some((button) => button.textContent?.trim() === ${JSON.stringify(deviceName)})`, Boolean, "new device appears in the list");
     expect(deviceId).toMatch(/^[0-9a-f-]{36}$/);
     expect(initialToken).toMatch(/^iot_[A-Za-z0-9_-]{43}$/);
-    await click("Close and clear token");
+    await escape();
     await waitForBrowser("document.querySelector('#issued-token') === null", Boolean, "token cleared on close");
+    await Bun.sleep(100);
+    const createFocus = await evaluate(`(() => {
+      const target = document.getElementById('new-device-submit');
+      return { activeId: document.activeElement?.id, activeTag: document.activeElement?.tagName, target: target?.outerHTML, targetFocused: target === document.activeElement };
+    })()`);
+    if ((createFocus as { targetFocused?: boolean }).targetFocused !== true) {
+      throw new Error(`Token close did not restore the create button focus: ${JSON.stringify(createFocus)}`);
+    }
 
-    await click("Create device");
+    await tabToControl("active.matches('#new-device-submit')", "Create device submit");
     await setValue("#new-device-name", deviceName);
     await setValue("#new-device-metadata", "{}");
-    await evaluate("document.querySelector('#new-device-name')?.focus()");
+    await tabToControl("active.matches('#new-device-submit')", "Create device submit");
     await enter();
     await waitForBrowser("document.querySelector('[role=alert]')?.textContent", (value) => typeof value === "string" && value.includes("device name already exists"), "duplicate device error");
     const createAttemptsBeforeBlock = requestMethods.filter((request) => request === "POST /api/v1/devices").length;
     await call("Network.setBlockedURLs", { urls: ["*://*/api/v1/devices*"] });
     await setValue("#new-device-name", `${deviceName}-uncertain`);
     await setValue("#new-device-metadata", "{}");
-    await evaluate("document.querySelector('#new-device-name')?.focus()");
+    await tabToControl("active.matches('#new-device-submit')", "Create device submit");
     await enter();
     await waitForBrowser("document.querySelector('[role=alert]')?.textContent", (value) => typeof value === "string" && value.includes("check the current state before trying again"), "create network-error guidance");
     await Bun.sleep(700);
@@ -536,9 +691,18 @@ url = "sqlite://./data/iot.db"
 
     await click("Refresh list");
     await waitForBrowser(`document.querySelector('.table-wrap tbody')?.innerText.includes(${JSON.stringify(deviceName)})`, Boolean, "created device list refresh");
-    expect(await click(deviceName)).toBe(true);
+    await tabToControl(`active instanceof HTMLButtonElement && active.textContent?.trim() === ${JSON.stringify(deviceName)}`, "open device detail");
+    await enter();
     await waitForBrowser("document.querySelector('#device-title')?.textContent?.trim()", (value) => value === "Device detail", "device detail");
+    await waitForBrowser("document.activeElement?.id === 'device-title'", Boolean, "focus moved to device detail");
+    await auditKeyboard("device detail");
     expect(await evaluate(`([...document.querySelectorAll('input,select,textarea')].every((field) => field.labels?.length || field.getAttribute('aria-label')) && [...document.querySelectorAll('button')].every((button) => button.getAttribute('aria-label') || button.textContent?.trim()))`)).toBe(true);
+    await tabToControl("active instanceof HTMLButtonElement && active.textContent?.trim() === 'Back to devices'", "Back to devices");
+    await enter();
+    await waitForBrowser("document.querySelector('#devices-title') !== null && document.activeElement?.id === 'devices-title'", Boolean, "keyboard back to devices");
+    await tabToControl(`active instanceof HTMLButtonElement && active.textContent?.trim() === ${JSON.stringify(deviceName)}`, "reopen device detail");
+    await enter();
+    await waitForBrowser("document.querySelector('#device-title') !== null && document.activeElement?.id === 'device-title'", Boolean, "keyboard reopen device detail");
     const historyToInput = await evaluate(`(() => {
       const date = new Date(Date.now());
       const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
@@ -586,6 +750,27 @@ url = "sqlite://./data/iot.db"
     if (!axNodes.some((node) => node.role?.value === "image" && node.name?.value?.includes("Telemetry chart for"))) {
       throw new Error(`Chart accessibility nodes: ${JSON.stringify(axNodes)}`);
     }
+    await call("Emulation.setDeviceMetricsOverride", { width: 320, height: 900, deviceScaleFactor: 1, mobile: false });
+    await Bun.sleep(150);
+    const narrowPage = await evaluate("({ viewport: window.innerWidth, content: document.documentElement.scrollWidth })") as { viewport: number; content: number };
+    if (narrowPage.content > narrowPage.viewport + 1) {
+      const overflow = await evaluate(`(() => {
+        const chart = document.querySelector('.uplot');
+        const ancestors = [];
+        for (let element = chart; element && ancestors.length < 8; element = element.parentElement) {
+          const rect = element.getBoundingClientRect();
+          const style = getComputedStyle(element);
+          ancestors.push({ tag: element.tagName, id: element.id, className: typeof element.className === 'string' ? element.className : '', width: Math.round(rect.width), minWidth: style.minWidth, maxWidth: style.maxWidth, overflowX: style.overflowX });
+        }
+        return ancestors;
+      })()`);
+      const offenders = await evaluate(`[...document.querySelectorAll('body *')].map((element) => {
+        const rect = element.getBoundingClientRect();
+        return { tag: element.tagName, id: element.id, className: typeof element.className === 'string' ? element.className : '', left: Math.round(rect.left), right: Math.round(rect.right), width: Math.round(rect.width), scrollWidth: element.scrollWidth };
+      }).filter((item) => item.width && (item.left < 0 || item.right > window.innerWidth + 1)).sort((a, b) => b.right - a.right).slice(0, 12)`);
+      throw new Error(`320px viewport overflows: ${JSON.stringify({ narrowPage, ancestors: overflow, offenders })}`);
+    }
+    await call("Emulation.setDeviceMetricsOverride", { width: 1280, height: 900, deviceScaleFactor: 1, mobile: false });
 
     await setValue("#edit-device-name", `${deviceName}-edited`);
     await setValue("#edit-device-metadata", JSON.stringify({ room: "lab", owner: "ops" }));
@@ -594,12 +779,14 @@ url = "sqlite://./data/iot.db"
     await waitForBrowser("document.querySelector('#edit-device-metadata')?.value.includes('owner')", Boolean, "edited metadata");
 
     await setValue("#command-params", "[");
-    await click("Create command");
+    await tabToControl("active instanceof HTMLButtonElement && active.textContent?.trim() === 'Create command'", "Create command");
+    await enter();
     await waitForBrowser("document.querySelector('[role=alert]')?.textContent", (value) => typeof value === "string" && value.includes("Command parameters must be valid JSON"), "command validation error");
     await setValue("#command-params", JSON.stringify({ delay_s: 5 }));
     await setValue("#command-name", "reboot");
     await setValue("#command-ttl", "60000");
-    await click("Create command");
+    await tabToControl("active instanceof HTMLButtonElement && active.textContent?.trim() === 'Create command'", "Create command");
+    await enter();
     const command = await deviceMqtt.waitPublish(`devices/${deviceId}/commands`);
     expect(command.name).toBe("reboot");
     await deviceMqtt.publish(`devices/${deviceId}/commands/ack`, {
@@ -617,10 +804,21 @@ url = "sqlite://./data/iot.db"
     await waitForBrowser("document.body.innerText.includes('expired')", Boolean, "command expiry state", 12_000);
 
     await evaluate("window.confirm = () => true");
-    await click("Rotate token");
+    await tabToControl("active instanceof HTMLButtonElement && active.textContent?.trim() === 'Rotate token'", "Rotate token");
+    await enter();
     await waitForBrowser("document.querySelector('.token-dialog[open]') !== null", Boolean, "rotated device token");
+    await auditKeyboard("rotated token dialog");
     const rotatedToken = await evaluate("document.querySelector('#issued-token')?.value") as string;
-    await click("Close and clear token");
+    await tabToControl("active instanceof HTMLButtonElement && active.textContent?.trim() === 'Close and clear token'", "rotated token dialog close");
+    await enter();
+    await Bun.sleep(50);
+    const restoredFocus = await evaluate(`(() => {
+      const active = document.activeElement;
+      return { tag: active?.tagName, id: active instanceof HTMLElement ? active.id : "", text: active?.textContent?.trim() };
+    })()`);
+    if ((restoredFocus as { text?: string }).text !== "Rotate token") {
+      throw new Error(`Token dialog did not restore focus to its trigger: ${JSON.stringify(restoredFocus)}`);
+    }
     await waitForBrowser("[...document.querySelectorAll('button')].some((button) => button.textContent?.trim() === 'Disable device')", Boolean, "device refreshed after credential rotation");
     await waitFor(() => deviceMqtt.closedConnection.then(() => true), "old MQTT session kicked", 10_000);
     const denied = await MqttDevice.connect(mqttHelper, "127.0.0.1", mqttPort, deviceId, initialToken);
@@ -632,17 +830,15 @@ url = "sqlite://./data/iot.db"
     await activeMqtt.subscribe(`devices/${deviceId}/telemetry/ack`);
     await activeMqtt.subscribe(`devices/${deviceId}/commands`);
 
-    await click("Devices");
+    await tabToControl("active instanceof HTMLButtonElement && active.textContent?.trim() === 'Devices'", "Devices navigation");
+    await enter();
     await waitForBrowser("document.querySelector('#devices-title') !== null", Boolean, "device list before disable");
+    await waitForBrowser("document.activeElement?.id === 'devices-title'", Boolean, "focus moved to Devices after re-navigation");
+    await auditKeyboard("device list after reauthentication");
     expect(await evaluate("document.querySelector('.chart-host') === null")).toBe(true);
     await waitForBrowser(`document.querySelector('.table-wrap tbody')?.innerText.includes(${JSON.stringify(`${deviceName}-edited`)})`, Boolean, "edited device row before disable");
-    const clickDeviceAction = (action: string) => evaluate(`(() => {
-      const row = [...document.querySelectorAll('.table-wrap tbody tr')].find((item) => item.innerText.includes(${JSON.stringify(`${deviceName}-edited`)}));
-      const button = [...(row?.querySelectorAll('button') ?? [])].find((item) => item.textContent?.trim() === ${JSON.stringify(action)});
-      button?.click();
-      return Boolean(button);
-    })()`);
-    expect(await clickDeviceAction("Disable")).toBe(true);
+    await tabToControl(`active instanceof HTMLButtonElement && active.textContent?.trim() === 'Disable' && active.closest('tr')?.innerText.includes(${JSON.stringify(`${deviceName}-edited`)})`, "disable device");
+    await enter();
     await waitFor(() => requestMethods.includes(`PATCH /api/v1/devices/${deviceId}`), "disable-device PATCH request");
     await waitForBrowser(`(() => {
       const row = [...document.querySelectorAll('.table-wrap tbody tr')].find((item) => item.innerText.includes(${JSON.stringify(`${deviceName}-edited`)}));
@@ -651,7 +847,8 @@ url = "sqlite://./data/iot.db"
     await waitFor(() => activeMqtt.closedConnection.then(() => true), "disabled MQTT session kicked", 10_000);
     const disabledToken = await MqttDevice.connect(mqttHelper, "127.0.0.1", mqttPort, deviceId, rotatedToken);
     expect(disabledToken.code).toBe(4);
-    expect(await clickDeviceAction("Enable")).toBe(true);
+    await tabToControl(`active instanceof HTMLButtonElement && active.textContent?.trim() === 'Enable' && active.closest('tr')?.innerText.includes(${JSON.stringify(`${deviceName}-edited`)})`, "enable device");
+    await enter();
     await waitForBrowser(`(() => {
       const row = [...document.querySelectorAll('.table-wrap tbody tr')].find((item) => item.innerText.includes(${JSON.stringify(`${deviceName}-edited`)}));
       return [...(row?.querySelectorAll('button') ?? [])].some((button) => button.textContent?.trim() === 'Disable');
@@ -664,8 +861,11 @@ url = "sqlite://./data/iot.db"
     await activeMqtt.subscribe(`devices/${deviceId}/telemetry/ack`);
     await activeMqtt.subscribe(`devices/${deviceId}/commands`);
     await waitForBrowser(`document.querySelector('.table-wrap tbody')?.innerText.includes(${JSON.stringify(`${deviceName}-edited`)})`, Boolean, "enabled device row after reconnect");
-    expect(await click(`${deviceName}-edited`)).toBe(true);
+    await tabToControl(`active instanceof HTMLButtonElement && active.textContent?.trim() === ${JSON.stringify(`${deviceName}-edited`)}`, "reopen edited device");
+    await enter();
     await waitForBrowser("document.querySelector('#device-title') !== null", Boolean, "reopened device after enable");
+    await waitForBrowser("document.activeElement?.id === 'device-title'", Boolean, "focus moved to reopened device detail");
+    await auditKeyboard("device detail after re-enable");
     await waitForBrowser(`[...document.querySelectorAll('#telemetry-key option')].some((option) => option.value === "temperature")`, Boolean, "numeric telemetry key option");
     await setValue("#telemetry-key", "temperature", "change");
     await waitForBrowser("document.querySelector('#telemetry-key')?.value", (value) => value === "temperature", "selected temperature key");
@@ -712,20 +912,27 @@ url = "sqlite://./data/iot.db"
     expect(await evaluate("document.querySelector('.chart-host')?.getAttribute('aria-label')")).toBe("Telemetry chart for temperature, 2 numeric samples");
 
     const beforeOverviewReconnect = requestCount(requestUrls, "/api/v1/overview");
-    await click("Overview");
+    await tabToControl("active instanceof HTMLButtonElement && active.textContent?.trim() === 'Overview'", "Overview navigation");
+    await enter();
     await waitForBrowser("document.querySelector('#overview-title') !== null", Boolean, "overview view");
+    await waitForBrowser("document.activeElement?.id === 'overview-title'", Boolean, "focus moved to overview");
+    await auditKeyboard("overview after reconnect");
     await waitForBrowser("window.__iotOverviewIntervals.size === 1", Boolean, "overview interval restarted");
     await waitForBrowser("['Devices online', 'Telemetry events · 24h', 'Commands in progress', 'Ingest queue'].every((label) => document.body.innerText.includes(label))", Boolean, "overview API metrics");
     await reconnectOffline();
     await waitFor(() => requestCount(requestUrls, "/api/v1/overview") > beforeOverviewReconnect, "overview REST refetch");
 
-    await click("Config");
+    await tabToControl("active instanceof HTMLButtonElement && active.textContent?.trim() === 'Config'", "Config navigation");
+    await enter();
     await waitForBrowser("document.querySelector('#config-title') !== null", Boolean, "runtime configuration view");
+    await waitForBrowser("document.activeElement?.id === 'config-title'", Boolean, "focus moved to runtime configuration");
+    await auditKeyboard("runtime configuration");
     await waitForBrowser("window.__iotOverviewIntervals.size === 0", Boolean, "overview interval cleanup on config");
     await waitForBrowser("document.querySelector('#logging-level') !== null", Boolean, "runtime settings loaded");
     expect(await evaluate(`([...document.querySelectorAll('input,select,textarea')].every((field) => field.labels?.length || field.getAttribute('aria-label')) && [...document.querySelectorAll('button')].every((button) => button.getAttribute('aria-label') || button.textContent?.trim()))`)).toBe(true);
     await setValue("#logging-level", "debug", "change");
-    await click("Save runtime settings");
+    await tabToControl("active instanceof HTMLButtonElement && active.textContent?.trim() === 'Save runtime settings'", "Save runtime settings");
+    await enter();
     await waitForBrowser("document.body.innerText.includes('Current revision: 1')", Boolean, "runtime config PATCH");
     const beforeConfigReconnect = requestCount(requestUrls, "/api/v1/config");
     await reconnectOffline();
@@ -735,7 +942,8 @@ url = "sqlite://./data/iot.db"
     const database = new Database(dbPath);
     database.exec("CREATE TRIGGER fail_ui_telemetry BEFORE INSERT ON telemetry_events BEGIN SELECT RAISE(ABORT, 'test storage outage'); END");
     database.close();
-    await click("Overview");
+    await tabToControl("active instanceof HTMLButtonElement && active.textContent?.trim() === 'Overview'", "Overview navigation");
+    await enter();
     await waitForBrowser("document.querySelector('#overview-title') !== null", Boolean, "overview before storage failure");
     await activeMqtt.publish(`devices/${deviceId}/telemetry`, {
       event_id: `storage-${Date.now()}`,
@@ -757,18 +965,23 @@ url = "sqlite://./data/iot.db"
     const expired = sessionDatabase.query("UPDATE sessions SET expires_at = ? WHERE token_hash = ?").run(Date.now() - 1_000, sessionHash);
     sessionDatabase.close();
     expect(expired.changes).toBe(1);
-    await click("Devices");
+    await tabToControl("active instanceof HTMLButtonElement && active.textContent?.trim() === 'Devices'", "Devices navigation after session expiry");
+    await enter();
     await waitForBrowser("document.querySelector('form[aria-label=\"Admin login\"]') !== null", Boolean, "expired-session login screen");
+    await auditKeyboard("expired-session login");
     expect(await evaluate("document.body.innerText.includes('Your session has expired. Sign in again.')")).toBe(true);
     expect(await evaluate("document.querySelector('.chart-host') === null")).toBe(true);
     expect(await evaluate("localStorage.length")).toBe(0);
 
     await setValue("input[name='username']", "ui-admin");
     await setValue("input[name='password']", password);
-    await evaluate("document.querySelector('input[name=\"password\"]')?.focus()");
+    await tabToControl("active.matches('form[aria-label=\\\"Admin login\\\"] button[type=\\\"submit\\\"]')", "re-authentication submit");
     await enter();
     await waitForBrowser("document.querySelector('#overview-title') !== null", Boolean, "login after expiry");
-    await click("Log out");
+    await waitForBrowser("document.activeElement?.id === 'overview-title'", Boolean, "focus moved to overview after re-authentication");
+    await auditKeyboard("overview after re-authentication");
+    await tabToControl("active instanceof HTMLButtonElement && active.textContent?.trim() === 'Log out'", "Log out");
+    await enter();
     await waitForBrowser("document.querySelector('form[aria-label=\"Admin login\"]') !== null", Boolean, "server-confirmed logout");
     expect(requestMethods).toContain("POST /api/v1/auth/logout");
     await waitFor(async () => await evaluate("window.__iotSockets.at(-1)?.readyState") === 3, "logout WebSocket cleanup");

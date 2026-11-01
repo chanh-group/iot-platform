@@ -17,7 +17,7 @@ export function DeviceDetailView(props: {
   return (
     <section aria-labelledby="device-title">
       <div class="heading-row">
-        <div><h1 id="device-title">Device detail</h1><p class="mono">{props.deviceId}</p></div>
+        <div><h1 id="device-title" tabIndex={-1}>Device detail</h1><p class="mono">{props.deviceId}</p></div>
         <button class="button" onClick={props.onBack}>Back to devices</button>
       </div>
       <DevicePanel

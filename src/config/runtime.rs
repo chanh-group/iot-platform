@@ -102,7 +102,8 @@ impl RuntimeConfigStore {
     }
 
     /// Validates, persists, applies and publishes one hot-config patch.
-    pub async fn update(
+    #[cfg(test)]
+    pub(crate) async fn update(
         &self,
         expected_revision: u64,
         settings: &Value,
@@ -117,7 +118,7 @@ impl RuntimeConfigStore {
     }
 
     /// Keeps updates serialized through post-publication audit and notification work.
-    pub async fn update_and_then<F, Fut>(
+    pub(crate) async fn update_and_then<F, Fut>(
         &self,
         expected_revision: u64,
         settings: &Value,
@@ -295,18 +296,18 @@ impl RuntimeConfigStore {
 }
 
 /// Result of a successful in-process update; directory-sync failure is explicit.
-pub struct RuntimeUpdate {
+pub(crate) struct RuntimeUpdate {
     /// The atomically published snapshot.
-    pub snapshot: Arc<RuntimeSnapshot>,
+    pub(crate) snapshot: Arc<RuntimeSnapshot>,
     /// Hot config paths whose effective values changed.
-    pub changed_fields: Vec<String>,
+    pub(crate) changed_fields: Vec<String>,
     /// Present only when rename succeeded but directory durability is uncertain.
-    pub durability_error: Option<RuntimeWriteError>,
+    pub(crate) durability_error: Option<RuntimeWriteError>,
 }
 
 /// Validation, restart-only, revision, and persistence failures for a PATCH.
 #[derive(Debug)]
-pub enum RuntimeConfigError {
+pub(crate) enum RuntimeConfigError {
     Validation(Vec<String>),
     RestartRequired(Vec<String>),
     RevisionConflict(u64),
@@ -318,14 +319,14 @@ pub enum RuntimeConfigError {
 
 /// The failed persistence stage and whether rename already committed the new file.
 #[derive(Debug)]
-pub struct RuntimeWriteError {
-    pub stage: WriteStage,
-    pub source: io::Error,
-    pub renamed: bool,
+pub(crate) struct RuntimeWriteError {
+    pub(crate) stage: WriteStage,
+    pub(crate) source: io::Error,
+    pub(crate) renamed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WriteStage {
+pub(crate) enum WriteStage {
     ParentCreate,
     TempCreate,
     Write,
@@ -340,7 +341,7 @@ pub enum WriteStage {
 
 impl WriteStage {
     #[must_use]
-    pub fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::ParentCreate => "parent_create",
             Self::TempCreate => "temp_create",

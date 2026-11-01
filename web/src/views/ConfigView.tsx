@@ -9,7 +9,7 @@ export function ConfigView(props: { api: ApiClient; refreshKey: number }) {
   return (
     <section aria-labelledby="config-title">
       <div class="heading-row">
-        <div><h1 id="config-title">Runtime configuration</h1><p>Only hot-reloadable fields can be changed here.</p></div>
+        <div><h1 id="config-title" tabIndex={-1}>Runtime configuration</h1><p>Only hot-reloadable fields can be changed here.</p></div>
         <button class="button" onClick={config.config.refresh}>Refresh</button>
       </div>
       <Show when={config.error()}>

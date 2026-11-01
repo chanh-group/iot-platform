@@ -27,9 +27,11 @@ export function Dashboard(props: {
   const [reconnectKey, setReconnectKey] = createSignal(0);
   const [eventsConnected, setEventsConnected] = createSignal(false);
   const [liveEvents, setLiveEvents] = createSignal<RealtimeEvent[]>([]);
-  const [issuedToken, setIssuedToken] = createSignal<{ title: string; token: string }>();
+  const [issuedToken, setIssuedToken] = createSignal<{ title: string; token: string; restoreFocusId: string }>();
   const [systemNotice, setSystemNotice] = createSignal("");
   const actions = useActions();
+  let viewContent!: HTMLDivElement;
+  let focusFrame = 0;
   let socket!: EventsSocket;
 
   const channels = () => view() === "detail" && deviceId()
@@ -74,8 +76,14 @@ export function Dashboard(props: {
     const timer = setInterval(() => setOverviewRefreshKey((value) => value + 1), 15_000);
     onCleanup(() => clearInterval(timer));
   });
+  createEffect(() => {
+    view();
+    cancelAnimationFrame(focusFrame);
+    focusFrame = requestAnimationFrame(() => viewContent?.querySelector("h1")?.focus());
+  });
   onMount(() => socket.start());
   onCleanup(() => {
+    cancelAnimationFrame(focusFrame);
     socket.stop();
     setIssuedToken(undefined);
   });
@@ -84,6 +92,14 @@ export function Dashboard(props: {
     setDeviceId(id);
     setLiveEvents([]);
     setView("detail");
+  };
+
+  const closeIssuedToken = () => {
+    const restoreFocusId = issuedToken()?.restoreFocusId;
+    setIssuedToken(undefined);
+    if (restoreFocusId) {
+      window.setTimeout(() => document.getElementById(restoreFocusId)?.focus(), 0);
+    }
   };
 
   return (
@@ -109,35 +125,37 @@ export function Dashboard(props: {
         </nav>
         <Show when={props.notice}><div class="notice notice-warning" role="status">{props.notice}</div></Show>
         <Show when={systemNotice()}><div class="notice notice-warning" role="status">{systemNotice()}</div></Show>
-        <Show when={view() === "overview"}>
-          <OverviewView api={props.api} refreshKey={overviewRefreshKey()} onDevices={() => setView("devices")} onConfig={() => setView("config")} />
-        </Show>
-        <Show when={view() === "devices"}>
-          <DeviceListView
-            api={props.api}
-            refreshKey={deviceListRefreshKey()}
-            onOpen={openDevice}
-            onIssued={(title, token) => setIssuedToken({ title, token })}
-          />
-        </Show>
-        <Show when={view() === "detail" && deviceId()} keyed>
-          {(id) => (
-            <DeviceDetailView
+        <div class="view-content" ref={viewContent}>
+          <Show when={view() === "overview"}>
+            <OverviewView api={props.api} refreshKey={overviewRefreshKey()} onDevices={() => setView("devices")} onConfig={() => setView("config")} />
+          </Show>
+          <Show when={view() === "devices"}>
+            <DeviceListView
               api={props.api}
-              deviceId={id}
-              deviceRefreshKey={deviceRefreshKey()}
-              commandRefreshKey={commandRefreshKey()}
-              reconnectKey={reconnectKey()}
-              liveEvents={liveEvents()}
-              onBack={() => setView("devices")}
+              refreshKey={deviceListRefreshKey()}
+              onOpen={openDevice}
+              onIssued={(title, token, restoreFocusId) => setIssuedToken({ title, token, restoreFocusId })}
             />
-          )}
-        </Show>
-        <Show when={view() === "config"}>
-          <ConfigView api={props.api} refreshKey={configRefreshKey()} />
-        </Show>
+          </Show>
+          <Show when={view() === "detail" && deviceId()} keyed>
+            {(id) => (
+              <DeviceDetailView
+                api={props.api}
+                deviceId={id}
+                deviceRefreshKey={deviceRefreshKey()}
+                commandRefreshKey={commandRefreshKey()}
+                reconnectKey={reconnectKey()}
+                liveEvents={liveEvents()}
+                onBack={() => setView("devices")}
+              />
+            )}
+          </Show>
+          <Show when={view() === "config"}>
+            <ConfigView api={props.api} refreshKey={configRefreshKey()} />
+          </Show>
+        </div>
         <Show when={issuedToken()}>
-          {(issued) => <TokenDialog title={issued().title} token={issued().token} onClose={() => setIssuedToken(undefined)} />}
+          {(issued) => <TokenDialog title={issued().title} token={issued().token} onClose={closeIssuedToken} />}
         </Show>
       </main>
     </div>

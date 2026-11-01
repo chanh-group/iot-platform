@@ -28,17 +28,43 @@ export function TokenDialog(props: {
   onClose: () => void;
 }) {
   let dialog!: HTMLDialogElement;
+  const trapTab = (event: KeyboardEvent) => {
+    if (event.key !== "Tab") return;
+    const focusable = [...dialog.querySelectorAll<HTMLElement>(
+      'button:not(:disabled),input:not(:disabled),select:not(:disabled),textarea:not(:disabled),[href],[tabindex]:not([tabindex="-1"])',
+    )].filter((element) => element.getClientRects().length > 0);
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (!first || !last) {
+      event.preventDefault();
+      dialog.focus();
+    } else if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+  const closeDialog = () => {
+    if (dialog.open) dialog.close();
+    props.onClose();
+  };
+  const cancelDialog = (event: Event) => {
+    event.preventDefault();
+    closeDialog();
+  };
   onMount(() => dialog.showModal());
   onCleanup(() => {
     if (dialog.open) dialog.close();
   });
   return (
-    <dialog ref={dialog} aria-labelledby="token-title" class="token-dialog" onClose={props.onClose}>
+    <dialog ref={dialog} aria-labelledby="token-title" aria-describedby="token-description" class="token-dialog" onKeyDown={trapTab} onCancel={cancelDialog}>
       <h2 id="token-title">{props.title}</h2>
-      <p>Copy this device token now. It will not be shown again.</p>
+      <p id="token-description">Copy this device token now. It will not be shown again.</p>
       <label for="issued-token">Device token</label>
       <textarea id="issued-token" readonly rows={2} value={props.token} />
-      <button class="button button-primary" onClick={() => dialog.close()}>Close and clear token</button>
+      <button class="button button-primary" onClick={closeDialog}>Close and clear token</button>
     </dialog>
   );
 }

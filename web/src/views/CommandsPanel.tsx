@@ -104,7 +104,7 @@ export function CommandsPanel(props: {
       <Show when={commands.state().data}>
         {(page) => <>
           <Show when={page().items.length === 0}><p class="empty-state">No commands for this device.</p></Show>
-          <div class="table-wrap"><table><thead><tr><th>Command</th><th>Status</th><th>Created</th><th>Result</th></tr></thead><tbody>
+          <div class="table-wrap"><table aria-label="Device commands"><thead><tr><th scope="col">Command</th><th scope="col">Status</th><th scope="col">Created</th><th scope="col">Result</th></tr></thead><tbody>
             <For each={page().items}>{(item) => <tr>
               <td><button class="button button-quiet mono" onClick={() => setSelectedId(item.id)}>{item.id}</button><br />{item.name}</td>
               <td>{item.status}</td><td>{formatTime(item.created_at)}</td><td>{item.error ?? (item.result === null ? "—" : JSON.stringify(item.result))}</td>

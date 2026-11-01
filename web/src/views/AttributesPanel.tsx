@@ -26,7 +26,7 @@ export function AttributesPanel(props: { api: ApiClient; deviceId: string; recon
       <Show when={attributes.state().data}>
         {(page) => <>
           <Show when={page().items.length === 0}><p class="empty-state">No reported attributes.</p></Show>
-          <div class="table-wrap"><table><thead><tr><th>Key</th><th>Value</th><th>Updated</th></tr></thead><tbody>
+          <div class="table-wrap"><table aria-label="Latest device attributes"><thead><tr><th scope="col">Key</th><th scope="col">Value</th><th scope="col">Updated</th></tr></thead><tbody>
             <For each={page().items}>{(item) => <tr><td>{item.key}</td><td>{formatValue(item.value)}</td><td>{formatTime(item.updated_at)}</td></tr>}</For>
           </tbody></table></div>
           <button class="button" disabled={!page().next_cursor || attributes.state().loading} onClick={() => setCursor(page().next_cursor ?? "")}>More attributes</button>

@@ -8,7 +8,7 @@ export function DeviceListView(props: {
   api: ApiClient;
   refreshKey: number;
   onOpen: (id: string) => void;
-  onIssued: (title: string, token: string) => void;
+  onIssued: (title: string, token: string, restoreFocusId: string) => void;
 }) {
   const [search, setSearch] = createSignal("");
   const [query, setQuery] = createSignal("");
@@ -62,7 +62,7 @@ export function DeviceListView(props: {
       devices.refresh();
       setCreateName("");
       setMetadata("{}");
-      props.onIssued("Device created · copy its credential", result.credential.token);
+      props.onIssued("Device created · copy its credential", result.credential.token, "new-device-submit");
     } catch (error) {
       if (!isAbortError(error)) setCreateError(error);
     } finally {
@@ -95,7 +95,7 @@ export function DeviceListView(props: {
         credential: { id: string; token: string; created_at: number };
       }>(`/api/v1/devices/${device.id}/credentials/rotate`, undefined, signal));
       devices.refresh();
-      props.onIssued(`New credential · ${device.name}`, result.credential.token);
+      props.onIssued(`New credential · ${device.name}`, result.credential.token, `rotate-device-${device.id}`);
     } catch (error) {
       if (!isAbortError(error)) setCreateError(error);
     } finally {
@@ -119,7 +119,7 @@ export function DeviceListView(props: {
   return (
     <section aria-labelledby="devices-title">
       <div class="heading-row">
-        <div><h1 id="devices-title">Devices</h1><p>Manage device metadata, access, and credentials.</p></div>
+        <div><h1 id="devices-title" tabIndex={-1}>Devices</h1><p>Manage device metadata, access, and credentials.</p></div>
         <button class="button" onClick={devices.refresh}>Refresh list</button>
       </div>
 
@@ -158,7 +158,7 @@ export function DeviceListView(props: {
             </div>
           </div>
           <p class="form-help">A new device credential is shown once after creation. If the request times out, check the list before submitting again.</p>
-          <button class="button button-primary" type="submit" disabled={busy()}>{busy() ? "Saving…" : "Create device"}</button>
+          <button id="new-device-submit" class="button button-primary" type="submit" disabled={busy()}>{busy() ? "Saving…" : "Create device"}</button>
         </form>
       </div>
 
@@ -174,8 +174,8 @@ export function DeviceListView(props: {
               </Show>
               <Show when={page().items.length > 0}>
                 <div class="table-wrap">
-                  <table>
-                    <thead><tr><th>Name</th><th>Connection</th><th>Enabled</th><th>Last seen</th><th>Actions</th></tr></thead>
+                  <table aria-label="Device list">
+                    <thead><tr><th scope="col">Name</th><th scope="col">Connection</th><th scope="col">Enabled</th><th scope="col">Last seen</th><th scope="col">Actions</th></tr></thead>
                     <tbody>
                       <For each={page().items}>{(device) => (
                         <tr>
@@ -185,7 +185,7 @@ export function DeviceListView(props: {
                           <td>{formatTime(device.last_seen_at)}</td>
                           <td><div class="inline-actions">
                             <button class="button" disabled={busy()} onClick={() => void updateEnabled(device)}>{device.enabled ? "Disable" : "Enable"}</button>
-                            <button class="button" disabled={busy()} onClick={() => void rotate(device)}>Rotate token</button>
+                            <button id={`rotate-device-${device.id}`} class="button" disabled={busy()} onClick={() => void rotate(device)}>Rotate token</button>
                           </div></td>
                         </tr>
                       )}</For>

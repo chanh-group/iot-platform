@@ -24,10 +24,24 @@ fn is_hashed_asset(path: &str) -> bool {
     let Some(stem) = file_name.rsplit_once('.').map(|(stem, _)| stem) else {
         return false;
     };
-    let Some((_, hash)) = stem.rsplit_once('-') else {
+    let Some(separator) = stem.len().checked_sub(9) else {
         return false;
     };
-    hash.len() >= 8 && hash.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    let Some(hash) = stem.get(separator + 1..) else {
+        return false;
+    };
+    separator > 0
+        && stem.as_bytes().get(separator) == Some(&b'-')
+        && hash.len() == 8
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+#[test]
+fn hashed_asset_check_matches_the_server_hash_length_and_alphabet() {
+    assert!(is_hashed_asset("/assets/index-abc-_xyz.js"));
+    assert!(!is_hashed_asset("/assets/index-abcdefghx.js"));
 }
 
 #[test]

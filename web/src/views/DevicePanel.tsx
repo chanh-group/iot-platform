@@ -96,6 +96,11 @@ export function DevicePanel(props: {
     }
   };
 
+  const closeToken = () => {
+    setToken("");
+    window.setTimeout(() => document.getElementById("rotate-device-detail")?.focus(), 0);
+  };
+
   return (
     <>
       <Show when={error()}><ErrorMessage error={error()} /></Show>
@@ -108,7 +113,7 @@ export function DevicePanel(props: {
             <div class="inline-actions">
               <span class={`status ${current().online ? "status-online" : "status-offline"}`}>{current().online ? "Online" : "Offline"}</span>
               <button class="button" disabled={busy()} onClick={() => void toggleEnabled()}>{current().enabled ? "Disable device" : "Enable device"}</button>
-              <button class="button" disabled={busy()} onClick={() => void rotateCredential()}>Rotate token</button>
+              <button id="rotate-device-detail" class="button" disabled={busy()} onClick={() => void rotateCredential()}>Rotate token</button>
             </div>
           </div>
           <p class="muted">Last seen: {formatTime(current().last_seen_at)} · Credential created: {formatTime(current().credential.created_at)}</p>
@@ -122,7 +127,7 @@ export function DevicePanel(props: {
         </section>}
       </Show>
       <Show when={token()}>
-        {(issued) => <TokenDialog title="New device credential" token={issued()} onClose={() => setToken("")} />}
+        {(issued) => <TokenDialog title="New device credential" token={issued()} onClose={closeToken} />}
       </Show>
     </>
   );
