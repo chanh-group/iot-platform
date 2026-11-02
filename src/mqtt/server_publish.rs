@@ -115,7 +115,8 @@ impl ServerPublisher {
         payload: &[u8],
     ) -> anyhow::Result<()> {
         let topic = format!("devices/{device_id}/telemetry/ack");
-        self.publish_device(device_id, &topic, payload).await
+        self.publish_device_inner(device_id, &topic, payload, true)
+            .await
     }
 
     async fn publish_device(
@@ -124,7 +125,23 @@ impl ServerPublisher {
         topic: &str,
         payload: &[u8],
     ) -> anyhow::Result<()> {
-        if !self.2.device_can_exchange(device_id).unwrap_or(false) {
+        self.publish_device_inner(device_id, topic, payload, false)
+            .await
+    }
+
+    async fn publish_device_inner(
+        &self,
+        device_id: &str,
+        topic: &str,
+        payload: &[u8],
+        ack: bool,
+    ) -> anyhow::Result<()> {
+        let allowed = if ack {
+            self.2.device_can_receive_ack(device_id)
+        } else {
+            self.2.device_can_exchange(device_id)
+        };
+        if !allowed.unwrap_or(false) {
             anyhow::bail!("device session is disabled");
         }
         let id = Id::new(self.0.node.id(), 0, None, None, device_id.into(), None);

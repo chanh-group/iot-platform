@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
@@ -17,12 +17,17 @@ struct Work {
     response: Option<oneshot::Sender<Result<TelemetryInsertResult, ()>>>,
 }
 
+struct QueueState {
+    episode: std::sync::Mutex<()>,
+    pending: AtomicUsize,
+}
+
 /// Handle used to submit validated telemetry to the bounded ingest queue.
 #[derive(Clone)]
 pub struct IngestHandle {
     sender: mpsc::Sender<Work>,
     events: EventBus,
-    queue_episode: Arc<std::sync::Mutex<()>>,
+    queue: Arc<QueueState>,
 }
 
 /// Completion receiver for a submitted telemetry event.
@@ -57,10 +62,11 @@ impl IngestHandle {
         event: ValidatedTelemetry,
     ) -> Result<IngestResult, IngestSubmitError> {
         let (response, receiver) = oneshot::channel();
-        let Ok(_episode) = self.queue_episode.lock() else {
+        let Ok(_episode) = self.queue.episode.lock() else {
             tracing::error!("ingest queue episode lock is poisoned");
             return Err(IngestSubmitError::Closed);
         };
+        self.queue.pending.fetch_add(1, Ordering::AcqRel);
         match self.sender.try_send(Work {
             device_id,
             event,
@@ -68,11 +74,13 @@ impl IngestHandle {
         }) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
+                self.queue.pending.fetch_sub(1, Ordering::AcqRel);
                 Metrics::global().reject_ingest(IngestRejectReason::QueueFull);
                 self.events.publish_queue_full();
                 return Err(IngestSubmitError::Full);
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.queue.pending.fetch_sub(1, Ordering::AcqRel);
                 return Err(IngestSubmitError::Closed);
             }
         }
@@ -81,6 +89,10 @@ impl IngestHandle {
             .telemetry_queue_depth
             .set((self.sender.max_capacity() - self.sender.capacity()) as u64);
         Ok(receiver)
+    }
+
+    pub(crate) fn pending_count(&self) -> usize {
+        self.queue.pending.load(Ordering::Acquire)
     }
 }
 
@@ -94,11 +106,14 @@ pub fn spawn_worker(
     control: IngestWorkerControl,
 ) -> (IngestHandle, tokio::task::JoinHandle<()>) {
     let (sender, receiver) = mpsc::channel(capacity);
-    let queue_episode = Arc::new(std::sync::Mutex::new(()));
+    let queue = Arc::new(QueueState {
+        episode: std::sync::Mutex::new(()),
+        pending: AtomicUsize::new(0),
+    });
     let handle = IngestHandle {
         sender,
         events: events.clone(),
-        queue_episode: Arc::clone(&queue_episode),
+        queue: Arc::clone(&queue),
     };
     let task = tokio::spawn(run_worker(
         repository,
@@ -107,7 +122,7 @@ pub fn spawn_worker(
         max_batch_bytes,
         runtime_config,
         control,
-        queue_episode,
+        queue,
     ));
     (handle, task)
 }
@@ -119,7 +134,7 @@ async fn run_worker(
     max_batch_bytes: usize,
     runtime_config: RuntimeConfigStore,
     control: IngestWorkerControl,
-    queue_episode: Arc<std::sync::Mutex<()>>,
+    queue: Arc<QueueState>,
 ) {
     let IngestWorkerControl {
         cancellation: cancel,
@@ -194,6 +209,7 @@ async fn run_worker(
         let results = loop {
             match repository.insert_batch(&rows).await {
                 Ok(results) => {
+                    queue.pending.fetch_sub(batch.len(), Ordering::AcqRel);
                     #[cfg(debug_assertions)]
                     crate::test_hooks::pause("IOT_TEST_PAUSE_AFTER_COMMIT").await;
                     break results;
@@ -232,16 +248,16 @@ async fn run_worker(
                 let _ = response.send(Ok(result));
             }
         }
-        reset_queue_full_if_drained(&receiver, &queue_episode, &events);
+        reset_queue_full_if_drained(&receiver, &queue, &events);
     }
 }
 
 fn reset_queue_full_if_drained(
     receiver: &mpsc::Receiver<Work>,
-    queue_episode: &std::sync::Mutex<()>,
+    queue: &QueueState,
     events: &EventBus,
 ) {
-    let Ok(_episode) = queue_episode.lock() else {
+    let Ok(_episode) = queue.episode.lock() else {
         return;
     };
     if receiver.capacity() == receiver.max_capacity() {
@@ -276,11 +292,14 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel(2);
         let events = EventBus::new();
         let mut realtime = events.subscribe_realtime();
-        let queue_episode = Arc::new(std::sync::Mutex::new(()));
+        let queue = Arc::new(QueueState {
+            episode: std::sync::Mutex::new(()),
+            pending: AtomicUsize::new(0),
+        });
         let ingest = IngestHandle {
             sender,
             events: events.clone(),
-            queue_episode: Arc::clone(&queue_episode),
+            queue: Arc::clone(&queue),
         };
         let rejected_before = Metrics::global().ingest_rejected_total.get();
         assert!(ingest.try_submit("device".to_owned(), event()).is_ok());
@@ -313,7 +332,7 @@ mod tests {
 
         assert!(receiver.try_recv().is_ok());
         assert!(receiver.try_recv().is_ok());
-        reset_queue_full_if_drained(&receiver, &queue_episode, &events);
+        reset_queue_full_if_drained(&receiver, &queue, &events);
         assert!(ingest.try_submit("device".to_owned(), event()).is_ok());
         assert!(ingest.try_submit("device".to_owned(), event()).is_ok());
         assert!(matches!(

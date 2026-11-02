@@ -733,20 +733,41 @@ impl MqttServer {
         self.command_ack_cancel.cancel();
     }
 
-    /// Drains MQTT workers after listener hooks have stopped producing messages.
-    pub async fn drain_workers(&mut self, timeout: Duration) -> bool {
+    pub(crate) async fn drain_telemetry_ack_worker(&mut self, timeout: Duration) -> bool {
         if let Some(cancel) = &self.ack_cancel {
             cancel.cancel();
         }
-        self.command_ack_cancel.cancel();
+        let Some(mut task) = self.ack_task.take() else {
+            return true;
+        };
+        match tokio::time::timeout(timeout, &mut task).await {
+            Ok(Ok(())) => true,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "telemetry ACK worker failed during shutdown");
+                false
+            }
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                false
+            }
+        }
+    }
+
+    /// Drains MQTT workers after listener hooks have stopped producing messages.
+    pub async fn drain_workers(&mut self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
-        let mut completed = true;
-        for mut task in [self.ack_task.take(), self.command_ack_task.take()]
-            .into_iter()
-            .flatten()
-        {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            match tokio::time::timeout(remaining, &mut task).await {
+        let mut completed = self
+            .drain_telemetry_ack_worker(deadline.saturating_duration_since(Instant::now()))
+            .await;
+        self.command_ack_cancel.cancel();
+        if let Some(mut task) = self.command_ack_task.take() {
+            match tokio::time::timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                &mut task,
+            )
+            .await
+            {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     tracing::warn!(%error, "MQTT worker failed during shutdown");
@@ -760,6 +781,91 @@ impl MqttServer {
             }
         }
         completed
+    }
+
+    pub(crate) fn stop_accepting(&self) -> bool {
+        if let Err(error) = self.connections.stop_accepting() {
+            tracing::error!(%error, "cannot stop new MQTT sessions during shutdown");
+            return false;
+        }
+        true
+    }
+
+    pub(crate) async fn kick_connected_sessions(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let handshakes_stopped = match self.connections.wait_for_pending_connections(timeout).await
+        {
+            Ok(true) => true,
+            Ok(false) => {
+                tracing::warn!("MQTT handshakes remained pending during shutdown");
+                false
+            }
+            Err(error) => {
+                tracing::warn!(%error, "cannot wait for MQTT handshakes during shutdown");
+                false
+            }
+        };
+        let devices = match self.connections.active_device_ids() {
+            Ok(devices) => devices,
+            Err(error) => {
+                tracing::error!(%error, "cannot snapshot connected MQTT sessions during shutdown");
+                return false;
+            }
+        };
+        let total = devices.len();
+        let mut devices = devices.into_iter();
+        let mut kicks = JoinSet::new();
+        let mut kicked = 0;
+
+        loop {
+            while kicks.len() < DEVICE_KICK_CONCURRENCY {
+                let Some(device_id) = devices.next() else {
+                    break;
+                };
+                let channel = self.device_channel();
+                kicks.spawn(async move {
+                    tokio::time::timeout(DEVICE_KICK_TIMEOUT, channel.kick(&device_id))
+                        .await
+                        .is_ok_and(|result| result.is_ok())
+                });
+            }
+            if kicks.is_empty() {
+                break;
+            }
+
+            match tokio::time::timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                kicks.join_next(),
+            )
+            .await
+            {
+                Ok(Some(Ok(true))) => kicked += 1,
+                Ok(Some(Ok(false))) => {}
+                Ok(Some(Err(error))) => {
+                    tracing::warn!(%error, "MQTT session kick task failed during shutdown");
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    kicks.abort_all();
+                    while kicks.join_next().await.is_some() {}
+                    break;
+                }
+            }
+        }
+
+        let failed = total - kicked;
+        if failed == 0 {
+            tracing::info!(sessions = total, kicked, "MQTT shutdown kicks completed");
+            handshakes_stopped
+        } else {
+            tracing::warn!(
+                sessions = total,
+                kicked,
+                failed,
+                "MQTT shutdown kicks incomplete"
+            );
+            false
+        }
     }
 }
 

@@ -21,11 +21,24 @@ pub enum ShutdownError {
 pub async fn http(
     ready: &AtomicBool,
     cancel: &CancellationToken,
+    server: JoinHandle<std::io::Result<()>>,
+    timeout: Duration,
+) -> Result<(), ShutdownError> {
+    begin_http(ready, cancel);
+    wait_http(server, timeout).await
+}
+
+/// Marks the service unavailable and signals Axum to stop accepting connections.
+pub fn begin_http(ready: &AtomicBool, cancel: &CancellationToken) {
+    ready.store(false, Ordering::Release);
+    cancel.cancel();
+}
+
+/// Waits for requests already accepted by Axum to complete within the remaining deadline.
+pub async fn wait_http(
     mut server: JoinHandle<std::io::Result<()>>,
     timeout: Duration,
 ) -> Result<(), ShutdownError> {
-    ready.store(false, Ordering::Release);
-    cancel.cancel();
     match tokio::time::timeout(timeout, &mut server).await {
         Ok(Ok(Ok(()))) => Ok(()),
         Ok(Ok(Err(error))) => Err(ShutdownError::Server(error)),

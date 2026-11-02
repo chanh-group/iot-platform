@@ -366,6 +366,8 @@ async fn run_inner(
         release.notified().await;
     }
 
+    shutdown::begin_http(&state.ready, &cancel);
+    let mqtt_fenced = mqtt.stop_accepting();
     match task_exit {
         TaskExit::Signal => {}
         TaskExit::Http(result) => {
@@ -514,23 +516,30 @@ async fn run_inner(
     )
     .await;
     telemetry_cancel.cancel();
+    let telemetry_stopped = match tokio::time::timeout(
+        shutdown_remaining(deadline),
+        &mut ingest_task,
+    )
+    .await
+    {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            tracing::error!(%error, items_remaining = ingest.pending_count(), "telemetry worker failed during shutdown");
+            false
+        }
+        Err(_) => {
+            tracing::warn!(
+                items_remaining = ingest.pending_count(),
+                "telemetry worker did not drain before shutdown deadline"
+            );
+            ingest_task.abort();
+            let _ = (&mut ingest_task).await;
+            false
+        }
+    };
     drop(ingest);
-    let telemetry_stopped =
-        match tokio::time::timeout(shutdown_remaining(deadline), &mut ingest_task).await {
-            Ok(Ok(())) => true,
-            Ok(Err(error)) => {
-                tracing::error!(%error, "telemetry worker failed during shutdown");
-                false
-            }
-            Err(_) => {
-                tracing::warn!("telemetry worker did not drain before shutdown deadline");
-                ingest_task.abort();
-                let _ = (&mut ingest_task).await;
-                false
-            }
-        };
     let mqtt_workers_stopped = stop_mqtt_workers(&mut mqtt, shutdown_remaining(deadline)).await;
-    let outcome = shutdown::http(&state.ready, &cancel, server, shutdown_remaining(deadline)).await;
+    let outcome = shutdown::wait_http(server, shutdown_remaining(deadline)).await;
     state.pool.close().await;
     drop(lock);
 
@@ -538,7 +547,7 @@ async fn run_inner(
         outcome,
         command_stopped,
         retention_stopped,
-        mqtt_workers_stopped,
+        mqtt_workers_stopped && mqtt_fenced,
         telemetry_stopped,
     ) {
         (Ok(()), true, true, true, true) => {
@@ -588,8 +597,17 @@ fn shutdown_remaining(deadline: Instant) -> Duration {
 }
 
 async fn stop_mqtt_workers(mqtt: &mut MqttServer, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    let telemetry_acks_drained = mqtt
+        .drain_telemetry_ack_worker(shutdown_remaining(deadline))
+        .await;
+    let sessions_kicked = mqtt
+        .kick_connected_sessions(shutdown_remaining(deadline))
+        .await;
+    tokio::time::sleep(shutdown_remaining(deadline).min(Duration::from_millis(50))).await;
     mqtt.stop_listener().await;
-    mqtt.drain_workers(timeout).await
+    let workers_drained = mqtt.drain_workers(shutdown_remaining(deadline)).await;
+    telemetry_acks_drained && sessions_kicked && workers_drained
 }
 
 #[derive(Debug)]

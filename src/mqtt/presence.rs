@@ -27,6 +27,7 @@ struct ConnectionState {
     active: HashMap<String, String>,
     pending: HashMap<String, PendingConnections>,
     blocked: HashMap<String, usize>,
+    shutting_down: bool,
     // Retains the deny fence only while an authenticated or pending connection exists.
     disabled: HashSet<String>,
 }
@@ -79,7 +80,7 @@ impl ConnectionLimiter {
         let now = Instant::now();
         let mut state = self.lock()?;
         state.pending.retain(|_, pending| pending.expires_at > now);
-        if state.blocked.contains_key(device_id) {
+        if state.shutting_down || state.blocked.contains_key(device_id) {
             return Ok(false);
         }
         if let Some(pending) = state.pending.get_mut(device_id) {
@@ -175,7 +176,64 @@ impl ConnectionLimiter {
         device_id: &str,
     ) -> Result<bool, ConnectionLimiterError> {
         let state = self.lock()?;
+        Ok(!state.shutting_down
+            && !state.disabled.contains(device_id)
+            && !state.blocked.contains_key(device_id))
+    }
+
+    pub(crate) fn device_can_receive_ack(
+        &self,
+        device_id: &str,
+    ) -> Result<bool, ConnectionLimiterError> {
+        let state = self.lock()?;
         Ok(!state.disabled.contains(device_id) && !state.blocked.contains_key(device_id))
+    }
+
+    pub(crate) fn active_device_ids(&self) -> Result<Vec<String>, ConnectionLimiterError> {
+        let state = self.lock()?;
+        let mut ids: HashSet<_> = state.active.keys().cloned().collect();
+        ids.extend(state.pending.keys().cloned());
+        Ok(ids.into_iter().collect())
+    }
+
+    pub(crate) fn stop_accepting(&self) -> Result<(), ConnectionLimiterError> {
+        let mut state = self.lock()?;
+        state.shutting_down = true;
+        self.state_changed
+            .send_modify(|version| *version = version.wrapping_add(1));
+        Ok(())
+    }
+
+    pub(crate) async fn wait_for_pending_connections(
+        &self,
+        timeout: Duration,
+    ) -> Result<bool, ConnectionLimiterError> {
+        let mut changed = self.state_changed.subscribe();
+        let wait = async {
+            loop {
+                let expires_at = {
+                    let mut state = self.lock()?;
+                    let now = Instant::now();
+                    state.pending.retain(|_, pending| pending.expires_at > now);
+                    state
+                        .pending
+                        .values()
+                        .map(|pending| pending.expires_at)
+                        .min()
+                };
+                let Some(expires_at) = expires_at else {
+                    return Ok::<(), ConnectionLimiterError>(());
+                };
+                tokio::select! {
+                    result = changed.changed() => result.map_err(|_| ConnectionLimiterError)?,
+                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(expires_at)) => {}
+                }
+            }
+        };
+        match tokio::time::timeout(timeout, wait).await {
+            Ok(result) => result.map(|()| true),
+            Err(_) => Ok(false),
+        }
     }
 
     pub(crate) fn connected(
@@ -658,6 +716,44 @@ mod tests {
         assert!(!limiter.try_reserve("device-b").unwrap());
         limiter.disconnected("device-a", "session-2").unwrap();
         assert!(limiter.try_reserve("device-b").unwrap());
+    }
+
+    #[tokio::test]
+    async fn shutdown_fences_new_sessions_and_waits_for_existing_handshakes() {
+        let limiter = Arc::new(ConnectionLimiter::new(
+            2,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(Mutex::new(())),
+            CancellationToken::new(),
+        ));
+        assert!(limiter.try_reserve("device-a").unwrap());
+        limiter.stop_accepting().unwrap();
+        assert!(!limiter.try_reserve("device-b").unwrap());
+        assert!(!limiter.device_can_exchange("device-a").unwrap());
+        assert!(limiter.device_can_receive_ack("device-a").unwrap());
+        assert!(
+            !limiter
+                .wait_for_pending_connections(Duration::from_millis(150))
+                .await
+                .unwrap()
+        );
+
+        let waiting = tokio::spawn({
+            let limiter = Arc::clone(&limiter);
+            async move {
+                limiter
+                    .wait_for_pending_connections(Duration::from_secs(1))
+                    .await
+                    .unwrap()
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        limiter.connected("device-a", "session-a").unwrap();
+
+        assert!(waiting.await.unwrap());
+        assert_eq!(limiter.active_device_ids().unwrap(), vec!["device-a"]);
+        assert!(!limiter.device_can_exchange("device-a").unwrap());
     }
 
     #[test]

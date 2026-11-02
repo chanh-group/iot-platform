@@ -64,18 +64,18 @@ Nguồn sự thật:
 
 ## 4. Graceful shutdown — P4-04
 
-- [ ] Mở rộng `src/runtime/shutdown.rs` và `src/runtime/supervisor.rs` để xử lý đầy đủ:
+- [x] Mở rộng `src/runtime/shutdown.rs` và `src/runtime/supervisor.rs` để xử lý đầy đủ:
   1. Nhận SIGTERM → readiness false → ngừng accept request HTTP mới.
   2. Drain queue telemetry và commit trong deadline `shutdown_timeout_ms`.
-  3. Kick tất cả MQTT session đang kết nối.
+  3. Chặn MQTT handshake mới, drain application ACK, kick session đang kết nối.
   4. Đóng HTTP listener, MQTT listener, DB pool.
   5. Release data-dir lock.
   6. Exit code 0 khi sạch; log số lượng item còn chờ nếu hết deadline.
-- [ ] Không ACK item chưa commit trước khi drain hoàn tất.
-- [ ] Tín hiệu thứ hai (SIGTERM/SIGINT trong khi đang shutdown) → exit ngay; không panic.
-- [ ] Test: SIGTERM khi có request in-flight → request hoàn tất (nếu trong deadline) hoặc trả 503; lock được release; exit 0. Test: SIGTERM khi ingest queue không rỗng → drain/commit → exit. Test: deadline hết → log và exit.
-- [ ] Evidence: `tests/shutdown.rs` (nếu chưa có) hoặc mở rộng `tests/shutdown_http.rs`; tên test cụ thể.
-- [ ] Đây là A16.
+- [x] Không ACK item chưa commit trước khi drain hoàn tất.
+- [x] Tín hiệu thứ hai (SIGTERM/SIGINT trong khi đang shutdown) → exit ngay; không panic.
+- [x] Test: SIGTERM khi có request in-flight → request hoàn tất (nếu trong deadline) hoặc trả 503; lock được release; exit 0. Test: SIGTERM khi ingest queue không rỗng → drain/commit → exit. Test: deadline hết → log và exit.
+- [x] Evidence 2026-11-02T07:30:11+07:00: `tests/shutdown_http.rs::sigterm_drains_in_flight_request_and_releases_lock`, `::sigterm_commits_queued_telemetry_then_kicks_mqtt_and_releases_lock`, `::shutdown_deadline_logs_uncommitted_telemetry_and_exits_nonzero`, `::second_signal_exits_immediately_without_graceful_cleanup`, và `mqtt::presence::tests::shutdown_fences_new_sessions_and_waits_for_existing_handshakes` pass. `cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all` (256 passed, 0 failed across 31 suites) và `git diff --check` PASS.
+- [x] Đây là A16.
 
 ## 5. Security suite — P4-05
 
@@ -213,7 +213,7 @@ Checklist gate — ghi tên test và timestamp thực tế khi tick:
 - [x] A08: `tests/crash_recovery.rs` — kill trước commit, sau commit trước ACK, sau ACK — tất cả pass (evidence §3).
 - [ ] A09: `tests/storage_failure.rs` — DB lỗi (readiness false, không ACK), disk full, queue đầy (bounded RAM, metric), phục hồi — pass.
 - [ ] A15 release gate: `tests/ws_slow.rs` hoặc `tests/ws_telemetry.rs` — slow consumer close 1013, reconnect backfill, logout close 4401 — pass.
-- [ ] A16: `tests/shutdown.rs` — SIGTERM drain, không mất ACK, lock release, exit 0 — pass.
+- [x] A16: `tests/shutdown_http.rs` — SIGTERM drain, không ACK trước commit, kick session, lock release, exit 0 — pass (evidence §4).
 - [ ] A17: `tests/docker_smoke.sh` — Docker recreate cùng volume giữ data — pass.
 - [ ] A19 regression: `tests/mqtt_protocol.rs` — QoS/wildcard/retain/LWT/session/dup client/version matrix — pass.
 - [ ] Bounded resources: không còn `unbounded_channel` nghiệp vụ; audit checklist P4-01 hoàn tất.

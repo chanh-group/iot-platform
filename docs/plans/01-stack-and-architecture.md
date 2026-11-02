@@ -351,8 +351,8 @@ core -> không import axum/rmqtt/sqlx
 ### Shutdown sequence
 
 1. Nhận SIGTERM/SIGINT; set readiness false; hủy HTTP accept (graceful).
-2. Dừng nhận MQTT connection mới; vì `abort()` không đóng session, kick các session đang online (best effort, timeout ngắn) trước khi abort listener.
-3. Đóng ingest queue; worker drain tới `shutdown_timeout_ms`, commit nốt batch.
+2. Chặn MQTT handshake và publish mới; vẫn cho phép gửi ACK của telemetry đã nhận.
+3. Đóng ingest queue; worker drain và gửi ACK sau commit trong `shutdown_timeout_ms`. Chờ handshake đã xác thực hoàn tất rồi kick session trước khi abort listener; handshake còn pending khi hết deadline làm shutdown thất bại.
 4. Dừng dispatcher/retention; đóng DB pool; release file lock.
 5. Nếu hết deadline: log số item còn lại, exit code 1; không ACK item chưa commit.
 
