@@ -32,8 +32,14 @@ const PONG_TIMEOUT: Duration = Duration::from_secs(60);
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "lowercase")]
 enum ClientMessage {
-    Subscribe { channels: Vec<String> },
-    Unsubscribe { channels: Vec<String> },
+    Subscribe {
+        channels: Vec<String>,
+        #[serde(default)]
+        request_id: Option<u64>,
+    },
+    Unsubscribe {
+        channels: Vec<String>,
+    },
     Ping,
 }
 
@@ -179,12 +185,14 @@ async fn run(
                         if is_subscribed(&event, &subscriptions_rx.borrow())
                             && !send_event(&outbound_tx, event)
                         {
+                            tracing::warn!("WebSocket outbound queue full; closing slow client");
                             Metrics::global().ws_dropped_total.inc();
                             cancel_slow_consumer.cancel();
                             break;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "WebSocket client lagged; closing slow client");
                         Metrics::global().ws_dropped_total.inc();
                         cancel_slow_consumer.cancel();
                         break;
@@ -233,7 +241,7 @@ async fn run(
                         continue;
                     }
                     match serde_json::from_str::<ClientMessage>(text.as_str()) {
-                        Ok(ClientMessage::Subscribe { channels }) => {
+                        Ok(ClientMessage::Subscribe { channels, request_id }) => {
                             let Some(channels) = normalize_channels(&channels) else {
                                 if !send_error(&mut socket, "invalid_channel", "invalid channel").await {
                                     close(&mut socket, 1013, "slow_consumer").await;
@@ -251,7 +259,11 @@ async fn run(
                                 continue;
                             }
                             subscriptions_tx.send_replace(current);
-                            if !send_json(&mut socket, &json!({"type":"subscribed", "channels":channels})).await {
+                            let mut acknowledgement = json!({"type":"subscribed", "channels":channels});
+                            if let Some(request_id) = request_id {
+                                acknowledgement["request_id"] = json!(request_id);
+                            }
+                            if !send_json(&mut socket, &acknowledgement).await {
                                 close(&mut socket, 1013, "slow_consumer").await;
                                 break;
                             }

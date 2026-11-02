@@ -1,6 +1,7 @@
 import { For, Show, createEffect } from "solid-js";
 import { ApiClient } from "../lib/api";
 import type { RealtimeEvent } from "../lib/models";
+import type { ReconnectCheckpoint } from "../lib/ws";
 import { useDeviceTelemetry } from "../lib/deviceTelemetry";
 import { ErrorMessage, formatTime, formatValue } from "../common";
 import { TelemetryChart } from "../TelemetryChart";
@@ -9,6 +10,8 @@ export function TelemetryPanel(props: {
   api: ApiClient;
   deviceId: string;
   reconnectKey: number;
+  reconnectCheckpoint?: ReconnectCheckpoint;
+  onCheckpoint: (throughId: number) => void;
   liveEvents: RealtimeEvent[];
 }) {
   const telemetry = useDeviceTelemetry(
@@ -16,6 +19,8 @@ export function TelemetryPanel(props: {
     props.deviceId,
     () => props.reconnectKey,
     () => props.liveEvents,
+    () => props.reconnectCheckpoint,
+    props.onCheckpoint,
   );
   let keySelect!: HTMLSelectElement;
   createEffect(() => {
@@ -59,17 +64,22 @@ export function TelemetryPanel(props: {
         </Show>
         <Show when={telemetry.backfill().status === "fetched" && telemetry.backfill().pages > 0}>
           <p class="notice notice-warning" role="status">
-            Fetched {telemetry.backfill().rows.length} events across {telemetry.backfill().pages} pages in the event-time range. This does not prove all missed events were recovered: late events with timestamps before the selected start are excluded.
+            Backfill scanned {telemetry.backfill().pages} pages and retains {telemetry.backfill().rows.length} recent events through committed checkpoint {telemetry.backfill().throughId}.
+            <Show when={telemetry.backfill().truncated}>
+              {" Older recovered events are evicted from chart memory; browse history pages or widen the event-time range to retrieve them from REST."}
+            </Show>
           </p>
         </Show>
         <Show when={telemetry.backfill().status === "partial"}>
           <div class="notice notice-warning" role="alert">
-            Reconnect backfill query is bounded: fetched {telemetry.backfill().rows.length} events across {telemetry.backfill().pages} pages in the event-time range.
-            {telemetry.backfill().nextCursor
-              ? " More cursor pages remain; narrow the selected start time and retry or browse history pages."
-              : " The requested start predates the 31-day limit; earlier events were not fetched."}
-            {" "}Late events with timestamps before the selected start are excluded, so complete recovery cannot be established.
-            <button class="button" type="button" onClick={telemetry.retryBackfill}>Retry bounded backfill</button>
+            Reconnect backfill is bounded: scanned {telemetry.backfill().pages} pages and retains {telemetry.backfill().rows.length} recent events.
+            {" More pages remain; continue from the saved cursor. A second reconnect will be scanned after the current cursor completes."}
+            <Show when={telemetry.backfill().truncated}>
+              {" Older recovered events are evicted from chart memory; use history pages to browse them."}
+            </Show>
+            <button class="button" type="button" onClick={telemetry.retryBackfill}>
+              "Continue backfill"
+            </button>
           </div>
         </Show>
         <Show when={telemetry.backfill().status === "error"}>

@@ -102,6 +102,24 @@ async fn history_pages_are_stable_and_key_filter_projects_matching_values() {
     assert_eq!(first["items"][0]["values"], json!({ "x": 1 }));
     let cursor = first["next_cursor"].as_str().unwrap();
 
+    let changed_to = client
+        .get(&endpoint)
+        .query(&[
+            ("from", ts.to_string()),
+            ("to", (ts + 2).to_string()),
+            ("limit", "1".to_owned()),
+            ("keys", "x".to_owned()),
+            ("cursor", cursor.to_owned()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(changed_to.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        changed_to.json::<Value>().await.unwrap()["code"],
+        "invalid_cursor"
+    );
+
     let second: Value = client
         .get(&endpoint)
         .query(&[
@@ -141,6 +159,333 @@ async fn history_pages_are_stable_and_key_filter_projects_matching_values() {
         .unwrap();
     assert_eq!(third["items"][0]["event_id"], "history-3");
     assert!(third["next_cursor"].is_null());
+}
+
+#[tokio::test]
+async fn commit_order_backfill_finds_late_events_and_paginates_by_checkpoint() {
+    let app = TestApp::start().await;
+    let client = logged_in_client(&app).await;
+    let device = app.create_device("telemetry-received-backfill", true).await;
+    let now = auth::now_ms();
+    insert_event(
+        &app,
+        &device.id,
+        "before-checkpoint",
+        now - 300_000,
+        now - 1,
+        json!({"x": 0}),
+    )
+    .await;
+    let checkpoint: i64 = sqlx::query_scalar(
+        "SELECT internal_id FROM telemetry_events WHERE device_id = ? AND event_id = 'before-checkpoint'",
+    )
+    .bind(&device.id)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    insert_event(
+        &app,
+        &device.id,
+        "checkpoint-overlap",
+        now - 300_000,
+        now,
+        json!({"x": 1}),
+    )
+    .await;
+    insert_event(
+        &app,
+        &device.id,
+        "late-event-1",
+        now - 300_000,
+        now + 1,
+        json!({"x": 2}),
+    )
+    .await;
+    insert_event(
+        &app,
+        &device.id,
+        "late-event-2",
+        now - 300_000,
+        now + 2,
+        json!({"x": 3}),
+    )
+    .await;
+
+    let endpoint = format!("{}/api/v1/devices/{}/telemetry", app.base, device.id);
+    let first: Value = client
+        .get(&endpoint)
+        .query(&[
+            ("after_id", checkpoint.to_string()),
+            ("limit", "2".to_owned()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        first["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["event_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["checkpoint-overlap", "late-event-1"]
+    );
+    let through_id = first["through_id"].as_i64().unwrap();
+    assert!(through_id >= first["items"][1]["internal_id"].as_i64().unwrap());
+    let cursor = first["next_cursor"].as_str().unwrap();
+
+    let second: Value = client
+        .get(&endpoint)
+        .query(&[
+            ("after_id", checkpoint.to_string()),
+            ("limit", "2".to_owned()),
+            ("cursor", cursor.to_owned()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(second["items"][0]["event_id"], "late-event-2");
+    assert!(second["next_cursor"].is_null());
+    assert_eq!(second["through_id"], through_id);
+
+    for query in [
+        vec![
+            ("from", checkpoint.to_string()),
+            ("to", now.to_string()),
+            ("after_id", checkpoint.to_string()),
+        ],
+        vec![("after_id", "-1".to_owned())],
+        vec![("after_id", (through_id + 1).to_string())],
+    ] {
+        let response = client.get(&endpoint).query(&query).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["code"],
+            "validation_error"
+        );
+    }
+}
+
+#[tokio::test]
+async fn starting_checkpoint_avoids_scanning_old_history_before_a_missed_event() {
+    let app = TestApp::start().await;
+    let client = logged_in_client(&app).await;
+    let device = app.create_device("telemetry-api-large-history", true).await;
+    let now = auth::now_ms();
+    let old_timestamp = now - 40 * 24 * 60 * 60 * 1_000;
+    let mut tx = app.pool.begin().await.unwrap();
+    for index in 0..1_001_i64 {
+        sqlx::query(
+            "INSERT INTO telemetry_events
+             (device_id, event_id, ts, received_at, values_json, payload_sha256)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&device.id)
+        .bind(format!("old-history-{index}"))
+        .bind(old_timestamp - index)
+        .bind(old_timestamp - index)
+        .bind(r#"{"x":1}"#)
+        .bind([3_u8; 32].as_slice())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    let endpoint = format!("{}/api/v1/devices/{}/telemetry", app.base, device.id);
+    let baseline: Value = client
+        .get(&endpoint)
+        .query(&[("after_id", "0"), ("limit", "1")])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let checkpoint = baseline["through_id"].as_i64().unwrap();
+    assert_eq!(checkpoint, 1_001);
+    assert!(baseline["next_cursor"].is_string());
+
+    insert_event(
+        &app,
+        &device.id,
+        "missed-near-now",
+        now - 1_000,
+        now,
+        json!({"x": 2}),
+    )
+    .await;
+    let recovered: Value = client
+        .get(&endpoint)
+        .query(&[("after_id", checkpoint.to_string())])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(recovered["items"].as_array().unwrap().len(), 1);
+    assert_eq!(recovered["items"][0]["event_id"], "missed-near-now");
+    assert!(recovered["through_id"].as_i64().unwrap() > checkpoint);
+}
+
+#[tokio::test]
+async fn starting_checkpoint_skips_large_old_history_and_recovers_a_new_event() {
+    let app = TestApp::start().await;
+    let client = logged_in_client(&app).await;
+    let device = app
+        .create_device("telemetry-api-large-bootstrap", true)
+        .await;
+    let now = auth::now_ms();
+    let old_ts = now - 40 * 24 * 60 * 60 * 1_000;
+    let mut tx = app.pool.begin().await.unwrap();
+    for index in 0..1_001_i64 {
+        sqlx::query(
+            "INSERT INTO telemetry_events
+             (device_id, event_id, ts, received_at, values_json, payload_sha256)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&device.id)
+        .bind(format!("old-history-{index}"))
+        .bind(old_ts - index)
+        .bind(old_ts - index)
+        .bind(r#"{"x":1}"#)
+        .bind([4_u8; 32].as_slice())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    let endpoint = format!("{}/api/v1/devices/{}/telemetry", app.base, device.id);
+    let baseline: Value = client
+        .get(&endpoint)
+        .query(&[("after_id", "0"), ("limit", "1")])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let checkpoint = baseline["through_id"].as_i64().unwrap();
+    assert_eq!(checkpoint, 1_001);
+    assert!(baseline["next_cursor"].is_string());
+
+    insert_event(
+        &app,
+        &device.id,
+        "missed-near-now",
+        now - 1_000,
+        now,
+        json!({"x": 2}),
+    )
+    .await;
+    let recovered: Value = client
+        .get(&endpoint)
+        .query(&[("after_id", checkpoint.to_string())])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(recovered["items"].as_array().unwrap().len(), 1);
+    assert_eq!(recovered["items"][0]["event_id"], "missed-near-now");
+    assert!(recovered["through_id"].as_i64().unwrap() > checkpoint);
+}
+
+#[tokio::test]
+async fn commit_checkpoint_does_not_advance_past_an_uncommitted_batch() {
+    let app = TestApp::start().await;
+    let client = logged_in_client(&app).await;
+    let device = app
+        .create_device("telemetry-api-pending-commit", true)
+        .await;
+    insert_event(
+        &app,
+        &device.id,
+        "committed-before-pending",
+        auth::now_ms(),
+        auth::now_ms(),
+        json!({"x": 1}),
+    )
+    .await;
+    let checkpoint: i64 = sqlx::query_scalar("SELECT MAX(internal_id) FROM telemetry_events")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+
+    let mut conn = app.pool.acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO telemetry_events
+         (device_id, event_id, ts, received_at, values_json, payload_sha256)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&device.id)
+    .bind("waiting-for-commit")
+    .bind(auth::now_ms() - 40 * 24 * 60 * 60 * 1_000)
+    .bind(auth::now_ms() - 40 * 24 * 60 * 60 * 1_000)
+    .bind(r#"{"x":2}"#)
+    .bind([7_u8; 32].as_slice())
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+
+    let endpoint = format!("{}/api/v1/devices/{}/telemetry", app.base, device.id);
+    let before_commit: Value = client
+        .get(&endpoint)
+        .query(&[("after_id", checkpoint.to_string())])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(before_commit["through_id"], checkpoint);
+    assert!(before_commit["items"].as_array().unwrap().is_empty());
+
+    sqlx::query("COMMIT").execute(&mut *conn).await.unwrap();
+    let after_commit: Value = client
+        .get(&endpoint)
+        .query(&[("after_id", checkpoint.to_string())])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after_commit["items"][0]["event_id"], "waiting-for-commit");
+    assert!(after_commit["through_id"].as_i64().unwrap() > checkpoint);
+    assert!(
+        after_commit["items"][0]["ts"].as_i64().unwrap()
+            < auth::now_ms() - 31 * 24 * 60 * 60 * 1_000
+    );
 }
 
 #[tokio::test]

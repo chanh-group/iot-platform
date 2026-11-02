@@ -141,12 +141,18 @@ async fn subscribed_clients_receive_only_committed_telemetry_and_refetch_after_r
             .is_err()
     );
 
+    let device_timestamp = iot_server::core::auth::now_ms() - 20_000;
     let stored_ack = publish(
         &app,
         &device.id,
         &device.token,
         "committed-ws-event",
-        br#"{"event_id":"committed-ws-event","values":{"temperature":24.5}}"#,
+        &serde_json::to_vec(&json!({
+            "event_id": "committed-ws-event",
+            "ts": device_timestamp,
+            "values": {"temperature": 24.5}
+        }))
+        .unwrap(),
     )
     .await;
     assert_eq!(stored_ack["status"], "stored");
@@ -154,6 +160,7 @@ async fn subscribed_clients_receive_only_committed_telemetry_and_refetch_after_r
     assert_eq!(event["type"], "telemetry");
     assert_eq!(event["device_id"], device.id);
     assert_eq!(event["data"]["event_id"], "committed-ws-event");
+    assert_eq!(event["data"]["ts"], device_timestamp);
     assert_eq!(event["data"]["values"]["temperature"], 24.5);
     let stored: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM telemetry_events WHERE device_id = ? AND event_id = ?",
@@ -164,6 +171,14 @@ async fn subscribed_clients_receive_only_committed_telemetry_and_refetch_after_r
     .await
     .unwrap();
     assert_eq!(stored, 1);
+    let committed_checkpoint: i64 = sqlx::query_scalar(
+        "SELECT internal_id FROM telemetry_events WHERE device_id = ? AND event_id = ?",
+    )
+    .bind(&device.id)
+    .bind("committed-ws-event")
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
     socket
         .send(Message::Text(
             json!({"action":"unsubscribe", "channels":[format!("device:{}", device.id)]})
@@ -178,21 +193,68 @@ async fn subscribed_clients_receive_only_committed_telemetry_and_refetch_after_r
     );
 
     socket.close(None).await.unwrap();
+
+    for (event_id, ts) in [
+        (
+            "missed-late-ws-event",
+            iot_server::core::auth::now_ms() - 300_000,
+        ),
+        ("missed-ws-event", iot_server::core::auth::now_ms()),
+    ] {
+        let ack = publish(
+            &app,
+            &device.id,
+            &device.token,
+            event_id,
+            &serde_json::to_vec(&json!({
+                "event_id": event_id,
+                "ts": ts,
+                "values": {"temperature": 25.0}
+            }))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(ack["status"], "stored");
+    }
+    let command = client
+        .post(format!(
+            "{}/api/v1/devices/{}/commands",
+            app.base, device.id
+        ))
+        .header("X-IoT-CSRF", "1")
+        .json(&json!({"name":"reconnect-check"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(command.status(), reqwest::StatusCode::ACCEPTED);
+    let command_id = command.json::<Value>().await.unwrap()["command_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
     let mut reconnected = ws_connect(&app, &cookie).await;
     assert_eq!(next_json(&mut reconnected).await["type"], "hello");
+    reconnected
+        .send(Message::Text(
+            json!({"action":"subscribe", "channels":["overview", format!("device:{}", device.id)]})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(next_json(&mut reconnected).await["type"], "subscribed");
     assert!(
         tokio::time::timeout(Duration::from_millis(100), reconnected.next())
             .await
             .is_err()
     );
 
-    let ts = event["data"]["ts"].as_i64().unwrap();
     let history: Value = client
         .get(format!(
             "{}/api/v1/devices/{}/telemetry",
             app.base, device.id
         ))
-        .query(&[("from", ts.to_string()), ("to", (ts + 1).to_string())])
+        .query(&[("after_id", committed_checkpoint.to_string())])
         .send()
         .await
         .unwrap()
@@ -201,7 +263,49 @@ async fn subscribed_clients_receive_only_committed_telemetry_and_refetch_after_r
         .json()
         .await
         .unwrap();
-    assert_eq!(history["items"][0]["event_id"], "committed-ws-event");
+    let event_ids: Vec<_> = history["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["event_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(event_ids, ["missed-late-ws-event", "missed-ws-event"]);
+    assert!(
+        history["items"][0]["ts"].as_i64().unwrap() < iot_server::core::auth::now_ms() - 60_000
+    );
+
+    let commands: Value = client
+        .get(format!(
+            "{}/api/v1/devices/{}/commands",
+            app.base, device.id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        commands["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == command_id)
+    );
+    let overview: Value = client
+        .get(format!("{}/api/v1/overview", app.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(overview["telemetry"]["events_24h"], 3);
+    assert!(
+        overview["commands"]["pending"].as_i64().unwrap()
+            + overview["commands"]["dispatched"].as_i64().unwrap()
+            >= 1
+    );
     let logout = client
         .post(format!("{}/api/v1/auth/logout", app.base))
         .header("X-IoT-CSRF", "1")
@@ -293,10 +397,11 @@ async fn failed_telemetry_commit_is_not_broadcast() {
 
 #[tokio::test]
 async fn slow_websocket_is_closed_and_releases_its_connection_slot() {
-    let app = TestApp::builder().websocket_limits(1, 16).start().await;
+    let app = TestApp::builder().websocket_limits(2, 16).start().await;
     let dropped_before = Metrics::global().ws_dropped_total.get();
     let (_, cookie) = ws_session_cookie(&app).await;
     let device = app.create_device("ws-slow-consumer", true).await;
+    let fast_device = app.create_device("ws-fast-consumer", true).await;
     let mut slow = ws_connect(&app, &cookie).await;
     assert_eq!(next_json(&mut slow).await["type"], "hello");
     slow.send(Message::Text(
@@ -307,6 +412,29 @@ async fn slow_websocket_is_closed_and_releases_its_connection_slot() {
     .await
     .unwrap();
     assert_eq!(next_json(&mut slow).await["type"], "subscribed");
+    let mut fast = ws_connect(&app, &cookie).await;
+    assert_eq!(next_json(&mut fast).await["type"], "hello");
+    fast.send(Message::Text(
+        json!({"action":"subscribe", "channels":[format!("device:{}", fast_device.id)]})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(next_json(&mut fast).await["type"], "subscribed");
+    let fast_reader = tokio::spawn(async move {
+        loop {
+            match fast.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let event: Value = serde_json::from_str(text.as_str()).unwrap();
+                    if event["type"] == "telemetry" && event["id"] == "fast-sentinel" {
+                        break fast;
+                    }
+                }
+                other => panic!("fast WebSocket stopped receiving: {other:?}"),
+            }
+        }
+    });
 
     let payload = "x".repeat(32 * 1024);
     for event_id in 0_i64..512 {
@@ -317,6 +445,12 @@ async fn slow_websocket_is_closed_and_releases_its_connection_slot() {
             data: json!({"payload":payload.clone()}),
         });
     }
+    app.events.publish(TelemetryCommitted {
+        id: "fast-sentinel".to_owned(),
+        ts: 512,
+        device_id: fast_device.id,
+        data: json!({"payload":"fast client remains live"}),
+    });
 
     let close_code = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -331,11 +465,16 @@ async fn slow_websocket_is_closed_and_releases_its_connection_slot() {
     .await
     .expect("slow websocket should be closed");
     assert_eq!(close_code, CloseCode::Again);
-    assert_eq!(Metrics::global().ws_dropped_total.get() - dropped_before, 1);
+    assert!(Metrics::global().ws_dropped_total.get() > dropped_before);
+    let mut fast = tokio::time::timeout(Duration::from_secs(10), fast_reader)
+        .await
+        .expect("fast WebSocket was blocked by slow client")
+        .unwrap();
 
     let mut replacement = ws_connect(&app, &cookie).await;
     assert_eq!(next_json(&mut replacement).await["type"], "hello");
     replacement.close(None).await.unwrap();
+    fast.close(None).await.unwrap();
 }
 
 #[tokio::test]

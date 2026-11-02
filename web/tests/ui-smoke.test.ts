@@ -29,9 +29,14 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
   let eventId = 0;
   let historyEnabled = false;
   let backfillEnabled = false;
+  let checkpointRequests = 0;
+  let initialCatchupRequests = 0;
+  let checkpointHighWater = 5_000;
+  let initialCatchupPending = false;
+  let delayPrimaryDeviceAck = false;
+  let missedNearOpen = false;
+  let initialOverviewRequestId: number | undefined;
   let historyOverlap: TelemetryRow | undefined;
-  let lateEventSample: TelemetryRow | undefined;
-  let lateEventReturned = false;
   let latestItems: LatestValue[] = [];
   let holdNextLatestResponse = false;
   let releaseHeldLatestResponse: (() => void) | undefined;
@@ -52,8 +57,8 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
   const devicePatches: Array<{ id: string; patch: Record<string, unknown> }> = [];
   let deviceCreateRequests = 0;
   let credentialRotations = 0;
-  const historyRequests: Array<{ from: string | null; to: string | null; limit: string | null; cursor: string | null; key: string | null }> = [];
-  const backfillRequests: Array<{ from: string | null; to: string | null; limit: string | null; cursor: string | null; key: string | null }> = [];
+  const historyRequests: Array<{ from: string | null; to: string | null; afterId: string | null; limit: string | null; cursor: string | null; key: string | null }> = [];
+  const backfillRequests: Array<{ from: string | null; to: string | null; afterId: string | null; limit: string | null; cursor: string | null; key: string | null }> = [];
   const configPatches: Array<{ expected_revision: number; settings: Record<string, unknown> }> = [];
   const websocketActions: Array<{ action?: string; channels?: string[] }> = [];
   const sockets = new Set<ServerWebSocket<{ fixture: true }>>();
@@ -234,33 +239,84 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
         const query = {
           from: url.searchParams.get("from"),
           to: url.searchParams.get("to"),
+          afterId: url.searchParams.get("after_id"),
           limit: url.searchParams.get("limit"),
           cursor: url.searchParams.get("cursor"),
           key: url.searchParams.get("keys"),
         };
         historyRequests.push(query);
-        if (backfillEnabled && query.key === null) {
+        if (query.afterId !== null && query.key === null) {
+          const afterId = Number(query.afterId);
+          if (afterId === 0 && query.limit === "1") {
+            checkpointRequests += 1;
+            initialCatchupPending = true;
+            return Response.json({
+              items: [{
+                internal_id: 1,
+                event_id: "old-history-bootstrap",
+                ts: Date.now() - 24 * 60 * 60_000,
+                received_at: Date.now() - 24 * 60 * 60_000,
+                values: { temperature: 1 },
+              }],
+              next_cursor: "old-history-after-first-page",
+              through_id: checkpointHighWater,
+            });
+          }
+          if (initialCatchupPending && afterId === checkpointHighWater) {
+            initialCatchupPending = false;
+            initialCatchupRequests += 1;
+            if (missedNearOpen) {
+              return Response.json({
+                items: [{
+                  internal_id: afterId + 1,
+                  event_id: `missed-between-acks-${afterId}`,
+                  ts: Date.now() - 500,
+                  received_at: Date.now(),
+                  values: { humidity: "late-open-event" },
+                }],
+                next_cursor: null,
+                through_id: afterId + 1,
+              });
+            }
+            return Response.json({ items: [], next_cursor: null, through_id: afterId });
+          }
+          if (!backfillEnabled) {
+            return Response.json({ items: [], next_cursor: null, through_id: afterId });
+          }
           backfillRequests.push(query);
           const pageNumber = query.cursor ? Number(query.cursor.replace("backfill-", "")) : 1;
-          const timestamp = Number(query.from) + pageNumber;
-          lateEventSample = {
-            internal_id: 99,
-            event_id: "late-event-before-range",
-            ts: Number(query.from) - 1,
-            received_at: Number(query.from) + 1,
-            values: { temperature: 19 },
-          };
-          const inEventTimeRange = lateEventSample.ts >= Number(query.from) && lateEventSample.ts < Number(query.to);
-          lateEventReturned ||= inEventTimeRange;
+          if (afterId >= 10_000 && !query.cursor) {
+            const selectedTo = Number([...historyRequests].reverse().find((history) => history.to !== null)?.to ?? Date.now());
+            return Response.json({
+              items: [{
+                internal_id: afterId + 1,
+                event_id: `second-reconnect-${afterId}`,
+                ts: selectedTo - 1,
+                received_at: Date.now(),
+                values: { temperature: 27 },
+              }],
+              next_cursor: null,
+              through_id: afterId + 10,
+            });
+          }
+          const throughId = 10_000;
+          const selectedFrom = Number([...historyRequests].reverse().find((history) => history.from !== null)?.from ?? Date.now() - 60_000);
+          const selectedTo = Number([...historyRequests].reverse().find((history) => history.to !== null)?.to ?? Date.now());
+          const span = Math.max(1, selectedTo - selectedFrom);
+          const firstInternalId = afterId + (pageNumber - 1) * 200 + 1;
           return Response.json({
-            items: [...(inEventTimeRange ? [lateEventSample] : []), {
-              internal_id: pageNumber,
-              event_id: `backfill-${pageNumber}`,
-              ts: timestamp,
-              received_at: timestamp,
-              values: { temperature: 20 + pageNumber },
-            }],
+            items: Array.from({ length: 200 }, (_, index) => {
+              const internalId = firstInternalId + index;
+              return {
+                internal_id: internalId,
+                event_id: `backfill-${afterId}-${internalId}`,
+                ts: selectedFrom + internalId % span,
+                received_at: Date.now(),
+                values: { temperature: 20 + index % 10 },
+              };
+            }),
             next_cursor: pageNumber < 6 ? `backfill-${pageNumber + 1}` : null,
+            through_id: throughId,
           });
         }
         if (!historyEnabled) return Response.json({ items: [], next_cursor: null });
@@ -290,7 +346,10 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
         return Response.json({ items: [] });
       }
       if (url.pathname === `/api/v1/devices/${otherDeviceId}/telemetry`) {
-        return Response.json({ items: [], next_cursor: null });
+        const afterId = url.searchParams.get("after_id");
+        return afterId === null
+          ? Response.json({ items: [], next_cursor: null })
+          : Response.json({ items: [], next_cursor: null, through_id: Number(afterId) });
       }
       const commandsPath = url.pathname.match(/^\/api\/v1\/devices\/([^/]+)\/commands$/);
       if (commandsPath && request.method === "POST") {
@@ -363,10 +422,34 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
         socket.send(JSON.stringify({ type: "hello", server_time: Date.now(), max_subscriptions: 8 }));
       },
       message(socket, message) {
-        const payload = JSON.parse(String(message)) as { action?: string; channels?: string[] };
+        const payload = JSON.parse(String(message)) as { action?: string; channels?: string[]; request_id?: number };
         websocketActions.push(payload);
         if (payload.action === "subscribe") {
-          socket.send(JSON.stringify({ type: "subscribed", channels: payload.channels ?? [] }));
+          if (payload.channels?.includes("overview") && !payload.channels.some((channel) => channel.startsWith("device:"))) {
+            initialOverviewRequestId ??= payload.request_id;
+          }
+          if (delayPrimaryDeviceAck && payload.channels?.includes(`device:${deviceId}`)) {
+            delayPrimaryDeviceAck = false;
+            socket.send(JSON.stringify({
+              type: "subscribed",
+              channels: ["overview"],
+              request_id: initialOverviewRequestId,
+            }));
+            setTimeout(() => {
+              missedNearOpen = true;
+              socket.send(JSON.stringify({
+                type: "subscribed",
+                channels: ["overview", `device:${deviceId}`],
+                request_id: payload.request_id,
+              }));
+            }, 150);
+          } else {
+            socket.send(JSON.stringify({
+              type: "subscribed",
+              channels: [...new Set(["overview", ...(payload.channels ?? [])])],
+              request_id: payload.request_id,
+            }));
+          }
         }
       },
       close(socket) {
@@ -665,9 +748,15 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
       return true;
     })()`);
     await waitFor("document.body.innerText.includes('smoke-sensor')", Boolean, "all-device filter");
+    delayPrimaryDeviceAck = true;
     await evaluate(`[...document.querySelectorAll('button')].find((button) => button.textContent?.trim() === 'smoke-sensor')?.click()`);
     await waitFor("document.querySelector('#device-title')?.textContent?.trim()", (value) => value === "Device detail", "device detail");
-    await waitForFixture(() => historyRequests.length > 0, "initial empty history request");
+    await waitForFixture(() => checkpointRequests === 1 && initialCatchupRequests === 1, "initial commit checkpoint and post-subscribe catch-up");
+    expect(missedNearOpen).toBe(true);
+    await waitFor("document.body.innerText.includes('retains 1 recent events')", Boolean, "event committed between stale and device ACKs recovered");
+    expect(historyRequests.find((query) => query.afterId === "0" && query.limit === "1")?.cursor).toBe(null);
+    expect(historyRequests.find((query) => query.afterId === "5000")?.limit).toBe("200");
+    expect(historyRequests.some((query) => query.from !== null && query.to !== null)).toBe(true);
     const historyToInput = await evaluate(`(() => {
       const date = new Date(Date.now());
       const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
@@ -869,39 +958,83 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
     });
 
     const backfillToControl = await evaluate("document.querySelector('#history-to')?.value");
+    const retainedLiveTs = Date.now() - 500;
+    broadcast("telemetry", {
+      event_id: "live-retained-across-reconnects",
+      ts: retainedLiveTs,
+      received_at: retainedLiveTs,
+      values: { temperature: 31 },
+    }, deviceId);
+    await waitFor("document.querySelector('.chart-host')?.getAttribute('aria-label')", (value) => typeof value === "string" && value.includes("numeric sample"), "live point before reconnect");
+    const chartPointsBeforeReconnect = Number(((await evaluate("document.querySelector('.chart-host')?.getAttribute('aria-label')")) as string).match(/, (\d+) numeric/)?.[1]);
     const previousSocketCount = websocketOpened;
     const latestReadsBeforeReconnect = latestReads;
     backfillEnabled = true;
     for (const socket of [...sockets]) socket.close(1012, "smoke reconnect");
     await waitForFixture(() => websocketOpened > previousSocketCount, "WebSocket reconnect");
     await waitForFixture(() => backfillRequests.length === 5, "bounded multi-page reconnect backfill");
-    await waitFor("document.body.innerText.includes('Reconnect backfill query is bounded')", Boolean, "visible bounded backfill");
+    await waitFor("document.body.innerText.includes('Reconnect backfill is bounded')", Boolean, "visible bounded backfill");
     expect(backfillRequests).toHaveLength(5);
     expect(backfillRequests.every((query) => query.limit === "200" && query.key === null)).toBe(true);
     expect(backfillRequests.map((query) => query.cursor)).toEqual([null, "backfill-2", "backfill-3", "backfill-4", "backfill-5"]);
-    expect(new Set(backfillRequests.map((query) => query.from)).size).toBe(1);
-    expect(new Set(backfillRequests.map((query) => query.to)).size).toBe(1);
-    expect(Number(backfillRequests[0]?.to) - Number(backfillRequests[0]?.from)).toBeLessThanOrEqual(31 * 24 * 60 * 60 * 1_000);
-    expect(lateEventSample).toBeDefined();
-    expect(lateEventSample!.ts).toBeLessThan(Number(backfillRequests[0]?.from));
-    expect(lateEventSample!.received_at).toBeGreaterThanOrEqual(Number(backfillRequests[0]?.from));
-    expect(lateEventSample!.received_at).toBeLessThan(Number(backfillRequests[0]?.to));
-    expect(lateEventReturned).toBe(false);
-    expect(await evaluate("document.body.innerText.includes('complete recovery cannot be established')")).toBe(true);
+    expect(new Set(backfillRequests.map((query) => query.afterId)).size).toBe(1);
+    expect(backfillRequests.every((query) => query.from === null && query.to === null)).toBe(true);
+    expect(await evaluate("document.body.innerText.includes('More pages remain; continue from the saved cursor.')")).toBe(true);
     expect(await evaluate("document.querySelector('#history-to')?.value")).toBe(backfillToControl);
+
+    const secondSocketCount = websocketOpened;
+    for (const socket of [...sockets]) socket.close(1013, "second smoke reconnect");
+    await waitForFixture(() => websocketOpened > secondSocketCount, "second WebSocket reconnect");
+    await waitForFixture(() => backfillRequests.length === 7, "catch-up after saved cursor");
+    await waitFor("document.body.innerText.includes('committed checkpoint')", Boolean, "complete commit-order backfill");
+    expect(backfillRequests[5]?.cursor).toBe("backfill-6");
+    expect(backfillRequests[6]?.afterId).toBe("10000");
+    const recoveredStatus = await evaluate("document.querySelector('section[aria-labelledby=\"telemetry-title\"] .notice[role=\"status\"]')?.textContent") as string | undefined;
+    if (!recoveredStatus?.includes("retains 100 recent events")) throw new Error(`Unexpected backfill status: ${recoveredStatus}`);
+    const chartPointsAfterReconnects = Number(((await evaluate("document.querySelector('.chart-host')?.getAttribute('aria-label')")) as string).match(/, (\d+) numeric/)?.[1]);
+    expect(chartPointsAfterReconnects).toBeGreaterThan(chartPointsBeforeReconnect);
+    expect(recoveredStatus).toContain("evicted from chart memory");
+    const historyReadsBeforeExpandedRange = historyRequests.length;
+    const expandedTo = await evaluate(`(() => {
+      const date = new Date(Date.now() + 60_000);
+      const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+      return local.toISOString().slice(0, 23);
+    })()`) as string;
+    await evaluate(`(() => {
+      const input = document.querySelector('#history-to');
+      if (!input) return false;
+      input.value = ${JSON.stringify(expandedTo)};
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      return true;
+    })()`);
+    const expandedToMs = await evaluate("new Date(document.querySelector('#history-to')?.value ?? '').getTime()") as number;
+    await waitForFixture(() => historyRequests.some((query) => query.from !== null && query.to === String(expandedToMs)), "history reload after expanding range with evicted backfill rows");
+    expect(historyRequests.length).toBeGreaterThan(historyReadsBeforeExpandedRange);
+
     await waitForFixture(() => latestReads > latestReadsBeforeReconnect, "latest REST refetch after reconnect");
     await waitFor("document.querySelector('section[aria-labelledby=\"latest-title\"] .loading') === null", Boolean, "latest response after reconnect");
-    const latestReadsBeforeReplayedTie = latestReads;
+    const latestReadsBeforeDuplicateTie = latestReads;
     for (const event of manyTieEvents.slice(0, 2)) broadcast("telemetry", event, deviceId);
-    await waitForFixture(() => latestReads > latestReadsBeforeReplayedTie, "same tie group refresh after old groups are pruned");
     await Bun.sleep(300);
-    expect(latestReads).toBe(latestReadsBeforeReplayedTie + 1);
+    expect(latestReads).toBe(latestReadsBeforeDuplicateTie);
 
     expect(await evaluate("document.querySelector('.chart-host') !== null")).toBe(true);
     await evaluate(`[...document.querySelectorAll('button')].find((button) => button.textContent?.trim() === 'Devices')?.click()`);
     await waitFor("document.querySelector('#devices-title')?.textContent?.trim()", (value) => value === "Devices", "return to devices");
     await waitFor("document.querySelector('.chart-host') === null", Boolean, "chart unmount");
     expect(websocketActions.some((message) => message.action === "unsubscribe" && message.channels?.includes(`device:${deviceId}`))).toBe(true);
+
+    checkpointHighWater = Math.max(checkpointHighWater, 10_010) + 1_001;
+    missedNearOpen = false;
+    await waitFor("[...document.querySelectorAll('button')].some((button) => button.textContent?.trim() === 'smoke-sensor')", Boolean, "device available for re-open");
+    await evaluate(`[...document.querySelectorAll('button')].find((button) => button.textContent?.trim() === 'smoke-sensor')?.click()`);
+    await waitFor("document.querySelector('#device-title')?.textContent?.trim()", (value) => value === "Device detail", "reopened device after old events accumulated");
+    await waitForFixture(() => checkpointRequests === 2 && initialCatchupRequests === 2, "fresh checkpoint on device re-open");
+    expect(historyRequests.some((query) => query.afterId === String(checkpointHighWater))).toBe(true);
+    expect(backfillRequests).toHaveLength(7);
+
+    await evaluate(`[...document.querySelectorAll('button')].find((button) => button.textContent?.trim() === 'Devices')?.click()`);
+    await waitFor("document.querySelector('#devices-title')?.textContent?.trim()", (value) => value === "Devices", "leave reopened device");
     await evaluate(`[...document.querySelectorAll('button')].find((button) => button.textContent?.trim() === 'Config')?.click()`);
     await waitFor("document.querySelector('#config-title')?.textContent?.trim()", (value) => value === "Runtime configuration", "config view");
 

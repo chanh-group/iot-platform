@@ -3,6 +3,7 @@ import { ApiClient, ApiError, isAbortError } from "./api";
 import type { LatestValue, Page, RealtimeEvent, TelemetryRow } from "./models";
 import { useRequest } from "./useRequest";
 import type { LiveTelemetry } from "./chart";
+import type { ReconnectCheckpoint } from "./ws";
 import { mergeLatestValues } from "./latestTelemetry";
 
 function localDateTime(value: number): string {
@@ -18,16 +19,31 @@ function timestampFromInput(value: string): number {
 const MAX_RANGE_MS = 31 * 24 * 60 * 60 * 1_000;
 const HISTORY_PAGE_SIZE = 200;
 const BACKFILL_MAX_PAGES = 5;
+const BACKFILL_MAX_ROWS = 100;
+
+function keepRecentRows(rows: TelemetryRow[]): boolean {
+  if (rows.length <= BACKFILL_MAX_ROWS) return false;
+  rows.sort((left, right) => left.internal_id - right.internal_id);
+  rows.splice(0, rows.length - BACKFILL_MAX_ROWS);
+  return true;
+}
+
+type BackfillRequest =
+  { afterId: number; throughId?: number; cursor?: string };
 
 interface BackfillState {
   status: "idle" | "loading" | "fetched" | "partial" | "error";
   rows: TelemetryRow[];
   pages: number;
-  from?: number;
-  to?: number;
-  clipped: boolean;
+  afterId?: number;
+  throughId?: number;
+  truncated?: boolean;
   nextCursor?: string;
   error?: unknown;
+}
+
+interface TelemetryHistoryPage extends Page<TelemetryRow> {
+  through_id?: number;
 }
 
 export function useDeviceTelemetry(
@@ -35,46 +51,55 @@ export function useDeviceTelemetry(
   deviceId: string,
   reconnectKey: Accessor<number>,
   events: Accessor<RealtimeEvent[]>,
+  reconnectCheckpoint: Accessor<ReconnectCheckpoint | undefined> = () => undefined,
+  onCheckpoint: (throughId: number) => void = () => {},
 ) {
   const [from, setFrom] = createSignal(localDateTime(Date.now() - 24 * 60 * 60 * 1_000));
   const [to, setTo] = createSignal(localDateTime(Date.now()));
   const [key, setKey] = createSignal("");
   const [keyInitialized, setKeyInitialized] = createSignal(false);
   const [cursors, setCursors] = createSignal<string[]>([""]);
-  const [backfill, setBackfill] = createSignal<BackfillState>({ status: "idle", rows: [], pages: 0, clipped: false });
+  const [backfill, setBackfill] = createSignal<BackfillState>({ status: "idle", rows: [], pages: 0 });
   const cursor = () => cursors().at(-1) ?? "";
 
   const latest = useRequest(
     () => `${deviceId}:${reconnectKey()}`,
     (signal) => api.get<{ items: LatestValue[] }>(`/api/v1/devices/${deviceId}/telemetry/latest`, signal),
   );
-  const websocketLive = createMemo<LiveTelemetry[]>(() => events()
-    .filter((event) => event.type === "telemetry" && event.device_id === deviceId)
-    .flatMap((event) => {
-      const payload = event.data;
-      if (typeof payload.event_id !== "string" || typeof payload.values !== "object" || payload.values === null) return [];
-      const values: Record<string, string | number | boolean> = {};
-      for (const [name, value] of Object.entries(payload.values)) {
-        if (typeof value === "string" || typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value))) {
-          values[name] = value;
-        }
-      }
-      return [{
-        event_id: payload.event_id,
-        ts: typeof payload.ts === "number" ? payload.ts : event.ts,
-        received_at: typeof payload.received_at === "number" && Number.isFinite(payload.received_at)
-          ? payload.received_at
-          : undefined,
-        values,
-      }];
+  const live = (): LiveTelemetry[] => {
+    const seen = new Set<string>();
+    const backfilled = backfill().rows.map((row) => ({
+      event_id: row.event_id,
+      ts: row.ts,
+      received_at: row.received_at,
+      values: row.values,
     }));
-  const backfilledLive = createMemo<LiveTelemetry[]>(() => backfill().rows.map((row) => ({
-    event_id: row.event_id,
-    ts: row.ts,
-    received_at: row.received_at,
-    values: row.values,
-  })));
-  const live = createMemo<LiveTelemetry[]>(() => [...backfilledLive(), ...websocketLive()]);
+    const websocket = events()
+      .filter((event) => event.type === "telemetry" && event.device_id === deviceId)
+      .flatMap((event) => {
+        const payload = event.data;
+        if (typeof payload.event_id !== "string" || typeof payload.values !== "object" || payload.values === null) return [];
+        const values: Record<string, string | number | boolean> = {};
+        for (const [name, value] of Object.entries(payload.values)) {
+          if (typeof value === "string" || typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value))) {
+            values[name] = value;
+          }
+        }
+        return [{
+          event_id: payload.event_id,
+          ts: typeof payload.ts === "number" ? payload.ts : event.ts,
+          received_at: typeof payload.received_at === "number" && Number.isFinite(payload.received_at)
+            ? payload.received_at
+            : undefined,
+          values,
+        }];
+      });
+    return [...backfilled, ...websocket].filter((event) => {
+      if (seen.has(event.event_id)) return false;
+      seen.add(event.event_id);
+      return true;
+    });
+  };
   const latestMerge = createMemo(() => mergeLatestValues(latest.state().data?.items ?? [], live()));
   const latestValues = createMemo<LatestValue[]>(() => latestMerge().items);
   const checkedTieEvents = new Map<string, Set<string>>();
@@ -102,67 +127,101 @@ export function useDeviceTelemetry(
   let previousReconnectKey = reconnectKey();
   let backfillGeneration = 0;
   let backfillController: AbortController | undefined;
+  let catchUpAfterCursor = false;
 
-  const startBackfill = () => {
+  const startBackfill = (request: BackfillRequest) => {
     const generation = ++backfillGeneration;
     backfillController?.abort();
     backfillController = undefined;
-    const requestedFrom = timestampFromInput(from());
-    const toMs = Date.now();
-    if (!Number.isFinite(requestedFrom)) {
-      setBackfill({ status: "error", rows: [], pages: 0, clipped: false, error: new ApiError("validation_error", "Choose a valid history start time before reconnect backfill.") });
+    const previous = backfill();
+    if (!Number.isSafeInteger(request.afterId) || request.afterId < 0) {
+      setBackfill({ ...previous, status: "error", error: new ApiError("validation_error", "Reconnect commit checkpoint is invalid.") });
       return;
     }
-    if (requestedFrom >= toMs) {
-      setBackfill({ status: "error", rows: [], pages: 0, from: requestedFrom, to: toMs, clipped: false, error: new ApiError("validation_error", "Reconnect backfill start time must be before now.") });
-      return;
-    }
-
-    const fromMs = Math.max(requestedFrom, toMs - MAX_RANGE_MS);
-    const clipped = fromMs > requestedFrom;
     const controller = new AbortController();
     backfillController = controller;
-    setBackfill({ status: "loading", rows: [], pages: 0, from: fromMs, to: toMs, clipped });
+    setBackfill({
+      ...previous,
+      status: "loading",
+      afterId: request.afterId,
+      throughId: request.throughId,
+      nextCursor: request.cursor,
+      error: undefined,
+    });
 
     void (async () => {
       const rows: TelemetryRow[] = [];
       const seenCursors = new Set<string>();
-      let cursor: string | undefined;
+      let cursor = request.cursor;
+      if (cursor) seenCursors.add(cursor);
+      let throughId = request.throughId;
+      let truncated = false;
       let pages = 0;
       while (pages < BACKFILL_MAX_PAGES) {
         if (controller.signal.aborted || generation !== backfillGeneration) {
-          return { rows, pages, nextCursor: cursor };
+          return { rows, pages, nextCursor: cursor, throughId, truncated };
         }
-        const query = new URLSearchParams({ from: String(fromMs), to: String(toMs), limit: String(HISTORY_PAGE_SIZE) });
+        const query = new URLSearchParams({ after_id: String(request.afterId), limit: String(HISTORY_PAGE_SIZE) });
         if (cursor) query.set("cursor", cursor);
-        const page = await api.get<Page<TelemetryRow>>(`/api/v1/devices/${deviceId}/telemetry?${query}`, controller.signal);
+        const page = await api.get<TelemetryHistoryPage>(`/api/v1/devices/${deviceId}/telemetry?${query}`, controller.signal);
         if (controller.signal.aborted || generation !== backfillGeneration) {
-          return { rows, pages, nextCursor: cursor };
+          return { rows, pages, nextCursor: cursor, throughId, truncated };
         }
+        if (typeof page.through_id !== "number"
+          || !Number.isSafeInteger(page.through_id)
+          || page.through_id < request.afterId
+          || (throughId !== undefined && throughId !== page.through_id)) {
+          throw new ApiError("invalid_response", "Reconnect backfill returned an invalid committed checkpoint.");
+        }
+        throughId = page.through_id;
         rows.push(...page.items);
+        const pageTruncated = keepRecentRows(rows);
+        truncated = truncated || pageTruncated;
         pages += 1;
         cursor = page.next_cursor ?? undefined;
         if (!cursor) break;
         if (seenCursors.has(cursor)) throw new ApiError("invalid_response", "Reconnect backfill returned a repeated cursor.");
         seenCursors.add(cursor);
       }
-      return { rows, pages, nextCursor: cursor };
+      return { rows, pages, nextCursor: cursor, throughId, truncated };
     })().then(
       (result) => {
         if (generation !== backfillGeneration) return;
+        backfillController = undefined;
+        const mergedRows = new Map(
+          backfill().rows.map((row) => [row.event_id, row]),
+        );
+        for (const row of result.rows) {
+          mergedRows.set(row.event_id, row);
+        }
+        const retainedRows = [...mergedRows.values()];
+        const mergedTruncated = keepRecentRows(retainedRows);
+        const didTruncate = result.truncated || mergedTruncated;
+        const complete = !result.nextCursor;
         setBackfill({
-          status: result.nextCursor || clipped ? "partial" : "fetched",
-          rows: result.rows,
-          pages: result.pages,
-          from: fromMs,
-          to: toMs,
-          clipped,
+          status: result.nextCursor ? "partial" : "fetched",
+          rows: retainedRows.sort((left, right) =>
+            left.ts - right.ts || left.internal_id - right.internal_id,
+          ),
+          pages: previous.pages + result.pages,
+          afterId: request.afterId,
+          throughId: result.throughId,
+          truncated: previous.truncated || didTruncate,
           nextCursor: result.nextCursor,
         });
+        if (complete && result.throughId !== undefined) {
+          if (catchUpAfterCursor) {
+            catchUpAfterCursor = false;
+            startBackfill({ afterId: result.throughId });
+          } else {
+            onCheckpoint(result.throughId);
+          }
+        }
       },
       (error: unknown) => {
         if (generation === backfillGeneration && !isAbortError(error)) {
-          setBackfill({ status: "error", rows: [], pages: 0, from: fromMs, to: toMs, clipped, error });
+          backfillController = undefined;
+          setBackfill({ ...backfill(), status: "error", error });
         }
       },
     );
@@ -172,7 +231,21 @@ export function useDeviceTelemetry(
     const currentReconnectKey = reconnectKey();
     if (currentReconnectKey === previousReconnectKey) return;
     previousReconnectKey = currentReconnectKey;
-    startBackfill();
+    const previous = backfill();
+    if (backfillController) {
+      catchUpAfterCursor = true;
+      return;
+    }
+    if (previous.nextCursor && previous.afterId !== undefined) {
+      catchUpAfterCursor = true;
+      startBackfill({
+        afterId: previous.afterId,
+        throughId: previous.throughId,
+        cursor: previous.nextCursor,
+      });
+    } else {
+      startBackfill({ afterId: reconnectCheckpoint()?.afterId ?? 0 });
+    }
   });
   onCleanup(() => {
     backfillGeneration += 1;
@@ -197,12 +270,12 @@ export function useDeviceTelemetry(
     },
   );
   const historyRows = createMemo(() => history.state().data?.items ?? []);
-  const chartLive = createMemo(() => {
+  const chartLive = () => {
     const fromMs = timestampFromInput(from());
     const toMs = timestampFromInput(to());
     if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || fromMs >= toMs) return [];
     return live().filter((event) => event.ts >= fromMs && event.ts < toMs);
-  });
+  };
   const chartKey = createMemo(() => {
     const selected = key();
     if (!selected) return undefined;
@@ -236,7 +309,19 @@ export function useDeviceTelemetry(
     historyRows,
     chartKey,
     backfill,
-    retryBackfill: startBackfill,
+    retryBackfill: () => {
+      const previous = backfill();
+      if (previous.nextCursor && previous.afterId !== undefined) {
+        catchUpAfterCursor = true;
+        startBackfill({
+          afterId: previous.afterId,
+          throughId: previous.throughId,
+          cursor: previous.nextCursor,
+        });
+      } else {
+        startBackfill({ afterId: previous.throughId ?? reconnectCheckpoint()?.afterId ?? 0 });
+      }
+    },
     pageNumber: () => cursors().length,
     canGoPrevious: () => cursors().length > 1,
     canGoNext: () => {

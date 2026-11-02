@@ -3,7 +3,7 @@ import { ApiClient } from "./lib/api";
 import type { AdminUser, RealtimeEvent } from "./lib/models";
 import { routeDashboardEvent, reconnectTarget, type DashboardView } from "./lib/dashboardEvents";
 import { useActions } from "./lib/useRequest";
-import { EventsSocket } from "./lib/ws";
+import { EventsSocket, type ReconnectCheckpoint } from "./lib/ws";
 import { TokenDialog } from "./common";
 import { ConfigView } from "./views/ConfigView";
 import { DeviceDetailView } from "./views/DeviceDetailView";
@@ -25,6 +25,7 @@ export function Dashboard(props: {
   const [commandRefreshKey, setCommandRefreshKey] = createSignal(0);
   const [configRefreshKey, setConfigRefreshKey] = createSignal(0);
   const [reconnectKey, setReconnectKey] = createSignal(0);
+  const [reconnectCheckpoint, setReconnectCheckpoint] = createSignal<ReconnectCheckpoint>({ afterId: 0 });
   const [eventsConnected, setEventsConnected] = createSignal(false);
   const [liveEvents, setLiveEvents] = createSignal<RealtimeEvent[]>([]);
   const [issuedToken, setIssuedToken] = createSignal<{ title: string; token: string; restoreFocusId: string }>();
@@ -33,6 +34,8 @@ export function Dashboard(props: {
   let viewContent!: HTMLDivElement;
   let focusFrame = 0;
   let socket!: EventsSocket;
+  let deviceOpenGeneration = 0;
+  let initialBackfillPending = false;
 
   const channels = () => view() === "detail" && deviceId()
     ? ["overview", `device:${deviceId()}`]
@@ -54,12 +57,22 @@ export function Dashboard(props: {
         case undefined: break;
       }
     },
-    onReconnect: () => {
-      setLiveEvents([]);
+    onSubscribed: (subscribedChannels, reconnected) => {
+      if (!initialBackfillPending
+        || view() !== "detail"
+        || !subscribedChannels.includes(`device:${deviceId()}`)) return;
+      initialBackfillPending = false;
+      if (!reconnected) setReconnectKey((value) => value + 1);
+    },
+    onReconnect: (subscribedChannels) => {
       switch (reconnectTarget(view())) {
         case "overview": setOverviewRefreshKey((value) => value + 1); break;
         case "devices": setDeviceListRefreshKey((value) => value + 1); break;
-        case "detail": setReconnectKey((value) => value + 1); break;
+        case "detail":
+          if (subscribedChannels.includes(`device:${deviceId()}`)) {
+            setReconnectKey((value) => value + 1);
+          }
+          break;
         case "config": setConfigRefreshKey((value) => value + 1); break;
       }
     },
@@ -88,9 +101,29 @@ export function Dashboard(props: {
     setIssuedToken(undefined);
   });
 
-  const openDevice = (id: string) => {
+  const openDevice = async (id: string) => {
+    const generation = ++deviceOpenGeneration;
+    let checkpoint: number;
+    try {
+      const query = new URLSearchParams({ after_id: "0", limit: "1" });
+      const response = await props.api.get<{ through_id?: number }>(`/api/v1/devices/${id}/telemetry?${query}`);
+      if (generation !== deviceOpenGeneration) return;
+      if (typeof response.through_id !== "number" || !Number.isSafeInteger(response.through_id)) {
+        throw new Error("The server returned an invalid telemetry checkpoint.");
+      }
+      checkpoint = response.through_id;
+    } catch {
+      if (generation === deviceOpenGeneration) {
+        setSystemNotice("Could not establish a telemetry checkpoint. Try opening the device again.");
+      }
+      return;
+    }
+    if (generation !== deviceOpenGeneration) return;
+    setSystemNotice("");
     setDeviceId(id);
+    setReconnectCheckpoint({ afterId: checkpoint });
     setLiveEvents([]);
+    initialBackfillPending = true;
     setView("detail");
   };
 
@@ -145,6 +178,8 @@ export function Dashboard(props: {
                 deviceRefreshKey={deviceRefreshKey()}
                 commandRefreshKey={commandRefreshKey()}
                 reconnectKey={reconnectKey()}
+                reconnectCheckpoint={reconnectCheckpoint()}
+                onTelemetryCheckpoint={(throughId) => setReconnectCheckpoint({ afterId: throughId })}
                 liveEvents={liveEvents()}
                 onBack={() => setView("devices")}
               />

@@ -25,6 +25,7 @@ const MAX_LIMIT: i64 = 1_000;
 pub struct HistoryQuery {
     from: Option<i64>,
     to: Option<i64>,
+    after_id: Option<i64>,
     limit: Option<i64>,
     cursor: Option<String>,
     keys: Option<String>,
@@ -39,11 +40,22 @@ pub struct LatestQuery {
 struct Cursor {
     version: u8,
     device_id: String,
+    #[serde(default)]
+    time_basis: HistoryTimeBasis,
     from: i64,
     to: i64,
-    after_ts: i64,
+    #[serde(alias = "after_ts")]
+    after_time: i64,
     after_id: i64,
     keys: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum HistoryTimeBasis {
+    #[default]
+    EventTimestamp,
+    CommitId,
 }
 
 #[derive(Deserialize)]
@@ -68,17 +80,29 @@ pub async fn history(
     query: Result<Query<HistoryQuery>, QueryRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Query(query) = query.map_err(|_| validation_error(&request_id, "invalid query"))?;
-    let (Some(from), Some(to)) = (query.from, query.to) else {
-        return Err(validation_error(&request_id, "from and to are required"));
+    let keys = parse_keys(query.keys.as_deref(), &request_id)?;
+    let decoded_cursor = query
+        .cursor
+        .as_deref()
+        .map(|cursor| decode_cursor(cursor, &request_id))
+        .transpose()?;
+    let (from, requested_to, time_basis) = match (query.after_id, query.from, query.to) {
+        (Some(after_id), None, None) => (after_id, None, HistoryTimeBasis::CommitId),
+        (None, Some(from), Some(to)) => (from, Some(to), HistoryTimeBasis::EventTimestamp),
+        _ => {
+            return Err(validation_error(&request_id, "provide from/to or after_id"));
+        }
     };
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT);
-    if to <= from || to.saturating_sub(from) > MAX_RANGE_MS {
+    if from < 0
+        || (time_basis == HistoryTimeBasis::EventTimestamp
+            && requested_to.is_none_or(|to| to <= from || to.saturating_sub(from) > MAX_RANGE_MS))
+    {
         return Err(validation_error(&request_id, "invalid time range"));
     }
     if !(1..=MAX_LIMIT).contains(&limit) {
         return Err(validation_error(&request_id, "limit must be 1..=1000"));
     }
-    let keys = parse_keys(query.keys.as_deref(), &request_id)?;
     if !telemetry_query::device_exists(&state.pool, &device_id)
         .await
         .map_err(|error| internal_error(error, &request_id))?
@@ -91,14 +115,65 @@ pub async fn history(
         ));
     }
 
-    let after = query
-        .cursor
-        .as_deref()
-        .map(|cursor| decode_cursor(cursor, &device_id, from, to, &keys, &request_id))
+    let to = if time_basis == HistoryTimeBasis::CommitId {
+        let committed_through = telemetry_query::committed_through(&state.pool)
+            .await
+            .map_err(|error| internal_error(error, &request_id))?;
+        if from > committed_through
+            || decoded_cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.to > committed_through)
+        {
+            return Err(if decoded_cursor.is_some() {
+                invalid_cursor(&request_id)
+            } else {
+                validation_error(&request_id, "after_id is beyond the committed checkpoint")
+            });
+        }
+        decoded_cursor
+            .as_ref()
+            .map_or(committed_through, |cursor| cursor.to)
+    } else {
+        requested_to.ok_or_else(|| validation_error(&request_id, "from and to are required"))?
+    };
+    if to < from || (time_basis == HistoryTimeBasis::EventTimestamp && to == from) {
+        return Err(validation_error(&request_id, "invalid time range"));
+    }
+
+    let after = decoded_cursor
+        .as_ref()
+        .map(|cursor| {
+            if cursor.device_id != device_id
+                || cursor.time_basis != time_basis
+                || cursor.from != from
+                || cursor.to != to
+                || cursor.keys != keys
+                || match time_basis {
+                    HistoryTimeBasis::EventTimestamp => {
+                        cursor.after_time < from || cursor.after_time >= to
+                    }
+                    HistoryTimeBasis::CommitId => cursor.after_id <= from || cursor.after_id > to,
+                }
+            {
+                return Err(invalid_cursor(&request_id));
+            }
+            Ok((cursor.after_time, cursor.after_id))
+        })
         .transpose()?;
-    let rows = telemetry_query::history(&state.pool, &device_id, from, to, after, &keys, limit + 1)
-        .await
-        .map_err(|error| internal_error(error, &request_id))?;
+    let rows = telemetry_query::history(
+        &state.pool,
+        &device_id,
+        telemetry_query::HistoryRange {
+            from,
+            to,
+            commit_order: time_basis == HistoryTimeBasis::CommitId,
+        },
+        after,
+        &keys,
+        limit + 1,
+    )
+    .await
+    .map_err(|error| internal_error(error, &request_id))?;
 
     let has_more = rows.len() as i64 > limit;
     let rows: Vec<_> = rows.into_iter().take(limit as usize).collect();
@@ -109,9 +184,14 @@ pub async fn history(
                     &Cursor {
                         version: 1,
                         device_id: device_id.clone(),
+                        time_basis,
                         from,
                         to,
-                        after_ts: row.ts,
+                        after_time: if time_basis == HistoryTimeBasis::EventTimestamp {
+                            row.ts
+                        } else {
+                            0
+                        },
                         after_id: row.internal_id,
                         keys: keys.clone(),
                     },
@@ -136,7 +216,11 @@ pub async fn history(
             }))
         })
         .collect::<Result<_, ApiError>>()?;
-    Ok(Json(json!({ "items": items, "next_cursor": next_cursor })))
+    let mut response = json!({ "items": items, "next_cursor": next_cursor });
+    if time_basis == HistoryTimeBasis::CommitId {
+        response["through_id"] = json!(to);
+    }
+    Ok(Json(response))
 }
 
 /// Returns the latest attributes received from a device.
@@ -290,39 +374,27 @@ fn encode_cursor(cursor: &Cursor, request_id: &str) -> Result<String, ApiError> 
         .map_err(|error| internal_error(error, request_id))
 }
 
-fn decode_cursor(
-    encoded: &str,
-    device_id: &str,
-    from: i64,
-    to: i64,
-    keys: &[String],
-    request_id: &str,
-) -> Result<(i64, i64), ApiError> {
-    let invalid = || {
-        ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "invalid_cursor",
-            "invalid telemetry cursor".to_owned(),
-            request_id.to_owned(),
-        )
-    };
+fn decode_cursor(encoded: &str, request_id: &str) -> Result<Cursor, ApiError> {
     if encoded.len() > 4_096 {
-        return Err(invalid());
+        return Err(invalid_cursor(request_id));
     }
-    let bytes = URL_SAFE_NO_PAD.decode(encoded).map_err(|_| invalid())?;
-    let cursor: Cursor = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
-    if cursor.version != 1
-        || cursor.device_id != device_id
-        || cursor.from != from
-        || cursor.to != to
-        || cursor.keys != keys
-        || cursor.after_id <= 0
-        || cursor.after_ts < from
-        || cursor.after_ts >= to
-    {
-        return Err(invalid());
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| invalid_cursor(request_id))?;
+    let cursor: Cursor = serde_json::from_slice(&bytes).map_err(|_| invalid_cursor(request_id))?;
+    if cursor.version != 1 || cursor.after_id <= 0 {
+        return Err(invalid_cursor(request_id));
     }
-    Ok((cursor.after_ts, cursor.after_id))
+    Ok(cursor)
+}
+
+fn invalid_cursor(request_id: &str) -> ApiError {
+    ApiError::new(
+        StatusCode::BAD_REQUEST,
+        "invalid_cursor",
+        "invalid telemetry cursor".to_owned(),
+        request_id.to_owned(),
+    )
 }
 
 fn validation_error(request_id: &str, message: &str) -> ApiError {
@@ -355,19 +427,31 @@ mod tests {
         let cursor = Cursor {
             version: 1,
             device_id: "device-a".to_owned(),
+            time_basis: HistoryTimeBasis::EventTimestamp,
             from: 10,
             to: 20,
-            after_ts: 12,
+            after_time: 12,
             after_id: 3,
             keys: vec!["x".to_owned()],
         };
         let encoded = encode_cursor(&cursor, "request").unwrap();
-        assert_eq!(
-            decode_cursor(&encoded, "device-a", 10, 20, &["x".to_owned()], "request").unwrap(),
-            (12, 3)
+        assert_eq!(decode_cursor(&encoded, "request").unwrap().after_time, 12);
+        assert!(decode_cursor("not-a-cursor", "request").is_err());
+
+        let legacy = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "version": 1,
+                "device_id": "device-a",
+                "from": 10,
+                "to": 20,
+                "after_ts": 12,
+                "after_id": 3,
+                "keys": ["x"]
+            }))
+            .unwrap(),
         );
-        assert!(decode_cursor(&encoded, "device-a", 10, 21, &["x".to_owned()], "request").is_err());
-        assert!(decode_cursor(&encoded, "device-a", 10, 20, &["y".to_owned()], "request").is_err());
-        assert!(decode_cursor(&encoded, "device-b", 10, 20, &["x".to_owned()], "request").is_err());
+        let legacy = decode_cursor(&legacy, "request").unwrap();
+        assert_eq!(legacy.time_basis, HistoryTimeBasis::EventTimestamp);
+        assert_eq!(legacy.after_time, 12);
     }
 }

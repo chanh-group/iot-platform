@@ -9,10 +9,15 @@ type Socket = Pick<
   "readyState" | "onopen" | "onmessage" | "onclose" | "onerror" | "send" | "close"
 >;
 
+export interface ReconnectCheckpoint {
+  afterId: number;
+}
+
 interface WebSocketOptions {
   channels: string[];
   onEvent: (event: RealtimeEvent) => void;
-  onReconnect: () => void;
+  onSubscribed?: (channels: string[], reconnected: boolean) => void;
+  onReconnect: (channels: string[]) => void;
   onDisconnect: () => void;
   onExpired: () => void;
   onStatus: (connected: boolean) => void;
@@ -28,6 +33,10 @@ export class EventsSocket {
   private stopped = false;
   private openedBefore = false;
   private reconnectPending = false;
+  private nextSubscriptionRequestId = 0;
+  private readonly pendingSubscriptions = new Map<number, string[]>();
+  private readonly latestRequestForChannel = new Map<string, number>();
+  private readonly confirmedChannels = new Set<string>();
   private readonly seen = new Set<string>();
   private readonly onOffline = () => this.socket?.close();
   private readonly onOnline = () => {
@@ -54,13 +63,18 @@ export class EventsSocket {
   setChannels(channels: string[]): void {
     const next = [...new Set(channels)];
     const socket = this.socket;
-    if (socket?.readyState === 1) {
-      const removed = this.channels.filter((channel) => !next.includes(channel));
-      const added = next.filter((channel) => !this.channels.includes(channel));
-      if (removed.length) this.send({ action: "unsubscribe", channels: removed });
-      if (added.length) this.send({ action: "subscribe", channels: added });
-    }
+    const removed = this.channels.filter((channel) => !next.includes(channel));
+    const added = next.filter((channel) => !this.channels.includes(channel));
     this.channels = next;
+    for (const channel of removed) {
+      this.confirmedChannels.delete(channel);
+      this.latestRequestForChannel.delete(channel);
+    }
+    if (socket?.readyState === 1) {
+      if (removed.length) this.send({ action: "unsubscribe", channels: removed });
+      if (added.length) this.subscribe(added);
+    }
+    this.finishSubscription();
   }
 
   stop(): void {
@@ -88,13 +102,16 @@ export class EventsSocket {
 
   private connect(): void {
     if (this.stopped) return;
+    this.pendingSubscriptions.clear();
+    this.latestRequestForChannel.clear();
+    this.confirmedChannels.clear();
     const url = `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/api/v1/events`;
     const socket = this.options.createSocket?.(url) ?? new WebSocket(url);
     this.socket = socket;
     socket.onopen = () => {
       if (this.stopped || this.socket !== socket) return;
       this.options.onStatus(false);
-      if (this.channels.length) this.send({ action: "subscribe", channels: this.channels });
+      if (this.channels.length) this.subscribe(this.channels);
     };
     socket.onmessage = (message) => {
       if (this.stopped || this.socket !== socket || typeof message.data !== "string") return;
@@ -107,17 +124,28 @@ export class EventsSocket {
       if (typeof value !== "object" || value === null) return;
       const event = value as Partial<RealtimeEvent>;
       if (event.type === "subscribed") {
-        this.options.onStatus(true);
-        this.openedBefore = true;
-        if (this.reconnectPending) {
-          this.reconnectPending = false;
-          this.options.onReconnect();
+        const acknowledgement = value as { channels?: unknown; request_id?: unknown };
+        const requestId = acknowledgement.request_id;
+        const requested = typeof requestId === "number" && Number.isSafeInteger(requestId)
+          ? this.pendingSubscriptions.get(requestId)
+          : undefined;
+        if (!requested || typeof requestId !== "number") return;
+        this.pendingSubscriptions.delete(requestId);
+        const receivedChannels = Array.isArray(acknowledgement.channels)
+          ? acknowledgement.channels.filter((channel): channel is string => typeof channel === "string")
+          : [];
+        const accepted = requested.filter((channel) =>
+          receivedChannels.includes(channel)
+          && this.channels.includes(channel)
+          && this.latestRequestForChannel.get(channel) === requestId,
+        );
+        for (const channel of accepted) this.confirmedChannels.add(channel);
+        if (accepted.length) {
+          this.options.onStatus(true);
+          this.openedBefore = true;
+          this.options.onSubscribed?.(accepted, this.reconnectPending);
         }
-        if (this.stableTimer !== undefined) clearTimeout(this.stableTimer);
-        this.stableTimer = setTimeout(() => {
-          this.stableTimer = undefined;
-          this.attempt = 0;
-        }, 30_000);
+        this.finishSubscription();
         return;
       }
       if (typeof event.id !== "string" || typeof event.type !== "string") return;
@@ -140,6 +168,9 @@ export class EventsSocket {
     socket.onclose = (event) => {
       if (this.stopped || this.socket !== socket) return;
       this.socket = undefined;
+      this.confirmedChannels.clear();
+      this.pendingSubscriptions.clear();
+      this.latestRequestForChannel.clear();
       this.options.onStatus(false);
       if (this.stableTimer !== undefined) clearTimeout(this.stableTimer);
       this.stableTimer = undefined;
@@ -158,7 +189,30 @@ export class EventsSocket {
     socket.onerror = () => socket.close();
   }
 
-  private send(message: { action: string; channels: string[] }): void {
+  private subscribe(channels: string[]): void {
+    const requestId = ++this.nextSubscriptionRequestId;
+    const requested = [...channels];
+    this.pendingSubscriptions.set(requestId, requested);
+    for (const channel of requested) this.latestRequestForChannel.set(channel, requestId);
+    this.send({ action: "subscribe", channels: requested, request_id: requestId });
+  }
+
+  private finishSubscription(): void {
+    if (this.socket?.readyState !== 1
+      || !this.channels.length
+      || !this.channels.every((channel) => this.confirmedChannels.has(channel))) return;
+    if (this.reconnectPending) {
+      this.reconnectPending = false;
+      this.options.onReconnect([...this.channels]);
+    }
+    if (this.stableTimer !== undefined) clearTimeout(this.stableTimer);
+    this.stableTimer = setTimeout(() => {
+      this.stableTimer = undefined;
+      this.attempt = 0;
+    }, 30_000);
+  }
+
+  private send(message: { action: string; channels: string[]; request_id?: number }): void {
     try {
       this.socket?.send(JSON.stringify(message));
     } catch {

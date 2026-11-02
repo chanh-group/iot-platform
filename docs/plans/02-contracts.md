@@ -393,6 +393,8 @@ CREATE TABLE telemetry_events (
 
 CREATE INDEX telemetry_device_ts_idx
     ON telemetry_events(device_id, ts, internal_id);
+CREATE INDEX telemetry_device_internal_idx
+    ON telemetry_events(device_id, internal_id);
 CREATE INDEX telemetry_received_idx ON telemetry_events(received_at);
 
 CREATE TABLE device_attributes (
@@ -665,7 +667,9 @@ Query: `limit`, `cursor`, `q` (tùy chọn, 2..64 ký tự, tìm trong name/id),
 
 #### `GET /api/v1/devices/{id}/telemetry`
 
-Query bắt buộc: `from`, `to` (ms, `from < to`, range ≤ 31 ngày). Tùy chọn: `limit` 1..1000 (mặc định 100), `cursor`, `keys` (comma-separated, tối đa 16 key).
+Query lịch sử theo event time: bắt buộc `from`, `to` (ms, `from < to`, range ≤ 31 ngày). Tùy chọn: `limit` 1..1000 (mặc định 100), `cursor`, `keys` (comma-separated, tối đa 16 key).
+
+Backfill sau WebSocket reconnect dùng mode riêng: gửi `after_id` (commit checkpoint `internal_id`, exclusive: chỉ trả ID lớn hơn) thay cho `from`/`to`. **Mỗi lần mở device để theo dõi**, client gọi `after_id=0&limit=1` trước khi subscribe, lưu `through_id` làm baseline và không tiếp tục cursor lịch sử cũ; sau ACK có chứa đúng `device:{id}`, gọi lại từ baseline để lấy event commit trong lúc mở channel. Nếu re-open sau thời gian không theo dõi, chụp baseline mới để không quét lịch sử cũ. Trang đầu chụp `through_id` là SQLite AUTOINCREMENT high-water mark đã commit (ít nhất bằng `after_id`); response trả `through_id`. Server lọc `after_id < internal_id <= through_id`, sort theo `internal_id`; cursor giữ nguyên checkpoint, high-water mark, device và keys. `after_id` lớn hơn high-water mark hiện tại bị từ chối. Sau khi lấy hết cursor, client chỉ tiến checkpoint tới `through_id` đã quét xong. Không dùng clock hoặc `received_at` để tiến checkpoint; batch chưa commit không thể nằm dưới high-water mark nhìn thấy. Không có giới hạn 31 ngày cho mode này. Không gửi đồng thời `after_id` với `from`/`to`.
 
 ```json
 {
@@ -680,9 +684,10 @@ Query bắt buộc: `from`, `to` (ms, `from < to`, range ≤ 31 ngày). Tùy ch�
 }
 ```
 
-- Sort `(ts, internal_id)` tăng dần.
+- Default `from`/`to` sort `(ts, internal_id)` tăng dần. Mode `after_id` sort `internal_id` tăng dần.
 - `keys` lọc values trả về; event không có key nào vẫn có thể xuất hiện với `values:{}`? **Không**: chỉ trả event có ít nhất một key khớp.
-- Lọc khoảng theo event timestamp `ts`, không theo `received_at`; event đến muộn có `ts < from` không được trả về dù `received_at` nằm trong khoảng.
+- Mode `from`/`to` lọc theo event timestamp `ts`, không theo `received_at`; event đến muộn có `ts < from` không được trả về dù `received_at` nằm trong khoảng. Mode `after_id` là checkpoint commit-order cho reconnect; nó bắt cả event đến muộn và event batch chỉ commit sau khi lần quét trước đã chụp high-water mark.
+- `through_id` chỉ có trong response mode `after_id`. WebSocket events là dữ liệu live, không phải bằng chứng về tính liên tục của checkpoint; client giữ live rows và deduplicate theo `(device_id, event_id)` khi merge với backfill.
 - `next_cursor` null khi hết.
 - 404 device; 400 `validation_error`/`invalid_cursor`.
 
@@ -877,19 +882,19 @@ Server gửi ngay:
 Client gửi (tối đa 4 096 byte):
 
 ```json
-{"action": "subscribe", "channels": ["overview", "device:019c..."]}
+{"action": "subscribe", "channels": ["overview", "device:019c..."], "request_id": 17}
 {"action": "unsubscribe", "channels": ["device:019c..."]}
 {"action": "ping"}
 ```
 
 - Channel hợp lệ: `overview`, `device:{uuid}`. Tối đa 8 channel/kết nối.
-- `subscribe` trả `{"type":"subscribed","channels":[...]}`; lỗi `{"type":"error","code":"...","message":"..."}`.
+- `subscribe` có thể gửi `request_id` (integer); ACK trả `{"type":"subscribed","channels":[...],"request_id":17}` cho đúng request. `channels` là các channel của request đã chấp nhận. Client nối ACK theo `request_id` và chỉ coi channel được xác nhận nếu vẫn thuộc lần subscribe hiện tại; nhiều ACK riêng có thể cùng hoàn tất tập channel đang cần. Lỗi `{"type":"error","code":"...","message":"..."}`.
 - `ping` trả `{"type":"pong","ts":...}`.
 - Server ping WebSocket protocol mỗi 30 giây; không pong trong 60 giây → đóng 1001.
 - Queue mỗi client `http.ws_queue_capacity` (256); đầy → đóng 1013 `slow_consumer`; client reconnect và REST refetch.
 - Tối đa `http.max_ws_connections` kết nối; vượt → HTTP 503 trước upgrade.
 - Không replay; không đảm bảo thứ tự giữa các loại event.
-- REST refetch telemetry sau reconnect chỉ truy vấn theo event-time range; không thể chứng minh đã khôi phục mọi event bị lỡ vì event đến muộn có thể có `ts` trước lower bound dù `received_at` mới hơn. Client phải trình bày kết quả có giới hạn mà không tuyên bố đã đồng bộ đầy đủ.
+- REST telemetry history theo `from/to` vẫn lọc event time. Reconnect backfill dùng `after_id/through_id` theo commit order, nên bắt event đến muộn và batch commit sau high-water mark mà không dựa vào đồng hồ client.
 
 Envelope event:
 

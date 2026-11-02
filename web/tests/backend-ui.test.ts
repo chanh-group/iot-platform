@@ -892,7 +892,7 @@ url = "sqlite://./data/iot.db"
     await call("Network.emulateNetworkConditions", { offline: true, latency: 0, downloadThroughput: -1, uploadThroughput: -1 });
     await evaluate("window.__iotSockets.at(-1)?.close(4000, 'detail reconnect')");
     await waitForBrowser("document.querySelector('.connection')?.textContent?.trim()", (value) => value === "Live updates reconnecting", "detail WebSocket disconnect");
-    const missedAt = reconnectHistoryTo - 1_000;
+    const missedAt = reconnectHistoryFrom + 100;
     await activeMqtt.publish(`devices/${deviceId}/telemetry`, {
       event_id: `reconnect-${missedAt}`,
       ts: missedAt,
@@ -901,13 +901,14 @@ url = "sqlite://./data/iot.db"
     expect((await activeMqtt.waitPublish(`devices/${deviceId}/telemetry/ack`)).status).toBe("stored");
     await call("Network.emulateNetworkConditions", { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 });
     await waitForBrowser("document.querySelector('.connection')?.textContent?.trim()", (value) => value === "Live updates connected", "detail WebSocket reconnect");
-    await waitForBrowser("document.body.innerText.includes('Fetched') && document.body.innerText.includes('event-time range')", Boolean, "bounded REST telemetry backfill");
+    await waitForBrowser("document.body.innerText.includes('Backfill scanned') && document.body.innerText.includes('committed checkpoint')", Boolean, "commit-order REST telemetry backfill");
     expect(requestCount(requestUrls, `/api/v1/devices/${deviceId}`)).toBeGreaterThan(beforeDetailReconnect.device);
     expect(requestCount(requestUrls, `/api/v1/devices/${deviceId}/attributes`)).toBeGreaterThan(beforeDetailReconnect.attributes);
     expect(requestCount(requestUrls, `/api/v1/devices/${deviceId}/telemetry/latest`)).toBeGreaterThan(beforeDetailReconnect.latest);
     expect(requestCount(requestUrls, `/api/v1/devices/${deviceId}/telemetry`)).toBeGreaterThan(beforeDetailReconnect.history);
     expect(requestCount(requestUrls, `/api/v1/devices/${deviceId}/commands`)).toBeGreaterThan(beforeDetailReconnect.commands);
     expect(requestCountPrefix(requestUrls, "/api/v1/commands/")).toBeGreaterThan(beforeCommandDetailReconnect);
+    expect(requestUrls.some((url) => new URL(url).searchParams.has("after_id"))).toBe(true);
     expect(await evaluate("document.querySelector('#telemetry-key')?.value")).toBe("temperature");
     expect(await evaluate("document.querySelector('.chart-host')?.getAttribute('aria-label')")).toBe("Telemetry chart for temperature, 2 numeric samples");
 

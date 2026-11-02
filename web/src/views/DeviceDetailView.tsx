@@ -1,5 +1,6 @@
 import type { ApiClient } from "../lib/api";
 import type { RealtimeEvent } from "../lib/models";
+import type { ReconnectCheckpoint } from "../lib/ws";
 import { AttributesPanel } from "./AttributesPanel";
 import { CommandsPanel } from "./CommandsPanel";
 import { DevicePanel } from "./DevicePanel";
@@ -11,6 +12,8 @@ export function DeviceDetailView(props: {
   deviceRefreshKey: number;
   commandRefreshKey: number;
   reconnectKey: number;
+  reconnectCheckpoint?: ReconnectCheckpoint;
+  onTelemetryCheckpoint: (throughId: number) => void;
   liveEvents: RealtimeEvent[];
   onBack: () => void;
 }) {
@@ -31,6 +34,8 @@ export function DeviceDetailView(props: {
         api={props.api}
         deviceId={props.deviceId}
         reconnectKey={props.reconnectKey}
+        reconnectCheckpoint={props.reconnectCheckpoint}
+        onCheckpoint={props.onTelemetryCheckpoint}
         liveEvents={props.liveEvents}
       />
       <CommandsPanel

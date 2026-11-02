@@ -23,9 +23,13 @@ class FakeSocket {
     this.onopen?.call(this as unknown as WebSocket, new Event("open"));
   }
 
-  acknowledgeSubscription() {
+  acknowledgeSubscription(channels = ["overview"], requestId?: number) {
+    const requests = this.sent
+      .map((message) => JSON.parse(message) as { action: string; request_id?: number })
+      .filter((message) => message.action === "subscribe");
+    const id = requestId ?? requests.at(-1)?.request_id;
     this.onmessage?.call(this as unknown as WebSocket, new MessageEvent("message", {
-      data: JSON.stringify({ type: "subscribed", channels: [] }),
+      data: JSON.stringify({ type: "subscribed", channels, request_id: id }),
     }));
   }
 
@@ -44,7 +48,7 @@ describe("WebSocket reconnect backoff", () => {
     expect(reconnectDelay(-1)).toBe(500);
   });
 
-  it("resubscribes the active channel after reconnect and cancels the next retry on stop", async () => {
+  it("waits for the requested device channel ACK before its initial catch-up", async () => {
     const previousLocation = Object.getOwnPropertyDescriptor(globalThis, "location");
     Object.defineProperty(globalThis, "location", {
       configurable: true,
@@ -52,9 +56,21 @@ describe("WebSocket reconnect backoff", () => {
     });
     const sockets: FakeSocket[] = [];
     let reconnects = 0;
+    let catchups = 0;
+    let eventCommittedBetweenAcks = false;
+    let catchupSawMissedEvent = false;
+    const originalNow = Date.now;
+    let now = 1_000;
+    Date.now = () => now;
     const client = new EventsSocket({
       channels: ["overview"],
       onEvent: () => {},
+      onSubscribed: (channels, reconnected) => {
+        if (!reconnected && channels.includes("device:device-a")) {
+          catchups += 1;
+          catchupSawMissedEvent = eventCommittedBetweenAcks;
+        }
+      },
       onReconnect: () => { reconnects += 1; },
       onDisconnect: () => {},
       onExpired: () => {},
@@ -70,27 +86,168 @@ describe("WebSocket reconnect backoff", () => {
     try {
       client.start();
       sockets[0]?.open();
-      client.setChannels(["device:device-a"]);
+      client.setChannels(["overview", "device:device-a"]);
       expect(sockets[0]?.sent.map((message) => JSON.parse(message))).toEqual([
-        { action: "subscribe", channels: ["overview"] },
-        { action: "unsubscribe", channels: ["overview"] },
-        { action: "subscribe", channels: ["device:device-a"] },
+        { action: "subscribe", channels: ["overview"], request_id: 1 },
+        { action: "subscribe", channels: ["device:device-a"], request_id: 2 },
       ]);
-      sockets[0]?.acknowledgeSubscription();
-      sockets[0]?.serverClose(1006);
+      sockets[0]?.acknowledgeSubscription(["overview"], 1);
+      expect(catchups).toBe(0);
+      eventCommittedBetweenAcks = true;
+      sockets[0]?.acknowledgeSubscription(["device:device-a"], 2);
+      expect(catchups).toBe(1);
+      expect(catchupSawMissedEvent).toBe(true);
+      now = 2_000;
+      // The server can drop queued events before this 1013 close reaches the browser.
+      sockets[0]?.serverClose(1013);
       await Bun.sleep(700);
       expect(sockets).toHaveLength(2);
+      now = 3_000;
       sockets[1]?.open();
       expect(reconnects).toBe(0);
-      sockets[1]?.acknowledgeSubscription();
+      sockets[1]?.acknowledgeSubscription(["overview", "device:device-a"]);
       expect(reconnects).toBe(1);
       expect(sockets[1]?.sent.map((message) => JSON.parse(message))).toEqual([
-        { action: "subscribe", channels: ["device:device-a"] },
+        { action: "subscribe", channels: ["overview", "device:device-a"], request_id: 3 },
       ]);
       sockets[1]?.serverClose(1006);
       client.stop();
       await Bun.sleep(700);
       expect(sockets).toHaveLength(2);
+    } finally {
+      client.stop();
+      Date.now = originalNow;
+      if (previousLocation) Object.defineProperty(globalThis, "location", previousLocation);
+      else Reflect.deleteProperty(globalThis, "location");
+    }
+  });
+
+  it("ignores a delayed ACK from an earlier open of the same device", async () => {
+    const previousLocation = Object.getOwnPropertyDescriptor(globalThis, "location");
+    Object.defineProperty(globalThis, "location", {
+      configurable: true,
+      value: { protocol: "http:", host: "smoke.test" },
+    });
+    const sockets: FakeSocket[] = [];
+    const subscribed: string[][] = [];
+    let reconnects = 0;
+    const client = new EventsSocket({
+      channels: ["overview"],
+      onEvent: () => {},
+      onSubscribed: (channels) => subscribed.push(channels),
+      onReconnect: () => { reconnects += 1; },
+      onDisconnect: () => {},
+      onExpired: () => {},
+      onStatus: () => {},
+      createSocket: () => {
+        const socket = new FakeSocket();
+        sockets.push(socket);
+        return socket as unknown as WebSocket;
+      },
+    });
+
+    try {
+      client.start();
+      sockets[0]?.open();
+      sockets[0]?.acknowledgeSubscription(["overview"], 1);
+      client.setChannels(["overview", "device:device-a"]);
+      client.setChannels(["overview"]);
+      client.setChannels(["overview", "device:device-a"]);
+
+      sockets[0]?.acknowledgeSubscription(["device:device-a"], 2);
+      expect(subscribed).toEqual([["overview"]]);
+      sockets[0]?.acknowledgeSubscription(["device:device-a"], 3);
+      expect(subscribed).toEqual([["overview"], ["device:device-a"]]);
+
+      sockets[0]?.serverClose(1013);
+      await Bun.sleep(700);
+      sockets[1]?.open();
+      sockets[1]?.acknowledgeSubscription(["overview", "device:device-a"], 4);
+      expect(reconnects).toBe(1);
+    } finally {
+      client.stop();
+      if (previousLocation) Object.defineProperty(globalThis, "location", previousLocation);
+      else Reflect.deleteProperty(globalThis, "location");
+    }
+  });
+
+  it("finishes reconnect after separately acknowledged current channels", async () => {
+    const previousLocation = Object.getOwnPropertyDescriptor(globalThis, "location");
+    Object.defineProperty(globalThis, "location", {
+      configurable: true,
+      value: { protocol: "http:", host: "smoke.test" },
+    });
+    const sockets: FakeSocket[] = [];
+    const reconnectChannels: string[][] = [];
+    const client = new EventsSocket({
+      channels: ["overview"],
+      onEvent: () => {},
+      onReconnect: (channels) => reconnectChannels.push(channels),
+      onDisconnect: () => {},
+      onExpired: () => {},
+      onStatus: () => {},
+      createSocket: () => {
+        const socket = new FakeSocket();
+        sockets.push(socket);
+        return socket as unknown as WebSocket;
+      },
+    });
+
+    try {
+      client.start();
+      sockets[0]?.open();
+      sockets[0]?.acknowledgeSubscription(["overview"], 1);
+      sockets[0]?.serverClose(1013);
+      await Bun.sleep(700);
+      sockets[1]?.open();
+      client.setChannels(["overview", "device:device-a"]);
+
+      sockets[1]?.acknowledgeSubscription(["overview"], 2);
+      expect(reconnectChannels).toEqual([]);
+      sockets[1]?.acknowledgeSubscription(["device:device-a"], 3);
+      expect(reconnectChannels).toEqual([["overview", "device:device-a"]]);
+    } finally {
+      client.stop();
+      if (previousLocation) Object.defineProperty(globalThis, "location", previousLocation);
+      else Reflect.deleteProperty(globalThis, "location");
+    }
+  });
+
+  it("waits for a new-connection ACK when channels change during reconnect delay", async () => {
+    const previousLocation = Object.getOwnPropertyDescriptor(globalThis, "location");
+    Object.defineProperty(globalThis, "location", {
+      configurable: true,
+      value: { protocol: "http:", host: "smoke.test" },
+    });
+    const sockets: FakeSocket[] = [];
+    const reconnectChannels: string[][] = [];
+    const client = new EventsSocket({
+      channels: ["overview"],
+      onEvent: () => {},
+      onReconnect: (channels) => reconnectChannels.push(channels),
+      onDisconnect: () => {},
+      onExpired: () => {},
+      onStatus: () => {},
+      createSocket: () => {
+        const socket = new FakeSocket();
+        sockets.push(socket);
+        return socket as unknown as WebSocket;
+      },
+    });
+
+    try {
+      client.start();
+      sockets[0]?.open();
+      sockets[0]?.acknowledgeSubscription(["overview"], 1);
+      sockets[0]?.serverClose(1013);
+      client.setChannels(["overview", "device:device-a"]);
+      expect(reconnectChannels).toEqual([]);
+
+      await Bun.sleep(700);
+      sockets[1]?.open();
+      expect(reconnectChannels).toEqual([]);
+      sockets[1]?.acknowledgeSubscription(["overview", "device:device-a"], 2);
+      expect(reconnectChannels).toEqual([["overview", "device:device-a"]]);
     } finally {
       client.stop();
       if (previousLocation) Object.defineProperty(globalThis, "location", previousLocation);

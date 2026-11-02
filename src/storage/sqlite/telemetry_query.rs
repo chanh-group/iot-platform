@@ -22,6 +22,12 @@ pub struct LatestValueRow {
     pub values_json: String,
 }
 
+pub struct HistoryRange {
+    pub from: i64,
+    pub to: i64,
+    pub commit_order: bool,
+}
+
 pub async fn device_exists(pool: &SqlitePool, device_id: &str) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM devices WHERE id = ?)")
         .bind(device_id)
@@ -29,11 +35,21 @@ pub async fn device_exists(pool: &SqlitePool, device_id: &str) -> Result<bool, s
         .await
 }
 
+pub async fn committed_through(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT MAX(
+            COALESCE((SELECT MAX(internal_id) FROM telemetry_events), 0),
+            COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'telemetry_events'), 0)
+         )",
+    )
+    .fetch_one(pool)
+    .await
+}
+
 pub async fn history(
     pool: &SqlitePool,
     device_id: &str,
-    from: i64,
-    to: i64,
+    range: HistoryRange,
     after: Option<(i64, i64)>,
     keys: &[String],
     limit: i64,
@@ -43,21 +59,39 @@ pub async fn history(
          FROM telemetry_events e
          WHERE e.device_id = ",
     );
-    query
-        .push_bind(device_id)
-        .push(" AND e.ts >= ")
-        .push_bind(from)
-        .push(" AND e.ts < ")
-        .push_bind(to);
-    if let Some((ts, internal_id)) = after {
+    query.push_bind(device_id);
+    let order_column = if range.commit_order {
         query
-            .push(" AND (e.ts > ")
-            .push_bind(ts)
-            .push(" OR (e.ts = ")
-            .push_bind(ts)
             .push(" AND e.internal_id > ")
-            .push_bind(internal_id)
-            .push("))");
+            .push_bind(range.from)
+            .push(" AND e.internal_id <= ")
+            .push_bind(range.to);
+        "e.internal_id"
+    } else {
+        query
+            .push(" AND e.ts >= ")
+            .push_bind(range.from)
+            .push(" AND e.ts < ")
+            .push_bind(range.to);
+        "e.ts"
+    };
+    if let Some((timestamp, internal_id)) = after {
+        if range.commit_order {
+            query.push(" AND e.internal_id > ").push_bind(internal_id);
+        } else {
+            query
+                .push(" AND (")
+                .push(order_column)
+                .push(" > ")
+                .push_bind(timestamp)
+                .push(" OR (")
+                .push(order_column)
+                .push(" = ")
+                .push_bind(timestamp)
+                .push(" AND e.internal_id > ")
+                .push_bind(internal_id)
+                .push("))");
+        }
     }
     if !keys.is_empty() {
         query.push(" AND EXISTS (SELECT 1 FROM json_each(e.values_json) AS v WHERE v.key IN (");
@@ -68,7 +102,13 @@ pub async fn history(
         separated.push_unseparated("))");
     }
     query
-        .push(" ORDER BY e.ts, e.internal_id LIMIT ")
+        .push(" ORDER BY ")
+        .push(order_column)
+        .push(if range.commit_order {
+            " LIMIT "
+        } else {
+            ", e.internal_id LIMIT "
+        })
         .push_bind(limit)
         .build_query_as::<TelemetryRow>()
         .fetch_all(pool)

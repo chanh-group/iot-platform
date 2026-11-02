@@ -93,13 +93,13 @@ Nguồn sự thật:
 
 ## 6. WebSocket slow client và A15 release gate — P4-06
 
-- [ ] Kiểm tra lại `src/http/ws.rs`: khi per-client queue đầy → đóng connection với close code `1013 Try Again Later`; log; metric; không block broadcast cho client khác.
-- [ ] REST backfill sau WS reconnect: client nhận event mới nhất qua REST, không giả định WS có replay bền vững. Backfill telemetry, command và overview đúng `[from, to)` của khoảng thời gian ngắt kết nối.
-- [ ] Test: slow consumer không đọc → queue đầy → close 1013 → slot được release → kết nối mới được chấp nhận.
-- [ ] Test: WS disconnect/reconnect → REST backfill telemetry bù đúng số bản ghi; không replay bản đã nhận.
-- [ ] Test: session logout → WS đóng với close 4401.
-- [ ] Đây là A15 release gate; Phase 3 đã có evidence một phần (`tests/ws_telemetry.rs`). Tick khi full gate pass kể cả slow-client.
-- [ ] Evidence: `tests/ws_slow.rs` hoặc mở rộng `tests/ws_telemetry.rs` — slow_consumer_close_1013, reconnect_backfill, logout_close_4401.
+- [x] WebSocket handler (`src/http/events.rs`): per-client queue full → close `1013 Try Again Later`, warning log + metric; publish queue vẫn non-blocking, client nhanh khác tiếp tục nhận event.
+- [x] Mỗi lần mở device, trước khi subscribe, client chụp SQLite AUTOINCREMENT commit high-water mark bằng `after_id=0&limit=1`; chỉ ACK có `device:{id}` mới chạy catch-up từ baseline. ACK được ghép bằng `request_id`, channel đã xác nhận được tích lũy và ACK cũ của lần mở trước bị bỏ qua. Re-open chụp baseline mới, tránh quét event tích lũy khi rời trang. Reconnect dùng `after_id`/`through_id` theo commit order, không lấy từ browser clock, WS delivery hay `received_at`; migration `0002` thêm index `(device_id, internal_id)`. Batch chưa commit không thể đẩy mốc vượt qua nó, cursor giữ high-water cố định và mode này không có giới hạn 31 ngày. Browser chỉ giữ 100 backfill rows; history API pagination lấy lại phần bị loại. Commands/overview re-fetch snapshot REST hiện tại.
+- [x] Test slow consumer: `tests/ws_telemetry.rs::slow_websocket_is_closed_and_releases_its_connection_slot` — close 1013, metric tăng, client khác nhận event trong lúc flood và slot được giải phóng để kết nối thay thế.
+- [x] Test reconnect: `tests/ws_telemetry.rs::subscribed_clients_receive_only_committed_telemetry_and_refetch_after_reconnect` — REST quét theo commit ID, telemetry đến muộn vẫn được trả, commands/overview phản ánh state lúc offline. `tests/telemetry_api.rs::commit_checkpoint_does_not_advance_past_an_uncommitted_batch` giữ transaction qua request backfill; `::starting_checkpoint_skips_large_old_history_and_recovers_a_new_event` tạo 1.001 event cũ rồi lấy event mới từ baseline; `history_pages_are_stable_and_key_filter_projects_matching_values` kiểm tra đổi riêng `to` trả `invalid_cursor`. `web/tests/ws.test.ts` trì hoãn ACK overview/device, ACK cũ cùng device và đổi channel khi reconnect đang chờ; `web/tests/ui-smoke.test.ts` kiểm tra event giữa ACK, catch-up theo ACK device và re-open sau 1.001 event. `web/tests/deviceTelemetry.test.ts` backfill nhiều lượt vượt cap, deduplicate và giữ live point; `ui-smoke` xác nhận mở rộng range refetch history.
+- [x] Test session logout: cùng test trên xác nhận close code 4401.
+- [x] Đây là A15 release gate; full evidence gồm slow-client, reconnect backfill và logout close.
+- [x] Evidence 2026-11-03T00:01:36+07:00: Rust format, Clippy, `cargo test --all` (261 passed); web typecheck, tests (29 passed, including repeated backfills beyond the 100-row cap and range refetch), and build pass. `git diff --check` passes.
 
 ## 7. Dockerfile multi-stage — P4-07
 
@@ -212,7 +212,7 @@ Checklist gate — ghi tên test và timestamp thực tế khi tick:
 - [ ] A04 đầy đủ: `tests/mqtt_acl.rs` wildcard/cross-device và `tests/security.rs` ACL regression pass.
 - [x] A08: `tests/crash_recovery.rs` — kill trước commit, sau commit trước ACK, sau ACK — tất cả pass (evidence §3).
 - [ ] A09: `tests/storage_failure.rs` — DB lỗi (readiness false, không ACK), disk full, queue đầy (bounded RAM, metric), phục hồi — pass.
-- [ ] A15 release gate: `tests/ws_slow.rs` hoặc `tests/ws_telemetry.rs` — slow consumer close 1013, reconnect backfill, logout close 4401 — pass.
+- [x] A15 release gate: `tests/ws_telemetry.rs::slow_websocket_is_closed_and_releases_its_connection_slot`, `::subscribed_clients_receive_only_committed_telemetry_and_refetch_after_reconnect` — slow consumer close 1013, commit-order reconnect backfill, logout close 4401 — pass (evidence §6, 2026-11-03T00:01:36+07:00).
 - [x] A16: `tests/shutdown_http.rs` — SIGTERM drain, không ACK trước commit, kick session, lock release, exit 0 — pass (evidence §4).
 - [ ] A17: `tests/docker_smoke.sh` — Docker recreate cùng volume giữ data — pass.
 - [ ] A19 regression: `tests/mqtt_protocol.rs` — QoS/wildcard/retain/LWT/session/dup client/version matrix — pass.

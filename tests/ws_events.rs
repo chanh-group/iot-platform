@@ -39,15 +39,20 @@ async fn expect_no_message(socket: &mut TestWebSocket) {
 }
 
 async fn subscribe(socket: &mut TestWebSocket, channels: Vec<String>) {
+    let mut expected_channels = channels.clone();
+    expected_channels.sort();
     socket
         .send(Message::Text(
-            json!({"action":"subscribe", "channels":channels})
+            json!({"action":"subscribe", "channels":channels, "request_id":17})
                 .to_string()
                 .into(),
         ))
         .await
         .unwrap();
-    assert_eq!(next_json(socket).await["type"], "subscribed");
+    let acknowledgement = next_json(socket).await;
+    assert_eq!(acknowledgement["type"], "subscribed");
+    assert_eq!(acknowledgement["channels"], json!(expected_channels));
+    assert_eq!(acknowledgement["request_id"], 17);
 }
 
 async fn create_command(

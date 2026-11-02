@@ -60,11 +60,23 @@ async fn migration_creates_schema_and_is_idempotent() {
         );
     }
 
+    let telemetry_indexes: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'telemetry_events'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(
+        telemetry_indexes
+            .iter()
+            .any(|name| name == "telemetry_device_internal_idx")
+    );
+
     let applied: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(applied, 1);
+    assert_eq!(applied, 2);
 
     pool.close().await;
 }
@@ -143,7 +155,7 @@ fn migrate_cli_is_idempotent() {
         pool.close().await;
         applied
     });
-    assert_eq!(applied, 1);
+    assert_eq!(applied, 2);
 }
 
 #[test]
