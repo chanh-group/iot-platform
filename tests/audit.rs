@@ -161,6 +161,10 @@ async fn audit_context_details_transactions_and_redaction_follow_contract() {
         .next()
         .unwrap()
         .to_owned();
+    let session_token = cookie
+        .strip_prefix("iot_session=")
+        .expect("session cookie name")
+        .to_owned();
     let actor_id: String =
         sqlx::query_scalar("SELECT id FROM users WHERE username = 'audit-admin'")
             .fetch_one(&app.pool)
@@ -209,7 +213,10 @@ async fn audit_context_details_transactions_and_redaction_follow_contract() {
     );
 
     let mut socket = common::ws_connect(&app, &cookie).await;
-    assert_eq!(next_ws_json(&mut socket).await["type"], "hello");
+    let mut ws_messages = Vec::new();
+    let hello = next_ws_json(&mut socket).await;
+    assert_eq!(hello["type"], "hello");
+    ws_messages.push(hello);
     socket
         .send(Message::Text(
             json!({"action":"subscribe", "channels":["overview", format!("device:{device_id}")]})
@@ -218,8 +225,9 @@ async fn audit_context_details_transactions_and_redaction_follow_contract() {
         ))
         .await
         .unwrap();
-    assert_eq!(next_ws_json(&mut socket).await["type"], "subscribed");
-    let mut ws_messages = Vec::new();
+    let subscribed = next_ws_json(&mut socket).await;
+    assert_eq!(subscribed["type"], "subscribed");
+    ws_messages.push(subscribed);
 
     let update = client
         .patch(format!("{devices_url}/{device_id}"))
@@ -396,9 +404,11 @@ async fn audit_context_details_transactions_and_redaction_follow_contract() {
         .unwrap();
     assert!(!get_device.to_string().contains(&initial_token));
     assert!(!get_device.to_string().contains(&rotated_token));
+    assert!(!get_device.to_string().contains(&session_token));
     assert!(!get_device.to_string().contains("token_hash"));
     assert!(!list_devices.to_string().contains(&initial_token));
     assert!(!list_devices.to_string().contains(&rotated_token));
+    assert!(!list_devices.to_string().contains(&session_token));
     assert!(!list_devices.to_string().contains("token_hash"));
 
     let (mqtt, mut eventloop, _) =
@@ -496,6 +506,7 @@ async fn audit_context_details_transactions_and_redaction_follow_contract() {
     let config_text = config.to_string();
     assert!(!config_text.contains(&initial_token));
     assert!(!config_text.contains(&rotated_token));
+    assert!(!config_text.contains(&session_token));
     assert!(!config_text.contains(PASSWORD));
     assert!(!config_text.contains(&password_hash));
     assert!(!config_text.contains(METRICS_TOKEN));
@@ -504,6 +515,7 @@ async fn audit_context_details_transactions_and_redaction_follow_contract() {
     let ws_text = serde_json::to_string(&ws_messages).unwrap();
     assert!(!ws_text.contains(&initial_token));
     assert!(!ws_text.contains(&rotated_token));
+    assert!(!ws_text.contains(&session_token));
     assert!(!ws_text.contains(PASSWORD));
     assert!(!ws_text.contains(&password_hash));
     assert!(!ws_text.contains(COMMAND_PARAMS));
@@ -521,6 +533,7 @@ async fn audit_context_details_transactions_and_redaction_follow_contract() {
     let initial_hash_hex = hex(&initial_token_hash);
     let rotated_hash_hex = hex(&rotated_token_hash);
     let redacted_values = [
+        ("session token", session_token.as_str()),
         ("password", PASSWORD),
         ("metrics token", METRICS_TOKEN),
         ("password hash", password_hash.as_str()),

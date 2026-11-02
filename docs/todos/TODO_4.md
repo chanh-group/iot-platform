@@ -79,17 +79,17 @@ Nguồn sự thật:
 
 ## 5. Security suite — P4-05
 
-- [ ] Tổng hợp và chạy lại bộ test bảo mật đã có từ Phase 2/3; đảm bảo không có regression:
-  - ACL wildcard/cross-device: device A không đọc/ghi topic device B.
-  - Rotate/disable: token cũ từ chối sau rotate; connection bị kick sau disable.
-  - CSRF: mutation thiếu `X-IoT-CSRF` → 403.
-  - Cookie: HttpOnly, SameSite=Strict, không lộ token trong GET/list/WS.
-  - Rate limit: login sai nhiều lần → 429.
-  - Redaction: không lộ token/password/hash/SQL trong log/audit/response.
-  - Device token không dùng được cho HTTP admin.
-- [ ] Tạo `tests/security.rs` tổng hợp tất cả scenario trên nếu chưa có; hoặc ghi rõ test ở file nào đã cover.
-- [ ] Không thêm endpoint mới trong Phase 4; chỉ kiểm tra endpoint đã có.
-- [ ] Evidence: `tests/security.rs` pass hoặc list file+test_name cho từng scenario.
+- [x] Tổng hợp và chạy lại bộ test bảo mật Phase 2/3; không có regression:
+  - ACL wildcard/cross-device: `tests/mqtt_acl.rs::subscribe_outside_own_prefix_is_refused_and_keeps_the_connection`, `::cross_device_publish_is_denied_not_routed_and_disconnects`.
+  - Rotate/disable: `tests/credential_rotate.rs::rotates_an_online_device_and_rejects_the_previous_token`, `tests/device_api.rs::disabling_a_device_kicks_its_live_session_and_blocks_reconnect`.
+  - CSRF: `tests/auth.rs::csrf_content_type_and_origin_are_enforced`, `tests/credential_rotate.rs::rotation_requires_admin_session_and_csrf`, `tests/device_api.rs::device_create_patch_validate_and_audit`.
+  - Cookie/token exposure: `tests/auth.rs::login_me_logout_roundtrip_and_cookie_flags`, `::secure_cookie_when_configured`; `tests/audit.rs::audit_context_details_transactions_and_redaction_follow_contract` extracts the admin `iot_session` token from `Set-Cookie` and checks it is absent from GET/list/WS/config responses, all captured WebSocket messages (including `hello`/`subscribed`), logs, and audit rows.
+  - Rate limit: `tests/auth.rs::login_rate_limit_returns_retry_after`.
+  - Redaction: `tests/audit.rs::audit_context_details_transactions_and_redaction_follow_contract` checks captured logs, audit rows and secret-bearing outputs (including the admin session token); `src/http/api_error.rs::tests::internal_error_does_not_leak_detail` checks SQL/DB path details are not returned.
+  - Device token boundary: `tests/auth.rs::device_token_cannot_authenticate_http_admin_routes` rejects the token as either session cookie or Bearer credential.
+- [x] Không tạo `tests/security.rs`: các suite hiện hữu được liệt kê theo scenario ở trên.
+- [x] Không thêm endpoint mới trong Phase 4; chỉ kiểm tra endpoint đã có.
+- [x] Evidence 2026-11-02T08:51:32+07:00: `tests/audit.rs::audit_context_details_transactions_and_redaction_follow_contract` checks the admin session token is absent from GET/list/WS/config responses, including initial `hello`/`subscribed` messages, and from captured logs/audit rows. The 29 security-suite tests and `cargo test --all` (257 passed, 0 failed) pass; `cargo fmt --all --check`, Clippy, and `git diff --check` PASS.
 
 ## 6. WebSocket slow client và A15 release gate — P4-06
 

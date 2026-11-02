@@ -69,6 +69,25 @@ async fn no_default_admin_and_me_requires_session() {
 }
 
 #[tokio::test]
+async fn device_token_cannot_authenticate_http_admin_routes() {
+    let server = TestApp::start().await;
+    let device = server.create_device("http-auth-boundary", true).await;
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/v1/devices", server.base);
+
+    for request in [
+        client
+            .get(&url)
+            .header("Cookie", format!("iot_session={}", device.token)),
+        client.get(&url).bearer_auth(&device.token),
+    ] {
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(json_body(response).await["code"], "unauthenticated");
+    }
+}
+
+#[tokio::test]
 async fn login_me_logout_roundtrip_and_cookie_flags() {
     let server = TestApp::start().await;
     server.create_admin("admin", PASSWORD).await;
