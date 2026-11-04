@@ -103,16 +103,16 @@ Nguồn sự thật:
 
 ## 7. Dockerfile multi-stage — P4-07
 
-- [ ] Tạo `deploy/Dockerfile` multi-stage:
+- [x] Tạo `deploy/Dockerfile` multi-stage:
   1. Stage 1 `oven/bun:1.4.2-alpine` (hoặc bookworm): `COPY web/ .` → `bun install --frozen-lockfile && bun run --bun build`.
   2. Stage 2 `rust:1.98-bookworm` (hoặc slim): copy web/dist từ stage 1 + Cargo source; `cargo build --release --locked`.
   3. Stage 3 `debian:bookworm-slim`: copy binary từ stage 2; cài `ca-certificates`, `curl` (healthcheck); tạo user non-root `iot` UID 10001; không copy source/target/node_modules.
-- [ ] Binary path `/usr/local/bin/iot-server`; workdir `/app`; config `/app/conf.toml`; data `/app/data`.
-- [ ] `ENTRYPOINT ["/usr/local/bin/iot-server"]`; `CMD ["run", "--config", "/app/conf.toml"]`; `STOPSIGNAL SIGTERM`.
-- [ ] `USER iot`; không chạy root; file không có setuid.
-- [ ] Tạo `.dockerignore`: loại trừ `target/`, `web/node_modules/`, `web/dist/`, `data/`, log, `.git`, `spikes/`.
-- [ ] Smoke test image build: `docker build -t iot-server:local .` thành công; image chạy `--version` không lỗi; file không chứa secret mẫu.
-- [ ] Evidence: `deploy/Dockerfile` và `deploy/.dockerignore` commit; image build PASS trong CI (hoặc record lệnh + output).
+- [x] Binary path `/usr/local/bin/iot-server`; workdir `/app`; config `/app/conf.toml`; data `/app/data`.
+- [x] `ENTRYPOINT ["/usr/local/bin/iot-server"]`; `CMD ["run", "--config", "/app/conf.toml"]`; `STOPSIGNAL SIGTERM`.
+- [x] `USER 10001:10001` (user `iot`); không chạy root; binary mode `0755`. Yêu cầu “file không có setuid” được áp dụng cho toàn filesystem trong image: Dockerfile xóa setuid/setgid trên mọi regular file và kiểm tra fail-build nếu còn sót.
+- [x] Tạo `.dockerignore`: loại trừ `target/`, `web/node_modules/`, `web/dist/`, `data/`, log, `.git`, `spikes/`.
+- [x] Smoke image: `docker build -f deploy/Dockerfile -t iot-server:local .` PASS; image `--version` → `iot-server 0.1.0`; user `10001:10001`; `/healthz` và `/readyz` trả 200; stop SIGTERM → exit 0. Secret sentinel scan sạch, `/app/conf.toml` và file app/config mẫu không có trong image. Build-time assertion và scan runtime xác nhận không còn regular file setuid/setgid.
+- [x] Evidence 2026-11-05T06:19:42+07:00: `sg docker -c 'docker build -f deploy/Dockerfile -t iot-server:local .'` PASS; image ID `sha256:df210d2b78da2a9827dc07341bdd30ef15c740acbcfd22c738b38aba5b3a08dd` (159050684 bytes). `docker run --rm iot-server:local --version`, UID check, `/healthz`, `/readyz`, SIGTERM (exit 0), exact sample-secret scan, and whole-image setuid/setgid scan all PASS. `git diff --check` PASS.
 
 ## 8. Docker Compose SQLite và config mẫu — P4-08
 
