@@ -1,0 +1,15 @@
+config_version = 1
+
+[server]
+data_dir = "/app/data"
+
+[http]
+listen = "0.0.0.0:8080"
+# Local Compose only; set true behind HTTPS in production.
+cookie_secure = false
+
+[mqtt]
+listen = "0.0.0.0:1883"
+
+[database]
+url = "sqlite:///app/data/iot.db"

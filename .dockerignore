@@ -2,6 +2,7 @@ target/
 web/node_modules/
 web/dist/
 data/
+deploy/data/
 *.log
 logs/
 .git/

@@ -116,16 +116,17 @@ Nguồn sự thật:
 
 ## 8. Docker Compose SQLite và config mẫu — P4-08
 
-- [ ] Tạo `deploy/compose.sqlite.yml`:
+- [x] Tạo `deploy/compose.sqlite.yml`:
   - Service `iot-server` dùng image build local hoặc registry.
   - Ports `8080:8080` và `1883:1883` (bind localhost hoặc note bảo mật).
   - Volume `./data:/app/data`; config mount `./conf.docker.toml:/app/conf.toml:ro`.
   - Healthcheck `curl -fsS http://127.0.0.1:8080/healthz`.
   - `stop_grace_period: 20s`, `init: true`.
-- [ ] Tạo `deploy/conf.docker.toml`: bind `0.0.0.0`, `data_dir=/app/data`, `database.url=sqlite:///app/data/iot.db`, `cookie_secure=false` ghi chú rõ chỉ khi local.
-- [ ] Ghi chú cảnh báo: không publish MQTT plaintext ra Internet nếu không có TLS proxy.
-- [ ] Test A17: Docker recreate cùng volume → giữ device/credential/telemetry/runtime config. Script test: `docker compose -f deploy/compose.sqlite.yml up -d` → seed data → `docker compose down` → `docker compose up -d` → assert data còn.
-- [ ] Evidence: `tests/docker_smoke.sh` hoặc tương đương; A17 pass.
+- [x] Tạo `deploy/conf.docker.toml`: bind `0.0.0.0`, `data_dir=/app/data`, `database.url=sqlite:///app/data/iot.db`, `cookie_secure=false` ghi chú rõ chỉ khi local.
+- [x] Data bind mount first-run: `deploy/prepare-data.sh` tạo directory UID/GID 10001; từ chối tự đổi owner của thư mục không rỗng. Hướng dẫn ở `deploy/README.md`; smoke test bắt đầu với đường dẫn chưa tồn tại.
+- [x] Ghi chú cảnh báo: ports chỉ bind localhost; không publish MQTT plaintext ra Internet nếu không có TLS proxy.
+- [x] Test A17: `tests/docker_smoke.sh` chạy ignored integration test `tests/docker_smoke.rs::compose_recreate_preserves_data_and_live_interfaces`; seed qua admin CLI + HTTP/MQTT khi server đang chạy, recreate, rồi xác nhận device/config/history qua API và dùng lại credential qua MQTT.
+- [x] Evidence 2026-11-05T23:12:35+07:00: `sg docker -c 'sh tests/docker_smoke.sh'` PASS từ data dir chưa tồn tại; cleanup xác nhận data dir và temp dir đã bị xóa. Test non-empty/wrong-owner xác nhận prepare script từ chối trước khi gọi Docker (`:Z`), giữ nguyên fixture. `cargo fmt --all --check`, Clippy, `cargo test --all` (262 passed, 1 ignored Docker integration test chạy riêng), Compose config, shell syntax và `git diff --check` PASS. Fixture cũ `/tmp/opencode/.tmp9Gql2t` không tồn tại.
 
 ## 9. Backup/restore SQLite — P4-09
 
@@ -214,7 +215,7 @@ Checklist gate — ghi tên test và timestamp thực tế khi tick:
 - [ ] A09: `tests/storage_failure.rs` — DB lỗi (readiness false, không ACK), disk full, queue đầy (bounded RAM, metric), phục hồi — pass.
 - [x] A15 release gate: `tests/ws_telemetry.rs::slow_websocket_is_closed_and_releases_its_connection_slot`, `::subscribed_clients_receive_only_committed_telemetry_and_refetch_after_reconnect` — slow consumer close 1013, commit-order reconnect backfill, logout close 4401 — pass (evidence §6, 2026-11-03T00:01:36+07:00).
 - [x] A16: `tests/shutdown_http.rs` — SIGTERM drain, không ACK trước commit, kick session, lock release, exit 0 — pass (evidence §4).
-- [ ] A17: `tests/docker_smoke.sh` — Docker recreate cùng volume giữ data — pass.
+- [x] A17: `tests/docker_smoke.sh` / `tests/docker_smoke.rs::compose_recreate_preserves_data_and_live_interfaces` — Docker recreate cùng volume giữ device, credential, telemetry, runtime revision; API và MQTT credential được dùng sau restart; fixture được dọn sau test — pass (evidence §8, 2026-11-05T23:12:35+07:00).
 - [ ] A19 regression: `tests/mqtt_protocol.rs` — QoS/wildcard/retain/LWT/session/dup client/version matrix — pass.
 - [ ] Bounded resources: không còn `unbounded_channel` nghiệp vụ; audit checklist P4-01 hoàn tất.
 - [ ] Security: `tests/security.rs` tất cả scenario pass; không regression từ Phase 2/3.
