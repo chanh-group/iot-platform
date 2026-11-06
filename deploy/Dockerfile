@@ -22,6 +22,7 @@ FROM docker.io/library/debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
+    util-linux \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 iot \
     && useradd --uid 10001 --gid iot --create-home --shell /usr/sbin/nologin iot \

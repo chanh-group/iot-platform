@@ -35,7 +35,7 @@ async fn compose_recreate_preserves_data_and_live_interfaces() -> anyhow::Result
     );
     let compose = Compose::new(
         repo.join("deploy/compose.sqlite.yml"),
-        project,
+        project.clone(),
         data_dir.clone(),
         http_port,
         mqtt_port,
@@ -52,7 +52,7 @@ async fn compose_recreate_preserves_data_and_live_interfaces() -> anyhow::Result
 
     compose.up()?;
     wait_ready(http_port).await?;
-    compose.down()?;
+    compose.stop()?;
 
     let password = format!("A17-{}-{}!", std::process::id(), Uuid::new_v4());
     std::fs::write(&password_file, &password)?;
@@ -162,6 +162,59 @@ async fn compose_recreate_preserves_data_and_live_interfaces() -> anyhow::Result
     assert!(events.iter().any(|event| event["event_id"] == first_event));
     assert!(events.iter().any(|event| event["event_id"] == second_event));
 
+    let backup_dir = temp.path().join("backup");
+    let wrong_project = format!("{project}-wrong");
+    let wrong_project_backup = run_backup(&compose, &backup_dir, &wrong_project)?;
+    assert!(!wrong_project_backup.status.success());
+    assert!(!backup_dir.exists());
+    wait_ready(http_port).await?;
+
+    compose.stop()?;
+    let lock_holder = format!("{project}-lock-holder");
+    let mut hold_lock = Command::new("docker");
+    hold_lock
+        .args([
+            "run",
+            "--rm",
+            "-d",
+            "--name",
+            &lock_holder,
+            "--user",
+            "10001:10001",
+            "--volume",
+        ])
+        .arg(format!("{}:/data:Z", data_dir.display()))
+        .args([
+            "--entrypoint",
+            "/usr/bin/flock",
+            IMAGE,
+            "/data/.lock",
+            "sleep",
+            "30",
+        ]);
+    run_checked(&mut hold_lock, "hold the data-directory lock")?;
+    let lock_guard = DockerLockHolder(lock_holder.clone());
+    let locked_backup = run_backup(&compose, &backup_dir, &project)?;
+    assert!(
+        !locked_backup.status.success(),
+        "backup must fail when the lock is held"
+    );
+    assert!(!backup_dir.exists());
+    let mut stop_lock = Command::new("docker");
+    stop_lock.args(["stop", &lock_holder]);
+    run_checked(&mut stop_lock, "release the data-directory lock")?;
+    drop(lock_guard);
+
+    let backup = run_backup(&compose, &backup_dir, &project)?;
+    if !backup.status.success() {
+        bail!(
+            "could not create backup: {}\n{}",
+            String::from_utf8_lossy(&backup.stderr),
+            String::from_utf8_lossy(&backup.stdout)
+        );
+    }
+    verify_private_backup(&backup_dir)?;
+
     compose.down()?;
     drop(compose);
     temp.cleanup_data()?;
@@ -175,6 +228,46 @@ async fn compose_recreate_preserves_data_and_live_interfaces() -> anyhow::Result
         !temp_path.exists(),
         "smoke-test temporary directory remains"
     );
+    Ok(())
+}
+
+fn run_backup(
+    compose: &Compose,
+    destination: &Path,
+    project: &str,
+) -> anyhow::Result<std::process::Output> {
+    let script = compose
+        .file
+        .parent()
+        .context("compose file has no parent")?
+        .join("backup.sh");
+    Ok(Command::new(script)
+        .arg(destination)
+        .env("COMPOSE_PROJECT_NAME", project)
+        .env("IOT_DATA_DIR", &compose.data_dir)
+        .output()?)
+}
+
+fn verify_private_backup(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let dir = std::fs::metadata(path)?;
+    let parent = std::fs::metadata(path.parent().context("backup has no parent")?)?;
+    anyhow::ensure!(dir.uid() == parent.uid());
+    anyhow::ensure!(dir.gid() == parent.gid());
+    anyhow::ensure!(dir.permissions().mode() & 0o777 == 0o700);
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        anyhow::ensure!(metadata.uid() == parent.uid());
+        anyhow::ensure!(metadata.gid() == parent.gid());
+        anyhow::ensure!(metadata.permissions().mode() & 0o777 == 0o600);
+    }
+    let output = Command::new("sha256sum")
+        .args(["-c", "SHA256SUMS"])
+        .current_dir(path)
+        .output()?;
+    anyhow::ensure!(output.status.success(), "backup checksums did not verify");
     Ok(())
 }
 
@@ -225,6 +318,18 @@ fn prepare_data_refuses_nonempty_wrong_owner_before_running_docker() -> anyhow::
 struct DockerTestDir {
     temp: TempDir,
     data_dir: PathBuf,
+}
+
+struct DockerLockHolder(String);
+
+impl Drop for DockerLockHolder {
+    fn drop(&mut self) {
+        let _ = Command::new("docker")
+            .args(["rm", "-f", &self.0])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
 }
 
 impl DockerTestDir {
@@ -308,6 +413,12 @@ impl Compose {
 
     fn down(&self) -> anyhow::Result<()> {
         let mut command = self.command(&["down", "--remove-orphans"]);
+        run_checked(&mut command, "stop Compose service")?;
+        Ok(())
+    }
+
+    fn stop(&self) -> anyhow::Result<()> {
+        let mut command = self.command(&["stop", "iot-server"]);
         run_checked(&mut command, "stop Compose service")?;
         Ok(())
     }

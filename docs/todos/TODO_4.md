@@ -106,13 +106,14 @@ Nguồn sự thật:
 - [x] Tạo `deploy/Dockerfile` multi-stage:
   1. Stage 1 `oven/bun:1.4.2-alpine` (hoặc bookworm): `COPY web/ .` → `bun install --frozen-lockfile && bun run --bun build`.
   2. Stage 2 `rust:1.98-bookworm` (hoặc slim): copy web/dist từ stage 1 + Cargo source; `cargo build --release --locked`.
-  3. Stage 3 `debian:bookworm-slim`: copy binary từ stage 2; cài `ca-certificates`, `curl` (healthcheck); tạo user non-root `iot` UID 10001; không copy source/target/node_modules.
+  3. Stage 3 `debian:bookworm-slim`: copy binary từ stage 2; cài `ca-certificates`, `curl` (healthcheck), `util-linux` (`flock` cho backup lock); tạo user non-root `iot` UID 10001; không copy source/target/node_modules.
 - [x] Binary path `/usr/local/bin/iot-server`; workdir `/app`; config `/app/conf.toml`; data `/app/data`.
 - [x] `ENTRYPOINT ["/usr/local/bin/iot-server"]`; `CMD ["run", "--config", "/app/conf.toml"]`; `STOPSIGNAL SIGTERM`.
 - [x] `USER 10001:10001` (user `iot`); không chạy root; binary mode `0755`. Yêu cầu “file không có setuid” được áp dụng cho toàn filesystem trong image: Dockerfile xóa setuid/setgid trên mọi regular file và kiểm tra fail-build nếu còn sót.
 - [x] Tạo `.dockerignore`: loại trừ `target/`, `web/node_modules/`, `web/dist/`, `data/`, log, `.git`, `spikes/`.
 - [x] Smoke image: `docker build -f deploy/Dockerfile -t iot-server:local .` PASS; image `--version` → `iot-server 0.1.0`; user `10001:10001`; `/healthz` và `/readyz` trả 200; stop SIGTERM → exit 0. Secret sentinel scan sạch, `/app/conf.toml` và file app/config mẫu không có trong image. Build-time assertion và scan runtime xác nhận không còn regular file setuid/setgid.
 - [x] Evidence 2026-11-05T06:19:42+07:00: `sg docker -c 'docker build -f deploy/Dockerfile -t iot-server:local .'` PASS; image ID `sha256:df210d2b78da2a9827dc07341bdd30ef15c740acbcfd22c738b38aba5b3a08dd` (159050684 bytes). `docker run --rm iot-server:local --version`, UID check, `/healthz`, `/readyz`, SIGTERM (exit 0), exact sample-secret scan, and whole-image setuid/setgid scan all PASS. `git diff --check` PASS.
+- [x] Evidence 2026-11-06T06:48:39+07:00: rebuilt runtime image including `util-linux` for `flock`; A17 Docker smoke PASS. Build-time whole-filesystem setuid/setgid assertion also passed.
 
 ## 8. Docker Compose SQLite và config mẫu — P4-08
 
@@ -130,11 +131,12 @@ Nguồn sự thật:
 
 ## 9. Backup/restore SQLite — P4-09
 
-- [ ] Tạo `deploy/backup.sh`: dừng container (SIGTERM, chờ exit) → copy `iot.db` + `-wal` + `-shm` → ghi checksum; hoặc dùng `sqlite3 .backup` / `VACUUM INTO` khi app dừng.
-- [ ] Ghi rõ: **không copy riêng `.db` khi app đang chạy WAL** — coi là backup không đầy đủ; document cảnh báo.
-- [ ] Test restore: copy backup vào data dir mới → chạy `iot-server run` → kiểm tra device/telemetry/runtime revision còn đúng. Test này phải chạy được như integration test (không cần Docker nếu dùng SQLite backup API).
-- [ ] Tạo/cập nhật `docs/operations.md` với hướng dẫn backup/restore, kiểm tra WAL, monitoring disk.
-- [ ] Evidence: restore test pass; `docs/operations.md` commit.
+- [x] Tạo `deploy/backup.sh`: xác nhận có container trong Compose project hiện tại; stop gửi SIGTERM và đợi `stop_grace_period`; kiểm tra container đã stopped; helper container đọc bind mount bằng root và giữ exclusive `.lock` suốt thời gian copy để chặn process/restart khác. Ghi DB, WAL/SHM nếu còn, `runtime.toml` và SHA-256 manifest. Không tự restart service; destination đã tồn tại thì từ chối.
+- [x] Ghi rõ: **không copy riêng `.db` khi app đang chạy WAL** — backup thiếu có thể bỏ mất commit còn trong WAL; document cảnh báo.
+- [x] Test restore/failure: `tests/backup_restore.rs::stopped_sqlite_backup_restores_device_telemetry_and_runtime_revision` gọi chính `deploy/backup.sh`; fake Docker adapter chạy nguyên shell-copy command trên fixture filesystem. Inject `cp` ghi dở rồi exit lỗi để xác nhận không publish backup; run thành công tạo backup, test restore chính output đó vào data dir mới, chạy binary `iot-server run`, đăng nhập và xác nhận device, telemetry, runtime revision qua API.
+- [x] Tạo `docs/operations.md` với hướng dẫn backup/restore, verify checksum, WAL và monitoring disk; README deploy trỏ đến hướng dẫn.
+- [x] Backup regression: A17 smoke test dùng data dir UID/GID 10001, mode 0750 do `prepare-data.sh` tạo và gọi backup script từ user chạy test; kiểm tra project mismatch/lock held bị từ chối, backup hợp lệ có mode 0700/0600, owner là operator và checksum đúng.
+- [x] Evidence 2026-11-06T06:57:02+07:00: `tests/backup_restore.rs` PASS sau khi inject `cp` ghi partial rồi trả lỗi (không có backup được publish); success path restore đúng thư mục output của `backup.sh` và verify device, telemetry, runtime revision qua API. `sg docker -c 'sh tests/docker_smoke.sh'` PASS với data dir thật do `prepare-data.sh` tạo, backup từ operator; project mismatch/lock held bị từ chối, checksum và mode/owner riêng tư PASS. `cargo fmt --all --check`, Clippy, `cargo test --all` (263 passed, 1 ignored Docker test chạy riêng), `sh -n deploy/backup.sh`, `git diff --check` PASS.
 
 ## 10. Load test baseline — P4-10
 

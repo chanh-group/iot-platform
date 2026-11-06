@@ -86,7 +86,7 @@ pub struct TestApp {
     command_cancel: CancellationToken,
     pub command_ready: Arc<AtomicBool>,
     handle: JoinHandle<()>,
-    _lock: DataDirLock,
+    _lock: Option<DataDirLock>,
     _dir: TempDir,
 }
 
@@ -215,6 +215,20 @@ impl TestApp {
 
     pub fn abort_mqtt(&self) {
         self.mqtt.abort();
+    }
+
+    pub async fn stop_for_backup(&mut self) {
+        self.mqtt.abort();
+        self.telemetry_cancel.cancel();
+        self.telemetry_task.abort();
+        let _ = (&mut self.telemetry_task).await;
+        self.command_cancel.cancel();
+        self.command_task.abort();
+        let _ = (&mut self.command_task).await;
+        self.handle.abort();
+        let _ = (&mut self.handle).await;
+        self.pool.close().await;
+        self._lock.take();
     }
 
     pub async fn retained_count(&self) -> isize {
@@ -551,7 +565,7 @@ impl TestAppBuilder {
             command_cancel,
             command_ready,
             handle,
-            _lock: lock,
+            _lock: Some(lock),
             _dir: dir,
         }
     }
