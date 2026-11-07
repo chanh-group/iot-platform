@@ -157,7 +157,7 @@ Nguồn sự thật:
 - [x] MQTT guide `docs/mqtt.md`: topic, QoS, ACL, application ACK, command flow/ACK, LWT, status/data, limits và ví dụ client.
 - [x] Troubleshooting: exit 3/4/5/6, disk full, DB lỗi, MQTT refuse/disconnect, login và dashboard; mỗi mục có hành động cụ thể.
 - [x] Không còn placeholder rỗng; README và các doc vận hành liên kết chéo tới contract `02`.
-- [x] Evidence 2026-11-07: review README, `docs/operations.md`, `docs/api.md`, `docs/mqtt.md`; `cargo fmt --all --check`, Clippy `-D warnings`, `cargo test --all` và `git diff --check` PASS. Commit P4-11.
+- [x] Evidence 2026-11-07: review README, `docs/operations.md`, `docs/api.md`, `docs/mqtt.md`; toàn bộ tài liệu dự án do repo viết (README, operations, API, MQTT, hai report, `tests/load/README.md`, `web/README.md`) đã chuyển sang tiếng Việt. `cargo fmt --all --check`, Clippy `-D warnings`, `cargo test --all` và `git diff --check` PASS. Commit P4-11.
 
 ## 12. Release checklist, SBOM và scan — P4-12
 

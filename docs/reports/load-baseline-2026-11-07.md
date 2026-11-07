@@ -1,38 +1,38 @@
-# MQTT load baseline — 2026-11-07
+# Baseline tải MQTT — 2026-11-07
 
-## Method
+## Phương pháp
 
-- Command: `IOT_LOAD_CGROUP=1 IOT_LOAD_DURATION_SECONDS=60 sh tests/load/run.sh`
-- Harness: ignored `tests/load_baseline.rs`, in-process server and clients on local loopback, `cargo test` test profile; Docker limits the combined process to 4 vCPU and 8 GiB, with 8,192 file descriptors. Not the release image.
-- Storage: temporary SQLite database on `/home` (Btrfs, `compress=zstd:1`) backed by WD PC SN5000S 476.9 GB NVMe; SQLite WAL mode, `synchronous=FULL`.
-- Host: AMD Ryzen 7 H 255, 8 cores / 16 threads; 29 GiB RAM. Rust/Cargo 1.98.0.
-- Workload: 1,000 MQTT 3.1.1 clients connected concurrently; QoS 1, one 43–47 byte JSON telemetry payload per client per second, unique `event_id`, staggered across each second; 60-second measurement, target 1,000 publish requests/s (60,000 over the window).
-- What is counted: a publish request is counted when the runner starts creating it while `Instant::now() < end`. `client.publish(...).await` then passes the request through the client queue. The count is therefore **publish requests created in-window**; it does not prove that every request reached the broker, was committed, or was acknowledged inside those 60 seconds. PUBACK, application ACK, and committed-row totals are drained for up to 10 seconds after the window and are not window-bounded latency measurements.
-- Ticks: the runner does not record skipped or late ticks separately. This run created 59,999 requests, one fewer than the 60,000 target; that shortfall alone does not prove which tick was late or why.
+- Lệnh: `IOT_LOAD_CGROUP=1 IOT_LOAD_DURATION_SECONDS=60 sh tests/load/run.sh`
+- Harness: `tests/load_baseline.rs` ignored, server và client chạy trong cùng process trên loopback, profile test của `cargo test`; Docker giới hạn process kết hợp ở 4 vCPU và 8 GiB, với 8 192 file descriptor. Không phải release image.
+- Storage: database SQLite tạm trên `/home` (Btrfs, `compress=zstd:1`) trên ổ WD PC SN5000S 476,9 GB NVMe; SQLite WAL mode, `synchronous=FULL`.
+- Host: AMD Ryzen 7 H 255, 8 core / 16 thread; 29 GiB RAM. Rust/Cargo 1.98.0.
+- Khối lượng đo: 1 000 client MQTT 3.1.1 kết nối đồng thời; QoS 1, mỗi client gửi một payload telemetry JSON 43–47 byte mỗi giây, `event_id` duy nhất, rải đều trong từng giây; đo 60 giây, mục tiêu 1 000 publish request/s (60 000 trong cửa sổ).
+- Cách đếm: một publish request được đếm khi runner bắt đầu tạo nó trong lúc `Instant::now() < end`. `client.publish(...).await` sau đó đưa request qua hàng đợi client. Vì vậy con số là **số publish request được tạo trong cửa sổ**; nó không chứng minh mọi request đã tới broker, đã commit hoặc đã được ACK trong đúng 60 giây đó. Tổng PUBACK, application ACK và số row đã commit được drain tối đa 10 giây sau cửa sổ và không phải phép đo latency giới hạn trong cửa sổ.
+- Nhịp: runner không ghi riêng số nhịp bị bỏ qua hoặc đến trễ. Lần chạy này tạo 59 999 request, thiếu một so với mục tiêu 60 000; chỉ riêng việc thiếu đó không chứng minh nhịp nào đến trễ hay vì sao.
 
-The numbers below are from the corrected rerun. An earlier runner gated publishes on the number already sent, so a delayed client could create a publish after the 60-second deadline while the total was still divided by 60 seconds. It now checks the real clock before creating each request, and `tests/load_baseline.rs::delayed_ticks_after_the_measurement_window_are_not_published` covers the late-tick case.
+Các số dưới đây đến từ lần chạy lại đã sửa. Runner trước đó gate publish theo số đã gửi, nên client bị trễ vẫn có thể tạo publish sau deadline 60 giây trong khi tổng vẫn chia cho 60 giây. Hiện runner kiểm tra đồng hồ thật trước khi tạo từng request, và `tests/load_baseline.rs::delayed_ticks_after_the_measurement_window_are_not_published` bao phủ trường hợp nhịp trễ.
 
-## Result
+## Kết quả
 
-| Measurement | Result |
+| Phép đo | Kết quả |
 | --- | ---: |
-| Target publish request rate | 1,000 requests/s (60,000 total) |
-| Publish requests created in-window | 59,999 (one fewer than target; skipped ticks are not counted separately) |
-| Publish request creation rate | 999.983 requests/s (59,999 / 60 s) |
-| MQTT PUBACK (drain-complete total) | 59,999 / 59,999 (100%) |
-| Committed SQLite rows (drain-complete total) | 59,999 / 59,999 |
-| Application ACK (drain-complete total) | 30,720 / 59,999 (51.201%) |
-| Application ACK dropped | 29,279 (48.799%) |
-| Application ACK p95 (received ACKs only) | 515.627 ms |
-| CONNECT-to-CONNACK p95 | 1,510.652 ms |
-| Peak pending CONNECT attempts | 1,000 |
-| Peak in-flight presence hooks | 711 |
-| Peak load-test process RSS | 136,008 KiB |
-| Peak cgroup memory | 149,332 KiB |
-| SQLite DB/WAL/SHM growth | 22,731,624 bytes / 60 s (about 22.7 MB/min) |
+| Tốc độ publish request mục tiêu | 1 000 request/s (tổng 60 000) |
+| Publish request được tạo trong cửa sổ | 59 999 (thiếu một so với mục tiêu; nhịp bị bỏ qua không được đếm riêng) |
+| Tốc độ tạo publish request | 999,983 request/s (59 999 / 60 giây) |
+| MQTT PUBACK (tổng sau khi drain hoàn tất) | 59 999 / 59 999 (100%) |
+| Row SQLite đã commit (tổng sau khi drain hoàn tất) | 59 999 / 59 999 |
+| Application ACK (tổng sau khi drain hoàn tất) | 30 720 / 59 999 (51,201%) |
+| Application ACK bị drop | 29 279 (48,799%) |
+| Application ACK p95 (chỉ các ACK nhận được) | 515,627 ms |
+| CONNECT-to-CONNACK p95 | 1 510,652 ms |
+| Đỉnh số lần CONNECT đang chờ | 1 000 |
+| Đỉnh số presence hook đang chạy | 711 |
+| Đỉnh RSS của process load test | 136 008 KiB |
+| Đỉnh bộ nhớ cgroup | 149 332 KiB |
+| Tăng trưởng SQLite DB/WAL/SHM | 22 731 624 byte / 60 giây (khoảng 22,7 MB/phút) |
 
-The 999.983 requests/s figure is the rate at which publish requests were created in-window, not proof that the broker received or SQLite committed them at that rate or inside the window. By the end of the post-window drain, all 59,999 created requests had a PUBACK and a committed row; some may have completed earlier, but the harness does not timestamp broker receipt or commits relative to the window. Establishing those timings, or the cause of the one-request shortfall, would require separate instrumentation.
+Con số 999,983 request/s là tốc độ tạo publish request trong cửa sổ, không chứng minh broker nhận hoặc SQLite commit ở tốc độ đó hay trong đúng cửa sổ. Đến cuối giai đoạn drain sau cửa sổ, cả 59 999 request đã tạo đều có PUBACK và row đã commit; một số có thể đã hoàn tất sớm hơn, nhưng harness không ghi timestamp broker nhận hoặc commit so với cửa sổ. Muốn xác định các thời điểm đó, hoặc nguyên nhân thiếu một request, cần instrumentation riêng.
 
-The 51.201% application ACK rate is **not a performance pass**: 29,279 application ACKs (48.799%) were dropped at this offered rate, so devices would need to retry the missing results. The ACK p95 covers only the ACKs that were received and excludes the dropped share, so it does not describe end-to-end latency for all events. The test also generates no retry traffic; behavior under retry load is unmeasured. This baseline is a failure signal for safe operation at 1,000 requests/s per instance, not a throughput promise or a release SLO.
+Tỷ lệ application ACK 51,201% **không phải pass hiệu năng**: 29 279 application ACK (48,799%) bị drop ở tốc độ offered này, nên device sẽ phải retry các kết quả bị thiếu. ACK p95 chỉ tính trên các ACK nhận được và loại trừ phần bị drop, nên nó không mô tả latency end-to-end cho toàn bộ event. Bài đo cũng không tạo tải retry; hành vi dưới tải retry chưa được đo. Baseline này là tín hiệu lỗi đối với vận hành an toàn ở 1 000 request/s mỗi instance, không phải cam kết throughput hay SLO phát hành.
 
-The measurement is a same-process loopback run on one host, not a release-image deployment or independent client-generator benchmark. The hook peak counts in-flight connect/disconnect callbacks, not an explicit queue. Repeat on deployment hardware and with its actual resource limits before sizing production.
+Phép đo là chạy loopback trong cùng process trên một host, không phải triển khai release image hay benchmark với client generator độc lập. Đỉnh hook đếm callback connect/disconnect đang chạy, không phải một queue tường minh. Cần lặp lại trên phần cứng triển khai và giới hạn tài nguyên thật trước khi sizing production.

@@ -1,18 +1,18 @@
 # HTTP API
 
-Base path: `/api/v1`. This is an operator/developer quick reference; the full contract, including every field and validation rule, is [02 — Contract kỹ thuật](plans/02-contracts.md) §4. The server does not accept telemetry over HTTP; devices publish over MQTT.
+Base path: `/api/v1`. Đây là bản tham chiếu nhanh cho operator/developer; contract đầy đủ, gồm mọi field và quy tắc validate, nằm trong [02 — Contract kỹ thuật](plans/02-contracts.md) §4. Server không nhận telemetry qua HTTP; thiết bị publish qua MQTT.
 
-## Authentication and CSRF
+## Xác thực và CSRF
 
-Admin sessions use the `iot_session` cookie. `POST /api/v1/auth/login` with `{"username":"admin","password":"..."}` sets the cookie; `POST /api/v1/auth/logout` revokes it. `GET /api/v1/auth/me` returns the current admin and expiry.
+Admin session dùng cookie `iot_session`. `POST /api/v1/auth/login` với `{"username":"admin","password":"..."}` set cookie; `POST /api/v1/auth/logout` thu hồi session. `GET /api/v1/auth/me` trả admin hiện tại và thời hạn session.
 
-Every authenticated mutation (`POST`, `PATCH`, `DELETE`) also requires:
+Mọi mutation đã xác thực (`POST`, `PATCH`, `DELETE`) còn yêu cầu:
 
 - `Content-Type: application/json`;
-- `X-IoT-CSRF: 1`;
-- if an `Origin` header is present, its host must match the request `Host`.
+- header `X-IoT-CSRF: 1`;
+- nếu có header `Origin`, host của Origin phải khớp `Host` của request.
 
-Use a cookie jar for the examples:
+Dùng cookie jar cho ví dụ:
 
 ```sh
 curl -sS -c cookies.txt -H 'Content-Type: application/json' \
@@ -25,58 +25,58 @@ curl -sS -b cookies.txt -H 'Content-Type: application/json' \
   http://127.0.0.1:8080/api/v1/devices
 ```
 
-A wrong username/password returns `401 invalid_credentials`; repeated failures return `429 rate_limited` with `Retry-After`. Device tokens cannot be used for the admin API. If `cookie_secure = true`, the cookie is only sent over HTTPS.
+Sai username/password trả `401 invalid_credentials`; sai nhiều lần trả `429 rate_limited` kèm `Retry-After`. Device token không dùng được cho admin API. Nếu `cookie_secure = true`, cookie chỉ được gửi qua HTTPS.
 
-## Endpoints
+## Endpoint
 
-| Method | Path | Purpose |
+| Method | Path | Mục đích |
 | --- | --- | --- |
-| `GET` | `/healthz` | Process liveness; no database check, no auth |
-| `GET` | `/readyz` | Readiness of database, MQTT, ingest and command dispatcher; no auth |
-| `POST` | `/api/v1/auth/login` | Create an admin session |
-| `POST` | `/api/v1/auth/logout` | Revoke the current session |
-| `GET` | `/api/v1/auth/me` | Current admin and session expiry |
-| `GET` | `/api/v1/devices` | List devices (`limit`, `cursor`, `q`, `enabled`) |
-| `POST` | `/api/v1/devices` | Create a device; returns its token once |
-| `GET` | `/api/v1/devices/{id}` | Read one device |
-| `PATCH` | `/api/v1/devices/{id}` | Rename, replace metadata, enable/disable |
-| `POST` | `/api/v1/devices/{id}/credentials/rotate` | Revoke the old token and return a new one |
-| `GET` | `/api/v1/devices/{id}/telemetry` | Telemetry history by `from`/`to` or reconnect checkpoint `after_id` |
-| `GET` | `/api/v1/devices/{id}/telemetry/latest` | Latest value per key |
-| `GET` | `/api/v1/devices/{id}/attributes` | Latest device attributes |
-| `POST` | `/api/v1/devices/{id}/commands` | Queue a command |
-| `GET` | `/api/v1/devices/{id}/commands` | List commands (`limit`, `cursor`, `status`) |
-| `GET` | `/api/v1/commands/{id}` | Read one command and its result |
-| `GET` | `/api/v1/config` | Effective, redacted configuration |
-| `PATCH` | `/api/v1/config/runtime` | Update hot-reloadable settings |
-| `GET` | `/api/v1/overview` | Dashboard counters |
-| `GET` | `/metrics` | Prometheus metrics; disabled by default, Bearer token only |
+| `GET` | `/healthz` | Process còn sống; không kiểm tra database, không auth |
+| `GET` | `/readyz` | Readiness của database, MQTT, ingest và command dispatcher; không auth |
+| `POST` | `/api/v1/auth/login` | Tạo admin session |
+| `POST` | `/api/v1/auth/logout` | Thu hồi session hiện tại |
+| `GET` | `/api/v1/auth/me` | Admin hiện tại và thời hạn session |
+| `GET` | `/api/v1/devices` | Liệt kê device (`limit`, `cursor`, `q`, `enabled`) |
+| `POST` | `/api/v1/devices` | Tạo device; trả token đúng một lần |
+| `GET` | `/api/v1/devices/{id}` | Đọc một device |
+| `PATCH` | `/api/v1/devices/{id}` | Đổi tên, thay metadata, enable/disable |
+| `POST` | `/api/v1/devices/{id}/credentials/rotate` | Thu hồi token cũ và trả token mới |
+| `GET` | `/api/v1/devices/{id}/telemetry` | Lịch sử telemetry theo `from`/`to` hoặc checkpoint reconnect `after_id` |
+| `GET` | `/api/v1/devices/{id}/telemetry/latest` | Giá trị mới nhất theo key |
+| `GET` | `/api/v1/devices/{id}/attributes` | Attribute mới nhất của device |
+| `POST` | `/api/v1/devices/{id}/commands` | Đưa command vào queue |
+| `GET` | `/api/v1/devices/{id}/commands` | Liệt kê command (`limit`, `cursor`, `status`) |
+| `GET` | `/api/v1/commands/{id}` | Đọc một command và kết quả |
+| `GET` | `/api/v1/config` | Cấu hình hiệu lực đã redact |
+| `PATCH` | `/api/v1/config/runtime` | Cập nhật setting hot-reload |
+| `GET` | `/api/v1/overview` | Counter cho dashboard |
+| `GET` | `/metrics` | Prometheus metric; mặc định tắt, chỉ Bearer token |
 | `GET` | `/api/v1/events` | WebSocket upgrade |
-| `GET` | `/` and assets | Embedded dashboard when `http.dashboard = true` |
+| `GET` | `/` và asset | Dashboard nhúng khi `http.dashboard = true` |
 
-Lists use opaque cursors, not offsets. Devices/commands default to `limit=50` (max 200); telemetry defaults to 100 (max 1 000); attributes default to 50 (max 200). Telemetry `from`/`to` must be an increasing range of at most 31 days. For reconnect backfill, use `after_id` instead of `from`/`to` and advance only to the returned `through_id`.
+Danh sách dùng cursor opaque, không dùng offset. Device/command mặc định `limit=50` (tối đa 200); telemetry mặc định 100 (tối đa 1 000); attribute mặc định 50 (tối đa 200). `from`/`to` của telemetry phải là range tăng dần, tối đa 31 ngày. Để backfill sau reconnect, dùng `after_id` thay cho `from`/`to` và chỉ tiến tới `through_id` được trả về.
 
-## Device credentials
+## Credential thiết bị
 
-`POST /api/v1/devices` and `POST /api/v1/devices/{id}/credentials/rotate` return the device token exactly once:
+`POST /api/v1/devices` và `POST /api/v1/devices/{id}/credentials/rotate` trả token thiết bị đúng một lần:
 
 ```json
 {"device": {"id": "019c...", "name": "sensor-01", "enabled": true},
  "credential": {"id": "019c...", "token": "iot_...", "created_at": 1793149200000}}
 ```
 
-Rotation returns `device_id` instead of the full `device` object:
+Rotate trả `device_id` thay vì object `device` đầy đủ:
 
 ```json
 {"device_id": "019c...",
  "credential": {"id": "019c...", "token": "iot_...", "created_at": 1793149200000}}
 ```
 
-The token is `iot_` plus 43 base64url characters. Store it in the device's secret store; the database keeps only a SHA-256 hash and the API never shows it again. Rotation commits the new credential and revokes the old one in one transaction, then kicks the connected session. If the response is lost after commit, rotate again to obtain a new known token; the previous token is already invalid.
+Token là `iot_` cộng 43 ký tự base64url. Lưu token trong secret store của thiết bị; database chỉ giữ hash SHA-256 và API không bao giờ hiển thị lại token. Rotate commit credential mới và thu hồi credential cũ trong cùng một transaction, rồi kick session đang kết nối. Nếu response bị mất sau commit, rotate lần nữa để lấy token mới đã biết; token trước đó đã bị vô hiệu.
 
-## Commands
+## Command
 
-Create a command with `name`, optional `params`, `ttl_ms`, and optional `idempotency_key`:
+Tạo command với `name`, `params` tùy chọn, `ttl_ms` và `idempotency_key` tùy chọn:
 
 ```json
 {
@@ -87,28 +87,28 @@ Create a command with `name`, optional `params`, `ttl_ms`, and optional `idempot
 }
 ```
 
-The response is `202` with `command_id`, `status: "pending"`, and `Location: /api/v1/commands/{id}`. Reusing an idempotency key with the same body returns the existing command with `Idempotent-Replayed: true`; a different body returns `409 idempotency_conflict`. A disabled device returns `409 device_disabled`; a full per-device queue returns `409 command_queue_full`. Command status is one of `pending`, `dispatched`, `succeeded`, `failed`, `expired`.
+Response là `202` với `command_id`, `status: "pending"` và `Location: /api/v1/commands/{id}`. Dùng lại idempotency key với cùng body trả command cũ kèm `Idempotent-Replayed: true`; body khác trả `409 idempotency_conflict`. Device disabled trả `409 device_disabled`; queue theo device đầy trả `409 command_queue_full`. Trạng thái command là một trong `pending`, `dispatched`, `succeeded`, `failed`, `expired`.
 
 ## Runtime configuration
 
-`PATCH /api/v1/config/runtime` accepts `expected_revision` and a `settings` object. Only these fields are hot-reloadable:
+`PATCH /api/v1/config/runtime` nhận `expected_revision` và object `settings`. Chỉ các field sau hot-reload được:
 
 - `logging.level`
 - `telemetry.retention_days`
 - `telemetry.batch_size`
 - `telemetry.flush_interval_ms`
 
-A stale revision returns `409 revision_conflict`. A valid field that needs a restart returns `422 restart_required` and does not write the file. Invalid values return `400 validation_error` and also do not write. The response is the same redacted shape as `GET /api/v1/config` with the new revision. Changing `runtime.toml` on disk is only read at startup.
+Revision cũ trả `409 revision_conflict`. Field hợp lệ nhưng cần restart trả `422 restart_required` và không ghi file. Giá trị không hợp lệ trả `400 validation_error` và cũng không ghi file. Response có cùng shape đã redact như `GET /api/v1/config` với revision mới. Sửa `runtime.toml` trên đĩa chỉ được đọc lúc khởi động.
 
 ## WebSocket
 
-Connect to `GET /api/v1/events` with the session cookie and a matching `Origin`. The server sends:
+Kết nối tới `GET /api/v1/events` với cookie session và `Origin` khớp. Server gửi ngay:
 
 ```json
 {"type": "hello", "server_time": 1793149200000, "max_subscriptions": 8}
 ```
 
-Client messages (maximum 4 096 bytes):
+Message từ client (tối đa 4 096 byte):
 
 ```json
 {"action": "subscribe", "channels": ["overview", "device:019c..."], "request_id": 17}
@@ -116,17 +116,17 @@ Client messages (maximum 4 096 bytes):
 {"action": "ping"}
 ```
 
-Channels are `overview` and `device:{uuid}`, at most 8 per connection. `subscribe` may include an integer `request_id`; the matching `subscribed` message contains the channels accepted for that request. `ping` returns `pong`. Events are invalidations, not a durable stream: telemetry is sent only after commit, commands carry `state_version`, and clients refetch REST resources after reconnect. The server pings every 30 seconds and closes a connection that does not respond for 60 seconds (`1001`). A slow consumer is closed with `1013 slow_consumer`; reconnect and backfill with `after_id`/`through_id`. Logout or session expiry closes WebSocket connections with `4401`.
+Channel là `overview` và `device:{uuid}`, tối đa 8 channel mỗi connection. `subscribe` có thể gửi `request_id` dạng integer; message `subscribed` khớp sẽ chứa các channel được chấp nhận cho request đó. `ping` trả `pong`. Event chỉ là invalidation, không phải stream bền vững: telemetry chỉ được gửi sau commit, command mang `state_version`, và client phải refetch REST resource sau reconnect. Server ping mỗi 30 giây và đóng connection không phản hồi trong 60 giây (`1001`). Slow consumer bị đóng với `1013 slow_consumer`; hãy reconnect và backfill bằng `after_id`/`through_id`. Logout hoặc session hết hạn đóng WebSocket với `4401`.
 
-Event types are `telemetry`, `command`, `presence`, `reported_status`, `config`, and `system`. The envelope is:
+Các loại event là `telemetry`, `command`, `presence`, `reported_status`, `config` và `system`. Envelope:
 
 ```json
 {"type": "telemetry", "id": "019c...", "ts": 1793149200123, "device_id": "019c...", "data": {}}
 ```
 
-## Errors
+## Lỗi
 
-Errors use one envelope and always return `X-Request-ID`:
+Lỗi dùng chung một envelope và luôn trả `X-Request-ID`:
 
 ```json
 {
@@ -137,8 +137,8 @@ Errors use one envelope and always return `X-Request-ID`:
 }
 ```
 
-Common codes: `validation_error`, `invalid_json`, `invalid_cursor`, `unauthenticated`, `invalid_credentials`, `csrf_failed`, `not_found`, `device_not_found`, `command_not_found`, `method_not_allowed`, `device_name_conflict`, `idempotency_conflict`, `revision_conflict`, `device_disabled`, `command_queue_full`, `payload_too_large`, `unsupported_media_type`, `restart_required`, `rate_limited`, `internal_error`, `config_write_failed`, `not_ready`, `request_capacity_exceeded`, and `storage_unavailable`. The complete status/code table is in [02 §4.10](plans/02-contracts.md).
+Các code thường gặp: `validation_error`, `invalid_json`, `invalid_cursor`, `unauthenticated`, `invalid_credentials`, `csrf_failed`, `not_found`, `device_not_found`, `command_not_found`, `method_not_allowed`, `device_name_conflict`, `idempotency_conflict`, `revision_conflict`, `device_disabled`, `command_queue_full`, `payload_too_large`, `unsupported_media_type`, `restart_required`, `rate_limited`, `internal_error`, `config_write_failed`, `not_ready`, `request_capacity_exceeded` và `storage_unavailable`. Bảng status/code đầy đủ nằm trong [02 §4.10](plans/02-contracts.md).
 
 ## Metrics
 
-`/metrics` returns `404` unless `http.metrics = true` and `http.metrics_bearer_token_env` names an environment variable containing a token of at least 32 bytes. It accepts only `Authorization: Bearer <token>`, never the admin cookie. Do not expose it without a reverse proxy, mTLS, or a network policy that limits access to the monitoring system. The exported metric names and semantics are listed in [02 §4.7](plans/02-contracts.md).
+`/metrics` trả `404` trừ khi `http.metrics = true` và `http.metrics_bearer_token_env` trỏ tới biến environment chứa token tối thiểu 32 byte. Endpoint chỉ nhận `Authorization: Bearer <token>`, không bao giờ dùng cookie admin. Không expose endpoint nếu không có reverse proxy, mTLS hoặc network policy giới hạn cho hệ thống monitoring. Tên metric và ngữ nghĩa được liệt kê trong [02 §4.7](plans/02-contracts.md).

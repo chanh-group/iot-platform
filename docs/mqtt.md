@@ -1,58 +1,58 @@
-# MQTT guide
+# Hướng dẫn MQTT
 
-The broker is embedded in `iot-server`; no external MQTT broker is required. The full wire contract is [02 — Contract kỹ thuật](plans/02-contracts.md) §2. This guide is the client/operator view.
+Broker được nhúng trong `iot-server`; không cần broker MQTT bên ngoài. Contract đầy đủ là [02 — Contract kỹ thuật](plans/02-contracts.md) §2. Tài liệu này là góc nhìn của client/operator.
 
-## Connection
+## Kết nối
 
-| Setting | Value |
+| Setting | Giá trị |
 | --- | --- |
 | Protocol | MQTT 3.1.1, protocol level `4` |
-| Listen | `[mqtt] listen`, default `127.0.0.1:1883` |
+| Listen | `[mqtt] listen`, mặc định `127.0.0.1:1883` |
 | `username` | Device ID (UUID v7) |
 | `password` | Device token (`iot_...`) |
-| `client_id` | Must equal the device ID |
-| `clean_session` | `0` or `1`; offline session expires after `max_session_expiry_ms` (default 1 hour) |
-| TLS | Not built in; terminate MQTT TLS at a proxy if traffic leaves the host |
+| `client_id` | Phải bằng device ID |
+| `clean_session` | `0` hoặc `1`; session offline hết hạn sau `max_session_expiry_ms` (mặc định 1 giờ) |
+| TLS | Không tích hợp; terminate MQTT TLS ở proxy nếu traffic ra khỏi host |
 
-The default listener is loopback-only. Plaintext MQTT is not safe on an untrusted network even when it runs inside Docker.
+Listener mặc định chỉ bind loopback. MQTT plaintext không an toàn trên mạng không tin cậy, kể cả khi chạy trong Docker.
 
-Connection failures deliberately do not reveal whether the device is unknown, disabled, or the token is wrong:
+Lỗi kết nối cố ý không tiết lộ device không tồn tại, đã disable hay token sai:
 
-| Result | Meaning |
+| Kết quả | Ý nghĩa |
 | --- | --- |
-| CONNACK `0x04` | Bad username/password; also used for unknown, disabled, or revoked devices and for `client_id != username` |
-| CONNACK `0x05` | MQTT 3.1 (protocol level 3) is not supported |
-| CONNACK `0x87` | MQTT 5 (protocol level 5) is not supported |
-| Connection refused | Server connection cap reached, or listener unavailable |
+| CONNACK `0x04` | Sai username/password; cũng dùng cho device không tồn tại, đã disable hoặc đã revoke, và cho `client_id != username` |
+| CONNACK `0x05` | MQTT 3.1 (protocol level 3) không được hỗ trợ |
+| CONNACK `0x87` | MQTT 5 (protocol level 5) không được hỗ trợ |
+| Connection bị từ chối | Đã đạt connection cap của server, hoặc listener không khả dụng |
 
-MQTT over WebSocket, `$share`, topic aliases, and MQTT 5 properties are not supported. `$SYS` is not available to devices.
+MQTT over WebSocket, `$share`, topic alias và MQTT 5 property không được hỗ trợ. Device không được dùng `$SYS`.
 
-## Topics and permissions
+## Topic và quyền
 
-ACL is deny-by-default. A device can only use its own `devices/{self}/...` namespace:
+ACL mặc định deny. Device chỉ dùng được namespace `devices/{self}/...` của chính nó:
 
-| Topic | Device publish | Device subscribe | Stored | Notes |
+| Topic | Device publish | Device subscribe | Lưu | Ghi chú |
 | --- | --- | --- | --- | --- |
-| `devices/{id}/telemetry` | Yes | No | Yes | Ingest; application ACK after commit |
-| `devices/{id}/telemetry/ack` | No | Yes | No | Server publishes QoS 1, non-retained |
-| `devices/{id}/attributes` | Yes | No | Latest only | No application ACK |
-| `devices/{id}/commands` | No | Yes | No | Server publishes QoS 1, non-retained |
-| `devices/{id}/commands/ack` | Yes | No | Command update | Execution result |
-| `devices/{id}/status` | Yes | Yes | No | Retained/LWT signal; server presence is authoritative |
-| `devices/{id}/data/#` | Yes | Yes | No | Free-form pub/sub; retained allowed within caps |
+| `devices/{id}/telemetry` | Có | Không | Có | Ingest; application ACK sau commit |
+| `devices/{id}/telemetry/ack` | Không | Có | Không | Server publish QoS 1, non-retained |
+| `devices/{id}/attributes` | Có | Không | Chỉ latest | Không có application ACK |
+| `devices/{id}/commands` | Không | Có | Không | Server publish QoS 1, non-retained |
+| `devices/{id}/commands/ack` | Có | Không | Cập nhật command | Kết quả thực thi |
+| `devices/{id}/status` | Có | Có | Không | Tín hiệu retained/LWT; presence của server là nguồn chính |
+| `devices/{id}/data/#` | Có | Có | Không | Pub/sub tự do; retained được phép trong giới hạn |
 
-Publishing must use a concrete topic, without `+` or `#`. Subscriptions may use wildcards, but the resolved filter must stay inside `devices/{self}/`. Do not subscribe to `devices/{self}` or `devices/{self}/#`; they would expose server-only topics. Cross-device access, `$SYS`, and `$share` are rejected.
+Publish phải dùng topic cụ thể, không chứa `+` hoặc `#`. Subscribe được dùng wildcard, nhưng filter đã resolve phải nằm trong `devices/{self}/`. Không subscribe `devices/{self}` hoặc `devices/{self}/#`; chúng sẽ lộ topic chỉ dành cho server. Cross-device, `$SYS` và `$share` bị từ chối.
 
-ACL denial behavior:
+Hành vi khi ACL từ chối:
 
-- Denied `PUBLISH`: the message is not routed and the broker closes the connection without a PUBACK.
-- Denied `SUBSCRIBE`: SUBACK failure `0x80`; the connection stays open.
-- Retained publish to `telemetry`, `attributes`, or a server-only topic is rejected; telemetry receives a `retained_not_allowed` application ACK only when its `event_id` is valid.
-- Exceeding the retained-message or retained-byte cap closes the connection and increments `iot_retained_cap_rejected_total`.
+- `PUBLISH` bị từ chối: message không được route và broker đóng connection mà không gửi PUBACK.
+- `SUBSCRIBE` bị từ chối: SUBACK failure `0x80`; connection vẫn mở.
+- Publish retained vào `telemetry`, `attributes` hoặc topic chỉ dành cho server bị từ chối; telemetry nhận application ACK `retained_not_allowed` chỉ khi `event_id` hợp lệ.
+- Vượt retained-message hoặc retained-byte cap đóng connection và tăng `iot_retained_cap_rejected_total`.
 
 ## Telemetry
 
-Publish to `devices/{id}/telemetry` with QoS 0 or 1 (QoS 1 recommended):
+Publish tới `devices/{id}/telemetry` với QoS 0 hoặc 1 (khuyến nghị QoS 1):
 
 ```json
 {
@@ -66,14 +66,14 @@ Publish to `devices/{id}/telemetry` with QoS 0 or 1 (QoS 1 recommended):
 }
 ```
 
-- `event_id` is required for every telemetry message, including QoS 0. It is 1–128 characters from `[A-Za-z0-9._:-]` and must be stable across retries.
-- `ts` is optional. If absent, the server uses `received_at`. Timestamps outside the configured past/future skew are rejected.
-- `values` is a flat object with 1–128 keys. Values are finite numbers, booleans, or strings up to 4 096 bytes; null, arrays, and nested objects are invalid.
-- The payload is limited by `telemetry.max_payload_bytes` (default 65 536 bytes) and the MQTT packet limit.
-- Deduplication is by `(device_id, event_id)` using a SHA-256 hash of the raw payload. Retries must send byte-identical payloads. The same ID with different bytes returns `event_id_conflict`.
-- Deduplication only covers records still inside telemetry retention. After retention deletes the old row, the old ID can be accepted again.
+- `event_id` bắt buộc cho mọi telemetry, kể cả QoS 0. Chuỗi dài 1–128 ký tự thuộc `[A-Za-z0-9._:-]` và phải giữ nguyên khi retry.
+- `ts` tùy chọn. Nếu thiếu, server dùng `received_at`. Timestamp lệch quá cửa sổ past/future đã cấu hình bị từ chối.
+- `values` là object phẳng với 1–128 key. Value là number hữu hạn, boolean hoặc string tối đa 4 096 byte; null, array và object lồng nhau không hợp lệ.
+- Payload giới hạn bởi `telemetry.max_payload_bytes` (mặc định 65 536 byte) và packet limit của MQTT.
+- Dedup theo `(device_id, event_id)` bằng hash SHA-256 của raw payload. Retry phải gửi payload giống hệt từng byte. Cùng ID nhưng khác byte trả `event_id_conflict`.
+- Dedup chỉ có hiệu lực khi bản ghi còn trong retention telemetry. Sau khi retention xóa row cũ, ID cũ có thể được chấp nhận lại.
 
-The server publishes the application ACK to `devices/{id}/telemetry/ack`, QoS 1, non-retained:
+Server publish application ACK tới `devices/{id}/telemetry/ack`, QoS 1, non-retained:
 
 ```json
 {
@@ -84,20 +84,20 @@ The server publishes the application ACK to `devices/{id}/telemetry/ack`, QoS 1,
 }
 ```
 
-| Status | Meaning | ACK after commit? |
+| Status | Ý nghĩa | ACK sau commit? |
 | --- | --- | --- |
-| `stored` | New event committed | Yes |
-| `duplicate` | Same event ID and same payload hash already exist | Yes |
-| `rejected` | Invalid event; `code` explains why | No write |
-| `retryable` | Temporary failure; retry the same event | No write |
+| `stored` | Event mới đã commit | Có |
+| `duplicate` | Cùng event ID và payload hash đã tồn tại | Có |
+| `rejected` | Event không hợp lệ; `code` cho biết lý do | Không ghi |
+| `retryable` | Lỗi tạm thời; retry cùng event | Không ghi |
 
-Common `code` values: `missing_event_id`, `invalid_event_id`, `invalid_payload`, `payload_too_large`, `invalid_timestamp`, `event_id_conflict`, `retained_not_allowed`, `unknown_device`, `queue_full`, and `storage_unavailable`. `queue_full` and `storage_unavailable` are retryable; retry with the same `event_id` and backoff.
+Các `code` thường gặp: `missing_event_id`, `invalid_event_id`, `invalid_payload`, `payload_too_large`, `invalid_timestamp`, `event_id_conflict`, `retained_not_allowed`, `unknown_device`, `queue_full` và `storage_unavailable`. `queue_full` và `storage_unavailable` là retryable; retry với cùng `event_id` và backoff.
 
-The application ACK queue is bounded. If it fills, ACKs are dropped and `iot_telemetry_ack_dropped_total` increases; the device sees no ACK and must retry. A retry of an already committed event returns `duplicate`. If the device is not subscribed to the ACK topic, ACKs are lost; retry after reconnect. QoS 0 delivery still receives an ACK when the server can process it, but QoS 0 must not be treated as durable.
+Application ACK queue có giới hạn. Nếu đầy, ACK bị drop và `iot_telemetry_ack_dropped_total` tăng; device không thấy ACK và phải retry. Retry event đã commit trả `duplicate`. Nếu device không subscribe topic ACK, ACK bị mất; retry sau reconnect. QoS 0 vẫn nhận ACK khi server xử lý được, nhưng không được coi QoS 0 là bền vững.
 
-## Attributes
+## Attribute
 
-Publish to `devices/{id}/attributes` with QoS 0 or 1, non-retained:
+Publish tới `devices/{id}/attributes` với QoS 0 hoặc 1, non-retained:
 
 ```json
 {
@@ -109,11 +109,11 @@ Publish to `devices/{id}/attributes` with QoS 0 or 1, non-retained:
 }
 ```
 
-Only the latest value per key is stored; there is no history in the MVP. `ts` is optional and stored as the device timestamp. Invalid payloads are dropped with a metric; there is no application ACK topic for attributes, and a QoS 1 PUBACK is only a protocol acknowledgement.
+Chỉ giá trị mới nhất theo key được lưu; MVP không có history. `ts` tùy chọn và được lưu làm device timestamp. Payload không hợp lệ bị drop kèm metric; không có topic application ACK cho attribute, và PUBACK QoS 1 chỉ là xác nhận giao thức.
 
-## Commands
+## Command
 
-Create a command through the HTTP API, then subscribe to `devices/{id}/commands`. The server publishes QoS 1, non-retained:
+Tạo command qua HTTP API, rồi subscribe `devices/{id}/commands`. Server publish QoS 1, non-retained:
 
 ```json
 {
@@ -125,7 +125,7 @@ Create a command through the HTTP API, then subscribe to `devices/{id}/commands`
 }
 ```
 
-Acknowledge on `devices/{id}/commands/ack`, QoS 0 or 1:
+ACK trên `devices/{id}/commands/ack`, QoS 0 hoặc 1:
 
 ```json
 {
@@ -136,46 +136,46 @@ Acknowledge on `devices/{id}/commands/ack`, QoS 0 or 1:
 }
 ```
 
-- `status` is `succeeded` or `failed`; `result` is any JSON value up to 16 384 bytes; `error` is at most 512 characters.
-- Commands do not depend on the broker session queue. A command for an offline device stays `pending` in SQLite and is published after reconnect if it has not expired.
-- Re-subscribing to the exact `devices/{id}/commands` topic wakes the dispatcher and can resend a command whose earlier publish raced the subscription. Deduplicate by `command_id`.
-- Duplicate ACKs do not change a terminal state. An ACK after `expires_at` is stored for diagnostics, but the command remains `expired`.
-- A device may have at most `commands.max_pending_per_device` commands in `pending` or `dispatched`; further creates return `409 command_queue_full`.
+- `status` là `succeeded` hoặc `failed`; `result` là JSON bất kỳ tối đa 16 384 byte; `error` tối đa 512 ký tự.
+- Command không phụ thuộc session queue của broker. Command cho device offline vẫn `pending` trong SQLite và được publish sau reconnect nếu chưa hết hạn.
+- Subscribe lại đúng topic `devices/{id}/commands` đánh thức dispatcher và có thể resend command có lần publish trước chạy trước subscription. Dedup theo `command_id`.
+- ACK trùng không đổi terminal state. ACK sau `expires_at` được lưu để chẩn đoán, nhưng command vẫn `expired`.
+- Mỗi device có tối đa `commands.max_pending_per_device` command ở trạng thái `pending` hoặc `dispatched`; tạo thêm trả `409 command_queue_full`.
 
-## Status and LWT
+## Status và LWT
 
-Publish a retained status and configure the same topic as the last will:
+Publish status retained và cấu hình cùng topic làm last will:
 
 ```json
 {"status": "offline"}
 ```
 
-`devices/{id}/status` accepts `online` or `offline` and an optional `ts`. It is an additional signal; actual presence is decided by the authenticated MQTT session. The server does not change presence because of this payload. The recommended LWT is a retained `{"status":"offline"}` on the device status topic so the dashboard can show the reported state.
+`devices/{id}/status` nhận `online` hoặc `offline` và `ts` tùy chọn. Đây là tín hiệu bổ sung; presence thật do MQTT session đã xác thực quyết định. Server không đổi presence vì payload này. LWT khuyến nghị là `{"status":"offline"}` retained trên topic status của device để dashboard hiển thị trạng thái được báo.
 
-## Free-form data
+## Data tự do
 
-`devices/{id}/data/#` accepts arbitrary payloads within the packet limit, with QoS and retain chosen by the device. It is not stored in SQLite. Retained messages count toward the retained caps.
+`devices/{id}/data/#` nhận payload tùy ý trong packet limit, với QoS và retain do device chọn. Dữ liệu không được lưu vào SQLite. Retained message tính vào retained cap.
 
-## Limits
+## Giới hạn
 
-| Limit | Default |
+| Giới hạn | Mặc định |
 | --- | --- |
-| Connections per server | 1 000 |
-| Client ID length | 64 bytes |
-| Topic levels | 16 |
-| Subscriptions per client | 8 |
-| Inflight messages per client | 32 |
-| Queued messages per client | 256 |
-| Session expiry after disconnect | 1 hour |
-| Retained messages | 10 000 |
-| Retained bytes | 16 MiB |
-| MQTT packet size | 262 144 bytes |
+| Connection mỗi server | 1 000 |
+| Độ dài client ID | 64 byte |
+| Số level topic | 16 |
+| Subscription mỗi client | 8 |
+| Inflight message mỗi client | 32 |
+| Message trong queue mỗi client | 256 |
+| Session expiry sau disconnect | 1 giờ |
+| Retained message | 10 000 |
+| Retained byte | 16 MiB |
+| Kích thước packet MQTT | 262 144 byte |
 
-These are configurable in `[mqtt]` in `conf.toml` (see [02 §5](plans/02-contracts.md)). Exceeding a limit can reject the connection, return SUBACK failure, or close the connection; it is not an application ACK and is not retried by the broker.
+Có thể cấu hình trong `[mqtt]` của `conf.toml` (xem [02 §5](plans/02-contracts.md)). Vượt giới hạn có thể từ chối connection, trả SUBACK failure hoặc đóng connection; đây không phải application ACK và broker không tự retry.
 
-## Client examples
+## Ví dụ client
 
-The commands below use `mosquitto_pub`/`mosquitto_sub` only as examples; the project does not require those tools.
+Các lệnh dưới dùng `mosquitto_pub`/`mosquitto_sub` chỉ làm ví dụ; dự án không yêu cầu các công cụ này.
 
 ```sh
 export DEVICE_ID='019c2f7e-7a1b-7c3d-8e9f-0123456789ab'
@@ -191,4 +191,4 @@ mosquitto_pub -h 127.0.0.1 -p 1883 \
   -m '{"event_id":"evt-001","values":{"temperature":27.5}}'
 ```
 
-For a command client, subscribe to `devices/$DEVICE_ID/commands`, execute the command, then publish the ACK with the same `command_id`.
+Với client command, subscribe `devices/$DEVICE_ID/commands`, thực thi command, rồi publish ACK với cùng `command_id`.

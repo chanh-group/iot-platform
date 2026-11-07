@@ -1,14 +1,11 @@
-# IoT Server dashboard
+# Dashboard IoT Server
 
-Client-only SolidJS SPA using same-origin HTTP and WebSocket APIs. Navigation is
-tab state only; reloading starts at Overview. No router, SSR, state library, or
-UI framework is used.
+SPA SolidJS chỉ chạy phía client, dùng HTTP và WebSocket API same-origin. Điều hướng chỉ là trạng thái tab; reload bắt đầu ở Overview. Không dùng router, SSR, state library hay UI framework.
 
-## Toolchain
+## Bộ công cụ
 
-- Bun 1.4.2 for install, test, and build.
-- SolidJS 1.9.18, `vite-plugin-solid` 2.11.15, Vite 8.3.5,
-  TypeScript 7.0.2, and uPlot 1.6.32 are exact-pinned.
+- Bun 1.4.2 cho install, test và build.
+- SolidJS 1.9.18, `vite-plugin-solid` 2.11.15, Vite 8.3.5, TypeScript 7.0.2 và uPlot 1.6.32 được pin chính xác.
 
 ```sh
 bun install --frozen-lockfile
@@ -17,15 +14,6 @@ bun run --bun test
 bun run --bun build
 ```
 
-Start the backend on `127.0.0.1:8080`, then run `bun run --bun dev`. Vite proxies
-`/api` without rewriting `Host` or `Origin`; cookies remain same-origin and the
-backend CSRF checks still apply. The frontend never persists session or device
-tokens in browser storage.
+Khởi động backend tại `127.0.0.1:8080`, rồi chạy `bun run --bun dev`. Vite proxy `/api` mà không rewrite `Host` hoặc `Origin`; cookie vẫn same-origin và CSRF check của backend vẫn áp dụng. Frontend không bao giờ lưu session hoặc device token trong browser storage.
 
-`bun test` runs API/request/chart/WebSocket regressions, a headless Chrome test
-with an in-memory API fixture, and `backend-ui.test.ts`, which builds and runs a
-temporary Rust server and drives the Solid app in Chrome against its HTTP API and
-MQTT broker. MQTT traffic uses the focused `examples/backend_ui_mqtt.rs` helper
-with `rumqttc`, not a browser-test packet implementation. The backend test requires
-Cargo and Chrome; set `CHROME_BIN` if Chrome is not on PATH. Both browser tests
-clean up their temporary server/profile.
+`bun test` chạy regression API/request/chart/WebSocket, một test Chrome headless với fixture API trong bộ nhớ, và `backend-ui.test.ts` — test này build và chạy server Rust tạm, rồi điều khiển ứng dụng Solid trong Chrome qua HTTP API và MQTT broker của server. Traffic MQTT dùng helper `examples/backend_ui_mqtt.rs` với `rumqttc`, không dùng implementation packet trong browser test. Test backend cần Cargo và Chrome; đặt `CHROME_BIN` nếu Chrome không có trong PATH. Cả hai browser test đều dọn server/profile tạm của chúng.

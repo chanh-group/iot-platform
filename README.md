@@ -67,7 +67,7 @@ curl http://127.0.0.1:8080/healthz
 curl http://127.0.0.1:8080/readyz
 ```
 
-`/healthz` kiểm tra process còn sống; `/readyz` kiểm tra readiness của database, MQTT, ingest và command dispatcher. Dừng server bằng Ctrl+C hoặc SIGTERM; xem [shutdown](docs/operations.md#shutdown-and-restart).
+`/healthz` kiểm tra process còn sống; `/readyz` kiểm tra readiness của database, MQTT, ingest và command dispatcher. Dừng server bằng Ctrl+C hoặc SIGTERM; xem [hướng dẫn vận hành](docs/operations.md).
 
 ## Bảo mật và dữ liệu
 
@@ -90,7 +90,7 @@ Integration test dùng SQLite và MQTT cục bộ; cần quyền tạo thư mụ
 
 - [Hướng dẫn vận hành](docs/operations.md)
 - [HTTP API](docs/api.md)
-- [MQTT guide](docs/mqtt.md)
+- [Hướng dẫn MQTT](docs/mqtt.md)
 - [Đặc tả sản phẩm](docs/SPEC.md)
 - [Stack và kiến trúc](docs/plans/01-stack-and-architecture.md)
 - [Contract MQTT, SQLite, HTTP và cấu hình](docs/plans/02-contracts.md)

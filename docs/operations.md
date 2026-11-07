@@ -1,17 +1,17 @@
-# Operations
+# Vận hành
 
-This is the operator guide for the SQLite MVP. The technical source of truth for behaviour is [02 — Contract kỹ thuật](plans/02-contracts.md); this document covers deployment, configuration, logging, shutdown, backup/restore, retention, monitoring, alerts and troubleshooting.
+Đây là hướng dẫn vận hành cho MVP SQLite. Nguồn sự thật kỹ thuật về hành vi là [02 — Contract kỹ thuật](plans/02-contracts.md); tài liệu này bao quát triển khai, cấu hình, log, shutdown, backup/restore, retention, monitoring, alert và troubleshooting.
 
-## Deploy with Docker Compose (SQLite)
+## Triển khai với Docker Compose (SQLite)
 
-Prerequisites:
+Điều kiện:
 
-- Docker Engine with Compose v2 on Linux x86_64. The image runs as UID/GID `10001`.
-- A local filesystem for `IOT_DATA_DIR`. SQLite WAL needs working POSIX locks; do not place the data directory on NFS, SMB, or another filesystem that does not provide reliable locks.
-- Free host ports (default `8080`/`1883`) or remapped `IOT_HTTP_PORT`/`IOT_MQTT_PORT`.
-- The data filesystem has room for the database, WAL, backups, and temporary restore copies.
+- Docker Engine với Compose v2 trên Linux x86_64. Image chạy với UID/GID `10001`.
+- Filesystem cục bộ cho `IOT_DATA_DIR`. SQLite WAL cần POSIX lock hoạt động đúng; không đặt thư mục dữ liệu trên NFS, SMB hoặc filesystem không cung cấp lock tin cậy.
+- Cổng host còn trống (mặc định `8080`/`1883`) hoặc đổi qua `IOT_HTTP_PORT`/`IOT_MQTT_PORT`.
+- Filesystem dữ liệu đủ chỗ cho database, WAL, backup và bản copy tạm khi restore.
 
-Build the local image and prepare the bind mount before the first start:
+Build image cục bộ và chuẩn bị bind mount trước lần khởi động đầu tiên:
 
 ```sh
 docker build -f deploy/Dockerfile -t iot-server:local .
@@ -19,18 +19,18 @@ cd deploy
 ./prepare-data.sh
 ```
 
-`prepare-data.sh` creates `deploy/data` owned by `10001:10001`. It refuses a non-empty directory owned by another user rather than changing ownership. Do not let Compose create the bind mount as root, and do not run `prepare-data.sh` over existing data without a backup.
+`prepare-data.sh` tạo `deploy/data` thuộc sở hữu `10001:10001`. Script từ chối thư mục không rỗng thuộc user khác thay vì đổi chủ sở hữu. Không để Compose tự tạo bind mount bằng root, và không chạy `prepare-data.sh` lên dữ liệu đang có mà chưa backup.
 
-Initialize the schema and the single admin while the server is stopped:
+Khởi tạo schema và admin duy nhất khi server đang dừng:
 
 ```sh
 docker compose -f compose.sqlite.yml run --rm iot-server migrate --config /app/conf.toml
 docker compose -f compose.sqlite.yml run --rm iot-server admin create --config /app/conf.toml
 ```
 
-`run` uses the same image, config and data volume but does not publish ports. `admin create` requires the migrated schema, prompts twice for the password (minimum 12 characters), and takes the exclusive data-directory lock, so no server may be running. There is no default admin.
+`run` dùng cùng image, config và data volume nhưng không publish port. `admin create` yêu cầu schema đã migrate, hỏi mật khẩu hai lần (tối thiểu 12 ký tự) và giữ lock độc quyền của data directory, nên không được có server đang chạy. Không có admin mặc định.
 
-Start and verify:
+Khởi động và kiểm tra:
 
 ```sh
 docker compose -f compose.sqlite.yml up -d
@@ -39,9 +39,9 @@ curl -fsS http://127.0.0.1:8080/healthz
 curl -fsS http://127.0.0.1:8080/readyz
 ```
 
-Both published ports bind to `127.0.0.1` in the sample Compose file. The sample config uses plaintext MQTT and `cookie_secure = false`; it is for localhost only. For a remote deployment, terminate HTTPS and MQTT TLS at a proxy, set `cookie_secure = true`, and do not publish plaintext MQTT to an untrusted network.
+Hai cổng publish trong file Compose mẫu chỉ bind vào `127.0.0.1`. Config mẫu dùng MQTT plaintext và `cookie_secure = false`; chỉ dành cho localhost. Với triển khai từ xa, phải terminate HTTPS và MQTT TLS ở proxy, đặt `cookie_secure = true`, và không publish MQTT plaintext ra mạng không tin cậy.
 
-Logs, restart and stop:
+Log, restart và stop:
 
 ```sh
 docker compose -f compose.sqlite.yml logs -f --tail=200 iot-server
@@ -50,75 +50,75 @@ docker compose -f compose.sqlite.yml stop iot-server
 docker compose -f compose.sqlite.yml down
 ```
 
-`down` keeps the bind-mounted data directory. Do not delete `deploy/data` to "reset" a deployment; use a backup and a deliberate restore instead.
+`down` giữ nguyên thư mục dữ liệu bind mount. Không xóa `deploy/data` để "reset" triển khai; hãy backup và restore có chủ đích.
 
-## Upgrade
+## Nâng cấp
 
-1. Create a backup and verify its checksums (see below).
-2. Build the new image with the same local tag.
-3. Run `docker compose -f compose.sqlite.yml up -d`; Compose recreates the container and the server applies pending migrations at startup.
-4. Check `/readyz`, the expected device/history through the API, and the runtime config revision.
+1. Tạo backup và kiểm tra checksum (xem bên dưới).
+2. Build image mới với cùng tag local.
+3. Chạy `docker compose -f compose.sqlite.yml up -d`; Compose tạo lại container và server áp dụng migration còn thiếu khi khởi động.
+4. Kiểm tra `/readyz`, device/history mong đợi qua API và revision runtime config.
 
-If startup fails, keep the old image and backup. Do not delete the database or WAL files to force a start.
+Nếu khởi động lỗi, giữ image cũ và backup. Không xóa database hoặc file WAL để ép server khởi động.
 
-## Configuration
+## Cấu hình
 
-The Compose deployment mounts `deploy/conf.docker.toml` read-only at `/app/conf.toml`. It binds the listeners to `0.0.0.0` inside the container and stores data under `/app/data`. The repository's [`conf.toml`](../conf.toml) is the complete local/default sample; field ranges and validation rules are in [02 §5](plans/02-contracts.md).
+Triển khai Compose mount `deploy/conf.docker.toml` read-only tại `/app/conf.toml`. File này bind listener vào `0.0.0.0` bên trong container và lưu dữ liệu dưới `/app/data`. [`conf.toml`](../conf.toml) ở repository là mẫu đầy đủ cho local/mặc định; range và quy tắc validate nằm trong [02 §5](plans/02-contracts.md).
 
-Compose variables:
+Biến Compose:
 
-| Variable | Default | Purpose |
+| Biến | Mặc định | Mục đích |
 | --- | --- | --- |
-| `IOT_HTTP_PORT` | `8080` | Host port for HTTP |
-| `IOT_MQTT_PORT` | `1883` | Host port for MQTT |
-| `IOT_DATA_DIR` | `./data` | Host bind-mount path, relative to `deploy/` |
-| `IOT_METRICS_TOKEN` | empty | Bearer token passed to the container; required only when metrics are enabled |
+| `IOT_HTTP_PORT` | `8080` | Cổng HTTP trên host |
+| `IOT_MQTT_PORT` | `1883` | Cổng MQTT trên host |
+| `IOT_DATA_DIR` | `./data` | Đường dẫn bind mount trên host, tương đối so với `deploy/` |
+| `IOT_METRICS_TOKEN` | rỗng | Bearer token truyền vào container; chỉ cần khi bật metrics |
 
-Edit `conf.docker.toml` and restart for fields that are not hot-reloadable. The only hot-reloadable settings are `logging.level`, `telemetry.retention_days`, `telemetry.batch_size`, and `telemetry.flush_interval_ms`. Update them through `PATCH /api/v1/config/runtime` (see the [API guide](api.md)); directly editing `runtime.toml` is only read at startup. All other config fields need a restart, and `conf.toml` is never watched.
+Sửa `conf.docker.toml` và restart với các field không hot-reload. Chỉ các setting sau hot-reload được: `logging.level`, `telemetry.retention_days`, `telemetry.batch_size` và `telemetry.flush_interval_ms`. Cập nhật chúng qua `PATCH /api/v1/config/runtime` (xem [hướng dẫn API](api.md)); sửa trực tiếp `runtime.toml` chỉ được đọc lúc khởi động. Mọi field config khác cần restart, và `conf.toml` không được watch.
 
-Relative paths in a config file resolve against the directory containing that file, not the process working directory. `server.data_dir` must contain the SQLite file and `runtime.settings_path`. `check` validates without creating files; `run`, `migrate`, and `admin create` create the data directory and take its lock.
+Đường dẫn tương đối trong file config resolve theo thư mục chứa file đó, không theo thư mục làm việc của process. `server.data_dir` phải chứa file SQLite và `runtime.settings_path`. `check` validate mà không tạo file; `run`, `migrate` và `admin create` tạo data directory và giữ lock của nó.
 
-## Logging
+## Log
 
-Logs go to stdout as JSON by default, so Docker captures them. Use:
+Log mặc định ra stdout dạng JSON, nên Docker thu lại. Dùng:
 
 ```sh
 docker compose -f compose.sqlite.yml logs -f --tail=200 iot-server
 ```
 
-Set `[logging] format = "text"` for human-readable local logs; `format` requires a restart. `logging.level` (`trace`, `debug`, `info`, `warn`, `error`) can be changed through the runtime config API without a restart. CLI and configuration errors are written to stderr. Tokens, passwords, payloads, and database URLs are not logged.
+Đặt `[logging] format = "text"` để log dễ đọc khi chạy local; `format` cần restart. `logging.level` (`trace`, `debug`, `info`, `warn`, `error`) đổi được qua runtime config API mà không cần restart. Lỗi CLI và cấu hình ghi ra stderr. Token, password, payload và database URL không được ghi log.
 
-## Shutdown and restart
+## Shutdown và restart
 
-The container receives `SIGTERM` on `docker compose stop`, `restart`, or `down`. The server stops accepting new HTTP requests and MQTT sessions, drains telemetry and application ACKs within `server.shutdown_timeout_ms` (default 10 000 ms), then stops MQTT, HTTP and the database. Compose allows a 20-second grace period.
+Container nhận `SIGTERM` khi `docker compose stop`, `restart` hoặc `down`. Server ngừng nhận HTTP request và MQTT session mới, drain telemetry và application ACK trong `server.shutdown_timeout_ms` (mặc định 10 000 ms), rồi dừng MQTT, HTTP và database. Compose cho phép grace period 20 giây.
 
-- A second signal forces an immediate exit with status `1`.
-- If the drain deadline expires, the process logs the remaining work and exits nonzero. Do not ignore that exit; inspect the logs and verify data after restart.
-- Do not use `docker kill` or `kill -9` unless the process is already unresponsive; an unclean stop can leave a WAL that must be preserved for recovery.
+- Signal thứ hai buộc thoát ngay với exit code `1`.
+- Nếu hết deadline drain, process log phần việc còn lại và thoát nonzero. Không bỏ qua exit code đó; kiểm tra log và xác minh dữ liệu sau khi restart.
+- Không dùng `docker kill` hoặc `kill -9` trừ khi process đã không phản hồi; shutdown không sạch có thể để lại WAL cần giữ nguyên để phục hồi.
 
-After an unclean stop, preserve the whole data directory before attempting repair, then run `PRAGMA integrity_check` on a stopped copy.
+Sau shutdown không sạch, giữ nguyên toàn bộ data directory trước khi sửa, rồi chạy `PRAGMA integrity_check` trên bản copy đã dừng.
 
-## SQLite backup and restore
+## Backup và restore SQLite
 
-From the `deploy/` directory, create a backup while Compose is running:
+Từ thư mục `deploy/`, tạo backup khi Compose đang chạy:
 
 ```sh
 ./backup.sh /path/to/backups/iot-2026-11-06
 ```
 
-Run it with the same Compose project identity used to start the service. For example, if it was started with `docker compose -p field-gateway ...`, set `COMPOSE_PROJECT_NAME=field-gateway` for the backup command; if the name is missing or wrong, the script refuses to copy.
+Chạy với đúng Compose project identity đã dùng để khởi động service. Ví dụ, nếu service được start bằng `docker compose -p field-gateway ...`, đặt `COMPOSE_PROJECT_NAME=field-gateway` cho lệnh backup; nếu tên thiếu hoặc sai, script từ chối copy.
 
-The script uses the current Compose project (`COMPOSE_PROJECT_NAME` if set), refuses to proceed if that project has no `iot-server` container or the container's `/app/data` mount does not match `IOT_DATA_DIR`, sends SIGTERM and waits for the configured 20-second grace period, and verifies the container is stopped. It then uses the runtime image as root to read the UID/GID 10001 data mount. A nonblocking exclusive lock on `/data/.lock` is held through copying `iot.db`, any remaining `-wal`/`-shm`, and `runtime.toml`; if another app process has the lock, backup fails. This protects against both a mismatched Compose project and the service restarting while files are copied.
+Script dùng Compose project hiện tại (`COMPOSE_PROJECT_NAME` nếu có), từ chối chạy nếu project không có container `iot-server` hoặc mount `/app/data` của container không khớp `IOT_DATA_DIR`, gửi SIGTERM và đợi grace period 20 giây đã cấu hình, rồi xác nhận container đã dừng. Sau đó script dùng runtime image với quyền root để đọc data mount UID/GID 10001. Một lock độc quyền nonblocking trên `/data/.lock` được giữ trong suốt thời gian copy `iot.db`, các file `-wal`/`-shm` còn lại và `runtime.toml`; nếu process app khác đang giữ lock, backup thất bại. Điều này bảo vệ cả trường hợp sai Compose project và trường hợp service tự restart trong lúc copy file.
 
-The new backup directory is mode `0700`, and artifacts including `SHA256SUMS` are mode `0600`, owned by the invoking host user. Any copy/checksum failure aborts and removes the staging directory rather than publishing a partial backup. The script refuses to overwrite an existing backup. The service remains stopped; from `deploy/`, restart it with:
+Thư mục backup mới có mode `0700`; các artifact gồm `SHA256SUMS` có mode `0600`, thuộc user host đang chạy. Mọi lỗi copy/checksum đều abort và xóa staging directory thay vì publish backup dở. Script từ chối ghi đè backup đã tồn tại. Service vẫn dừng sau backup; từ `deploy/`, khởi động lại bằng:
 
 ```sh
 docker compose -f compose.sqlite.yml up -d
 ```
 
-**Never copy only `iot.db` while the application is running in WAL mode.** Recent committed transactions may still be in `iot.db-wal`; a standalone database copy can silently omit them. Either stop the app as above or use SQLite's online backup API from a SQLite-aware tool.
+**Không bao giờ chỉ copy `iot.db` khi ứng dụng đang chạy ở WAL mode.** Transaction đã commit gần đây có thể còn trong `iot.db-wal`; bản copy database đơn lẻ có thể bỏ mất chúng mà không báo lỗi. Hoặc dừng app như trên, hoặc dùng SQLite online backup API từ công cụ hiểu SQLite.
 
-Verify and restore to a fresh data directory:
+Verify và restore vào data directory mới:
 
 ```sh
 cd /path/to/backups/iot-2026-11-06
@@ -134,37 +134,37 @@ done
 if [ -f /path/to/backups/iot-2026-11-06/runtime.toml ]; then cp /path/to/backups/iot-2026-11-06/runtime.toml restore-data/; fi
 ```
 
-Give the restored files to the container's non-root UID/GID, then start against that directory:
+Gán file đã restore cho UID/GID non-root của container, rồi start với thư mục đó:
 
 ```sh
 sudo chown -R 10001:10001 restore-data
 IOT_DATA_DIR="$PWD/restore-data" docker compose -f compose.sqlite.yml up -d
 ```
 
-Do not run `prepare-data.sh` on a non-empty directory owned by another user. Verify `/readyz`, the expected device/history through the authenticated API, and the runtime config revision. Keep the original backup unchanged until verification is complete.
+Không chạy `prepare-data.sh` trên thư mục không rỗng thuộc user khác. Kiểm tra `/readyz`, device/history mong đợi qua API đã xác thực và revision runtime config. Giữ nguyên backup gốc cho đến khi verify xong.
 
-## Retention and disk sizing
+## Retention và tính dung lượng đĩa
 
-Telemetry retention is controlled by `telemetry.retention_days` (1–3 650, default 30). A sweep runs at startup and then hourly, deleting rows with `received_at < now - retention_days` in batches of 5 000. The setting is hot-reloadable. Commands (including expired ones), audit events, the latest attributes, and revoked credentials are kept indefinitely.
+Retention telemetry do `telemetry.retention_days` điều khiển (1–3 650, mặc định 30). Một lượt sweep chạy lúc khởi động và sau đó mỗi giờ, xóa các row có `received_at < now - retention_days` theo batch 5 000. Setting này hot-reload được. Command (kể cả expired), audit event, attribute mới nhất và credential đã revoke được giữ vô thời hạn.
 
-Deleting telemetry does not automatically shrink the SQLite file. WAL checkpoints reuse pages over time; run `VACUUM` only on a stopped database, after a verified backup, and allow free space for a temporary copy. Do not delete `-wal` or `-shm` files while the process is running.
+Xóa telemetry không tự động thu nhỏ file SQLite. WAL checkpoint tái sử dụng page theo thời gian; chỉ chạy `VACUUM` trên database đã dừng, sau khi có backup đã verify, và phải còn đủ chỗ cho bản copy tạm. Không xóa file `-wal` hoặc `-shm` khi process đang chạy.
 
-The measured baseline grew about 22.7 MB per minute at 1 000 publish requests/s. That is roughly 32.7 GB per day at the same offered rate, but do not extrapolate it linearly for 30 days: retention and page reuse change the long-term size. Use it as an initial upper bound, monitor `du -h deploy/data/iot.db*`, and re-measure on the deployment hardware and actual rate. Size the data filesystem for retention plus backups and a restore copy, and alert when free space is at or below 20% (80% used).
+Baseline đã đo tăng khoảng 22,7 MB mỗi phút ở 1 000 publish request/s. Con số này xấp xỉ 32,7 GB mỗi ngày với cùng tốc độ offered, nhưng không ngoại suy tuyến tính cho 30 ngày: retention và tái sử dụng page làm thay đổi kích thước dài hạn. Dùng nó làm cận trên ban đầu, monitor `du -h deploy/data/iot.db*` và đo lại trên phần cứng/tốc độ thật. Tính dung lượng data filesystem cho retention, backup và bản copy restore; alert khi dung lượng trống còn từ 20% trở xuống (đã dùng 80%).
 
-## WAL and disk monitoring
+## WAL và monitoring dung lượng
 
-SQLite uses WAL with `synchronous=FULL` and automatic checkpoints. The `-wal` and `-shm` files are normal while the server is running; their presence alone is not a failure. Do not delete or rename them under a running process. Monitor `df -h` for the data filesystem (alert at 80%), `du -h deploy/data/iot.db*` for database/WAL growth, `/readyz` for readiness, and backup job exit status plus checksum verification. Monitor backup destination space separately. Disk exhaustion degrades readiness and causes telemetry writes to be retried/rejected rather than acknowledged as stored.
+SQLite dùng WAL với `synchronous=FULL` và checkpoint tự động. File `-wal` và `-shm` là bình thường khi server chạy; chỉ có chúng không phải là lỗi. Không xóa hoặc đổi tên chúng khi process đang chạy. Monitor `df -h` cho data filesystem (alert khi đã dùng 80%), `du -h deploy/data/iot.db*` cho tăng trưởng database/WAL, `/readyz` cho readiness, và exit code/checksum của backup job. Monitor dung lượng đích backup riêng. Cạn đĩa làm giảm readiness và khiến telemetry được retry/reject thay vì ACK là đã lưu.
 
 ## Monitoring
 
-Use these checks together:
+Dùng các check sau cùng nhau:
 
-- `/healthz` answers when the process is alive; it does not check the database.
-- `/readyz` returns `503` with per-component status when the database, MQTT listener, ingest worker, or command dispatcher is unhealthy.
-- `/api/v1/overview` provides device, telemetry, command, ingest, and storage counters for the dashboard.
-- `/metrics` exports Prometheus metrics when explicitly enabled.
+- `/healthz` trả lời khi process còn sống; không kiểm tra database.
+- `/readyz` trả `503` kèm trạng thái từng thành phần khi database, MQTT listener, ingest worker hoặc command dispatcher không khỏe.
+- `/api/v1/overview` cung cấp counter device, telemetry, command, ingest và storage cho dashboard.
+- `/metrics` export Prometheus metric khi được bật rõ ràng.
 
-Enable metrics in `deploy/conf.docker.toml`:
+Bật metrics trong `deploy/conf.docker.toml`:
 
 ```toml
 [http]
@@ -172,20 +172,20 @@ metrics = true
 metrics_bearer_token_env = "IOT_METRICS_TOKEN"
 ```
 
-Provide `IOT_METRICS_TOKEN` (at least 32 bytes) through Compose or a secret manager, then scrape with:
+Cung cấp `IOT_METRICS_TOKEN` (tối thiểu 32 byte) qua Compose hoặc secret manager, rồi scrape bằng:
 
 ```sh
 curl -fsS -H "Authorization: Bearer $IOT_METRICS_TOKEN" \
   http://127.0.0.1:8080/metrics
 ```
 
-Never expose `/metrics` publicly. The endpoint rejects the admin cookie and requires the Bearer token. Metric names and semantics are in [02 §4.7](plans/02-contracts.md); the most useful groups are MQTT connections/kick failures, ingest accepted/rejected by reason, queue depth, commit latency/errors, application ACK drops, command pending/expired/errors, WebSocket clients/drops, audit errors, retention errors, and backup freshness.
+Không bao giờ expose `/metrics` công khai. Endpoint từ chối cookie admin và yêu cầu Bearer token. Tên metric và ngữ nghĩa nằm trong [02 §4.7](plans/02-contracts.md); các nhóm hữu ích nhất là MQTT connection/kick failure, ingest accepted/rejected theo reason, queue depth, commit latency/error, application ACK drop, command pending/expired/error, WebSocket client/drop, audit error, retention error và backup freshness.
 
 ## Alert rules
 
-`deploy/alerts/prometheus.rules.yml` contains Prometheus rules for the metrics scrape, `/readyz` result and probe availability (scrape down or `probe_success` missing), data filesystem, telemetry queue saturation, ingest rejections, dropped application ACKs, SQLite commit errors, and failed/stale backups. The example assumes Prometheus scrapes `/metrics` as `job="iot-server"`, a Blackbox Exporter probes `/readyz` as `job="iot-server-readyz"`, and Node Exporter reports the data filesystem at `mountpoint="/var/lib/iot-server"`. Adjust that mountpoint matcher to the host filesystem containing `IOT_DATA_DIR`; keep the scrape/probe job labels consistent with the rules.
+`deploy/alerts/prometheus.rules.yml` chứa Prometheus rule cho metrics scrape, kết quả `/readyz` và probe availability (scrape down hoặc thiếu `probe_success`), data filesystem, telemetry queue saturation, ingest rejection, application ACK bị drop, SQLite commit error, backup thất bại/quá cũ. Ví dụ giả định Prometheus scrape `/metrics` với `job="iot-server"`, Blackbox Exporter probe `/readyz` với `job="iot-server-readyz"`, và Node Exporter báo data filesystem tại `mountpoint="/var/lib/iot-server"`. Chỉnh matcher mountpoint cho filesystem host chứa `IOT_DATA_DIR`; giữ label scrape/probe khớp với rule.
 
-To alert on backup freshness, enable Node Exporter's textfile collector and run backups with its existing collector directory, for example:
+Để alert backup freshness, bật textfile collector của Node Exporter và chạy backup với thư mục collector hiện có, ví dụ:
 
 ```sh
 cd deploy
@@ -193,56 +193,56 @@ IOT_BACKUP_METRICS_DIR=/var/lib/node_exporter/textfile_collector \
   ./backup.sh /path/to/backups/iot-2026-11-06
 ```
 
-Every valid backup run atomically updates `iot_backup_last_attempt_timestamp_seconds` and `iot_backup_last_attempt_success`; `IotBackupFailed` alerts when the latest result failed or its status metric is missing, while `iot_backup_last_success_timestamp_seconds` remains unchanged until a backup succeeds. `IotBackupMissing` also alerts if no success has been recorded in 24 hours. Ensure the textfile collector directory is writable by the backup operator. Schedule backups more frequently than the freshness threshold and monitor backup destination capacity separately. Check rule syntax and firing/clearing cases with `sh tests/alerts.sh` (requires Docker; uses Prometheus `promtool`).
+Mỗi lần backup hợp lệ cập nhật atomic `iot_backup_last_attempt_timestamp_seconds` và `iot_backup_last_attempt_success`; `IotBackupFailed` alert khi kết quả gần nhất thất bại hoặc thiếu metric trạng thái, trong khi `iot_backup_last_success_timestamp_seconds` không đổi cho đến khi có backup thành công. `IotBackupMissing` cũng alert nếu 24 giờ không ghi nhận thành công. Đảm bảo thư mục textfile collector ghi được bởi user chạy backup. Lên lịch backup thường xuyên hơn ngưỡng freshness và monitor dung lượng đích backup riêng. Kiểm tra cú pháp rule và case firing/clearing bằng `sh tests/alerts.sh` (cần Docker; dùng Prometheus `promtool`).
 
-If updating the textfile fails, the script warns but retains the backup's exit status; the previous metric can remain stale. Monitor scheduler exit status and script stderr independently, including collector write failures.
+Nếu cập nhật textfile lỗi, script cảnh báo nhưng giữ exit status của backup; metric trước đó có thể bị stale. Monitor exit status của scheduler và stderr của script riêng, kể cả lỗi ghi collector.
 
 ### Runbook
 
-| Alert | First checks and action |
+| Alert | Kiểm tra và hành động đầu tiên |
 | --- | --- |
-| `IotServerUnavailable` | Confirm the container/process is running and the metrics port/token are correct. Check `docker compose ps` and `logs`. If the process is down, preserve data and restart; investigate the last error before repeating. |
-| `IotServerNotReady` | Fetch `/readyz` and note which check fails. Check disk space, recent commit errors, MQTT listener state, and command dispatcher errors. Do not restart repeatedly without preserving logs and data. |
-| `IotReadinessProbeUnavailable` | Check the Blackbox Exporter target, network path, and `probe_success` scrape. This can fire even when the application is healthy. |
-| `IotDataDiskLow` | Free space or expand the data filesystem. Do not delete WAL/SHM. Reduce retention only after understanding the data requirement; verify backups first. |
-| `IotTelemetryQueueSaturated` | Reduce offered load or fix the storage bottleneck. Check commit errors, disk latency, and `iot_telemetry_queue_depth`. Increasing `queue_capacity` requires a restart and only adds bounded buffer, not throughput. |
-| `IotTelemetryAckDropped` | The application ACK queue overflowed; devices must retry missing ACKs. Check load, ingest latency, and queue depth. The 1 000 requests/s baseline dropped about 48.8% of ACKs, so this is a real capacity signal at that rate. |
-| `IotIngestRejected` | Inspect `iot_ingest_rejected_total{reason}`. Validation errors are client bugs; `queue_full` is server saturation; `storage_unavailable` is a database/disk problem. Fix the source, not only the alert. |
-| `IotDatabaseCommitErrors` | Treat as critical: check disk space, filesystem health, SQLite locks, and logs. Readiness should be failing. Stop writes, preserve the data directory, verify integrity on a stopped copy, and restore a backup if needed. |
-| `IotBackupMissing` / `IotBackupFailed` | Check the scheduler, backup destination space, Compose project name, `IOT_DATA_DIR` match, and lock conflicts. Inspect stderr and the textfile collector; rerun a backup after fixing the cause. |
+| `IotServerUnavailable` | Xác nhận container/process đang chạy và metrics port/token đúng. Kiểm tra `docker compose ps` và log. Nếu process đã chết, giữ dữ liệu và restart; điều tra lỗi cuối cùng trước khi lặp lại. |
+| `IotServerNotReady` | Gọi `/readyz` và xác định check nào fail. Kiểm tra dung lượng đĩa, commit error gần đây, trạng thái MQTT listener và lỗi command dispatcher. Không restart lặp lại mà không giữ log/dữ liệu. |
+| `IotReadinessProbeUnavailable` | Kiểm tra target Blackbox Exporter, đường mạng và scrape `probe_success`. Alert này có thể fire dù ứng dụng khỏe. |
+| `IotDataDiskLow` | Giải phóng dung lượng hoặc mở rộng data filesystem. Không xóa WAL/SHM. Chỉ giảm retention sau khi hiểu yêu cầu dữ liệu; verify backup trước. |
+| `IotTelemetryQueueSaturated` | Giảm offered load hoặc sửa nghẽn storage. Kiểm tra commit error, độ trễ đĩa và `iot_telemetry_queue_depth`. Tăng `queue_capacity` cần restart và chỉ thêm buffer có giới hạn, không tăng throughput. |
+| `IotTelemetryAckDropped` | Application ACK queue tràn; device phải retry các ACK bị mất. Kiểm tra tải, ingest latency và queue depth. Baseline 1 000 request/s drop khoảng 48,8% ACK, nên đây là tín hiệu capacity thật ở tốc độ đó. |
+| `IotIngestRejected` | Xem `iot_ingest_rejected_total{reason}`. Lỗi validation là bug client; `queue_full` là server quá tải; `storage_unavailable` là lỗi database/đĩa. Sửa nguyên nhân, không chỉ sửa alert. |
+| `IotDatabaseCommitErrors` | Coi là critical: kiểm tra dung lượng đĩa, sức khỏe filesystem, SQLite lock và log. Readiness phải đang fail. Dừng ghi, giữ data directory, verify integrity trên bản copy đã dừng và restore backup nếu cần. |
+| `IotBackupMissing` / `IotBackupFailed` | Kiểm tra scheduler, dung lượng đích backup, tên Compose project, khớp `IOT_DATA_DIR` và lock conflict. Xem stderr và textfile collector; chạy lại backup sau khi sửa nguyên nhân. |
 
 ## Troubleshooting
 
-CLI exit codes:
+Exit code CLI:
 
-| Exit | Meaning |
+| Exit | Ý nghĩa |
 | ---: | --- |
-| `0` | Command completed successfully |
-| `1` | Runtime failure, including database errors in `admin create`, or shutdown deadline exceeded |
-| `2` | Invalid CLI usage |
-| `3` | Configuration or environment validation failed |
-| `4` | Database open/create or migration failed (`run`/`migrate`) |
-| `5` | Data-directory lock is held |
-| `6` | An admin already exists |
+| `0` | Lệnh thành công |
+| `1` | Lỗi runtime, gồm lỗi database trong `admin create`, hoặc vượt shutdown deadline |
+| `2` | Dùng CLI sai |
+| `3` | Validate cấu hình hoặc environment thất bại |
+| `4` | Mở/tạo database hoặc migration thất bại (`run`/`migrate`) |
+| `5` | Data-directory lock đang bị giữ |
+| `6` | Admin đã tồn tại |
 
-**Lock conflict (exit 5).** Another `run`, `migrate`, or `admin create` holds `<data_dir>/.lock`. Stop the other process or container; the lock is released when that process exits. Deleting `.lock` does not release a lock held by another process and can hide the real conflict. If the container is gone, verify no host process is using the same data directory.
+**Lock conflict (exit 5).** Một process `run`, `migrate` hoặc `admin create` khác đang giữ `<data_dir>/.lock`. Dừng process/container kia; lock được nhả khi process đó thoát. Xóa `.lock` không nhả lock đang bị process khác giữ và có thể che mất conflict thật. Nếu container đã biến mất, xác minh không có process host nào dùng cùng data directory.
 
-**Migration or database failure (exit 4).** Run `iot-server check` first, then inspect permissions and free space on the data filesystem. The database path must be inside `data_dir`. Do not delete the database to retry. Preserve the full directory, run `PRAGMA integrity_check` on a stopped copy, and restore a verified backup if the database is damaged. `admin create` does not migrate; run `migrate` first. A schema/database error in `admin create` is reported as exit `1`, not `4`.
+**Migration hoặc database failure (exit 4).** Chạy `iot-server check` trước, rồi kiểm tra quyền và dung lượng trống trên data filesystem. Đường dẫn database phải nằm trong `data_dir`. Không xóa database để thử lại. Giữ nguyên toàn bộ thư mục, chạy `PRAGMA integrity_check` trên bản copy đã dừng, và restore backup đã verify nếu database hỏng. `admin create` không migrate; chạy `migrate` trước. Lỗi schema/database trong `admin create` trả exit `1`, không phải `4`.
 
-**Admin already exists (exit 6).** The MVP allows exactly one admin. Use the existing account; there is no reset-password CLI. If the credential is lost, recover from a backup or perform a controlled database intervention after preserving the current database.
+**Admin đã tồn tại (exit 6).** MVP cho phép đúng một admin. Dùng tài khoản hiện có; không có CLI reset password. Nếu mất credential, phục hồi từ backup hoặc can thiệp database có kiểm soát sau khi giữ bản database hiện tại.
 
-**Configuration error (exit 3).** The error names the failing path. Check unknown fields, invalid ranges, `allow_anonymous = true`, a missing `url_env`, a metrics token shorter than 32 bytes, or a path outside `data_dir`. `check` does not create the data directory or database.
+**Configuration error (exit 3).** Lỗi nêu path bị sai. Kiểm tra field lạ, range không hợp lệ, `allow_anonymous = true`, thiếu `url_env`, metrics token ngắn hơn 32 byte, hoặc path nằm ngoài `data_dir`. `check` không tạo data directory hoặc database.
 
-**Disk full.** Readiness drops, commits fail, and telemetry is retried or rejected; the server must not acknowledge data as stored. Free space or expand the filesystem, check backup destination usage, and only then let retries continue. Do not delete WAL/SHM files under a running process. After recovery, verify integrity and that `/readyz` is green.
+**Disk full.** Readiness giảm, commit fail, telemetry được retry hoặc reject; server không được ACK là đã lưu. Giải phóng hoặc mở rộng filesystem, kiểm tra dung lượng đích backup, rồi mới để retry tiếp tục. Không xóa WAL/SHM khi process đang chạy. Sau khi phục hồi, verify integrity và `/readyz` xanh trở lại.
 
-**Database errors or suspected corruption.** Stop the service, preserve the complete data directory, and run `PRAGMA integrity_check` on a copy. Restore a backup into a fresh directory if repair is not safe. Keep the original untouched until verification succeeds.
+**Database lỗi hoặc nghi hỏng.** Dừng service, giữ nguyên toàn bộ data directory, chạy `PRAGMA integrity_check` trên bản copy. Restore backup vào thư mục mới nếu không thể sửa an toàn. Giữ nguyên bản gốc cho đến khi verify thành công.
 
-**MQTT connection refused.** Confirm the client uses MQTT 3.1.1, `username = device_id`, `client_id = device_id`, and the current token. `0x04` covers wrong credentials, unknown/disabled devices, and ID mismatch; `0x05`/`0x87` mean the protocol version is wrong. Rotating or disabling a device kicks its existing session. Check the connection cap and listener address.
+**MQTT connection bị từ chối.** Xác nhận client dùng MQTT 3.1.1, `username = device_id`, `client_id = device_id` và token hiện tại. `0x04` bao gồm credential sai, device không tồn tại/đã disable và ID không khớp; `0x05`/`0x87` nghĩa là sai protocol version. Rotate hoặc disable device sẽ kick session đang mở. Kiểm tra connection cap và địa chỉ listener.
 
-**MQTT publish disconnects or times out.** A denied publish closes the connection without a PUBACK. Check the topic prefix, wildcard use, retained flag, topic levels, and packet size. A SUBACK `0x80` means the subscription filter is not allowed. Exceeding retained caps also closes the connection.
+**MQTT publish bị disconnect hoặc timeout.** Publish bị ACL từ chối sẽ đóng connection mà không có PUBACK. Kiểm tra prefix topic, wildcard, retained flag, số level topic và packet size. SUBACK `0x80` nghĩa là filter subscription không được phép. Vượt retained cap cũng đóng connection.
 
-**Login fails or loops.** `401 invalid_credentials` means the admin does not exist or the password is wrong; `429 rate_limited` means wait for `Retry-After`. If `cookie_secure = true` but the browser uses HTTP, the cookie is not sent; use HTTPS or set it to `false` only for local HTTP.
+**Login fail hoặc lặp.** `401 invalid_credentials` nghĩa là admin không tồn tại hoặc sai mật khẩu; `429 rate_limited` nghĩa là phải đợi `Retry-After`. Nếu `cookie_secure = true` nhưng browser dùng HTTP, cookie không được gửi; dùng HTTPS hoặc chỉ đặt `false` cho HTTP local.
 
-**Dashboard returns 404.** Check `http.dashboard`; when false, `/` and assets are intentionally unavailable while the API still works. In a debug build, a missing `web/dist` returns a build-instruction page; release builds require the embedded assets.
+**Dashboard trả 404.** Kiểm tra `http.dashboard`; khi false, `/` và asset chủ động không khả dụng trong khi API vẫn chạy. Với debug build, thiếu `web/dist` trả trang hướng dẫn build; release build yêu cầu asset nhúng.
 
-After an unclean stop or suspected storage issue, preserve a copy of the complete data directory before repair, then use SQLite integrity checks on a stopped copy (for example `sqlite3 iot.db 'PRAGMA integrity_check;'`). A healthy database returns `ok`.
+Sau shutdown không sạch hoặc nghi lỗi storage, giữ một bản copy của toàn bộ data directory trước khi sửa, rồi dùng SQLite integrity check trên bản copy đã dừng (ví dụ `sqlite3 iot.db 'PRAGMA integrity_check;'`). Database khỏe trả `ok`.

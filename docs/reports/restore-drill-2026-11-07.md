@@ -1,9 +1,9 @@
-# SQLite backup/restore drill — 2026-11-07
+# Diễn tập backup/restore SQLite — 2026-11-07
 
-Command: `cargo test --locked --test backup_restore -- --nocapture` — PASS.
+Lệnh: `cargo test --locked --test backup_restore -- --nocapture` — PASS.
 
-The integration test seeds an admin, device, telemetry event, and runtime revision, stops the source app, and runs `deploy/backup.sh`. Its fake Docker adapter substitutes only Compose/Engine control; the script's actual shell copy, lock, file mode, checksum, and publication steps run against the fixture data directory. An injected partial copy failure reports `iot_backup_last_attempt_success 0` without publishing a backup; a later success changes it to 1, and a subsequent failure resets it to 0 while preserving the last-success timestamp.
+Integration test seed admin, device, một telemetry event và runtime revision, dừng app nguồn, rồi chạy `deploy/backup.sh`. Fake Docker adapter của test chỉ thay thế điều khiển Compose/Engine; các bước shell copy, lock, file mode, checksum và publish thật của script chạy trên data directory fixture. Một lỗi copy dở được inject báo `iot_backup_last_attempt_success 0` mà không publish backup; lần thành công sau đổi thành 1, và lần thất bại tiếp theo đặt lại 0 trong khi giữ timestamp thành công cuối.
 
-For the restore drill, the test verifies the checksum of the successful script output, corrupts the destination `iot.db`, replaces it from that backup output (including present sidecars and `runtime.toml`), then starts the server from the restored data. Admin login, the seeded device, telemetry history event, and runtime revision 1 all verify through HTTP APIs. The source backup is left intact.
+Với diễn tập restore, test verify checksum của output script thành công, làm hỏng `iot.db` đích, thay nó bằng output backup đó (gồm các sidecar hiện có và `runtime.toml`), rồi start server từ dữ liệu đã restore. Admin login, device đã seed, telemetry history event và runtime revision 1 đều được verify qua HTTP API. Backup nguồn được giữ nguyên.
 
-This is an automated artifact-level restore drill, not a second live Compose deployment restore. The real Docker backup permission/identity smoke remains covered separately by `tests/docker_smoke.sh`.
+Đây là diễn tập restore ở mức artifact tự động, không phải lần restore thứ hai trên một triển khai Compose đang chạy. Smoke test quyền/identity của backup Docker thật vẫn được bao phủ riêng bởi `tests/docker_smoke.sh`.
