@@ -1,0 +1,208 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches package versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          web_version=$(sed -n 's/^  "version": "\(.*\)",$/\1/p' web/package.json | head -n1)
+          test "$GITHUB_REF_NAME" = "v$cargo_version"
+          test "$GITHUB_REF_NAME" = "v$web_version"
+
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
+          restore-keys: ${{ runner.os }}-bun-
+
+      - name: Frontend typecheck, test and build
+        working-directory: web
+        run: |
+          bun install --frozen-lockfile
+          bun run --bun typecheck
+          bun run --bun test
+          bun run --bun build
+
+      - name: Rust format, lint, test and release build
+        run: |
+          cargo fmt --all --check
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all
+          cargo build --release --locked
+
+      - name: Install audit tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2,cargo-audit@0.22.2
+
+      - name: Dependency, license and advisory checks
+        run: |
+          cargo deny check
+          cargo audit
+
+      - name: Package Linux x86_64 artifact
+        run: |
+          mkdir -p dist
+          tar -C target/release -czf "dist/iot-server-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" iot-server
+
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@v0
+        with:
+          syft-version: v1.57.0
+
+      - name: Create source SBOM
+        run: |
+          syft scan dir:. \
+            --exclude './target/**' \
+            --exclude './web/node_modules/**' \
+            --exclude './web/dist/**' \
+            --exclude './data/**' \
+            --exclude './.git/**' \
+            -q -o spdx-json=dist/sbom-source.spdx.json
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Scan image and fail on fixable HIGH/CRITICAL
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          version: v0.76.2
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+
+      - name: Save full image vulnerability report
+        if: always()
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          version: v0.76.2
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          exit-code: "0"
+          format: json
+          output: dist/trivy-image.json
+
+      - name: Create image SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ github.token }}
+          format: spdx-json
+          output-file: dist/sbom-image.spdx.json
+          syft-version: v1.57.0
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Create checksums
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum \
+            iot-server-*.tar.gz \
+            sbom-source.spdx.json \
+            sbom-image.spdx.json \
+            trivy-image.json > SHA256SUMS)
+
+      - uses: sigstore/cosign-installer@v4.1.3
+        with:
+          cosign-release: v3.1.4
+
+      - name: Sign image, checksums and verify
+        shell: bash
+        env:
+          IMAGE_REF: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${{ github.ref_name }}
+          ISSUER: https://token.actions.githubusercontent.com
+        run: |
+          set -euo pipefail
+          cosign sign --yes "$IMAGE_REF"
+          cosign sign-blob --yes --bundle dist/SHA256SUMS.bundle dist/SHA256SUMS
+          cosign verify \
+            --certificate-identity "$IDENTITY" \
+            --certificate-oidc-issuer "$ISSUER" \
+            "$IMAGE_REF"
+          cosign verify-blob \
+            --bundle dist/SHA256SUMS.bundle \
+            --certificate-identity "$IDENTITY" \
+            --certificate-oidc-issuer "$ISSUER" \
+            dist/SHA256SUMS
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/iot-server-*.tar.gz
+            dist/SHA256SUMS
+            dist/SHA256SUMS.bundle
+            dist/sbom-source.spdx.json
+            dist/sbom-image.spdx.json
+            dist/trivy-image.json

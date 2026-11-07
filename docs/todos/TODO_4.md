@@ -161,7 +161,7 @@ Nguồn sự thật:
 
 ## 12. Release checklist, SBOM và scan — P4-12
 
-- [ ] Tạo `docs/release-checklist.md` với các bước:
+- [x] Tạo `docs/release-checklist.md` với các bước:
   1. Baseline: `cargo fmt --check`, `clippy -D warnings`, `cargo test --all`, frontend typecheck/test/build, `cargo build --release --locked`.
   2. `cargo deny check`; `cargo audit`; không có advisory critical/high chưa có exception còn hạn.
   3. Docker build; smoke image.
@@ -172,9 +172,9 @@ Nguồn sự thật:
   8. Quét dependency/OS image (`trivy` hoặc tương đương); không có critical/high unmitigated.
   9. Ký image và tạo provenance (cosign hoặc tương đương).
   10. Tag semver, push image, tạo release artifact.
-- [ ] Implement CI workflow release (GitHub Actions hoặc tương đương) chạy khi tag semver: build, test, SBOM, scan, sign, publish image và artifact Linux x86_64.
-- [ ] Không có item TODO/P0/P1 trong `src/` khi release; backlog chỉ chứa mục sau MVP.
-- [ ] Evidence: `docs/release-checklist.md` commit; CI workflow file commit; ít nhất một dry-run (không push thật) pass.
+- [x] Implement CI workflow release (GitHub Actions hoặc tương đương) chạy khi tag semver: build, test, SBOM, scan, sign, publish image và artifact Linux x86_64. Workflow `.github/workflows/release.yml` xác minh tag khớp `Cargo.toml`/`web/package.json`, chạy frontend + Rust gate, `cargo deny`/`cargo audit`, push GHCR với provenance/SBOM attestation, tạo SBOM source/image, Trivy gate fixable HIGH/CRITICAL, ký keyless bằng cosign, verify, và tạo GitHub Release kèm binary/SBOM/scan/checksum.
+- [x] Không có item TODO/P0/P1 trong `src/` khi release; backlog chỉ chứa mục sau MVP. `grep -rnE 'TODO|FIXME|P0|P1' src/` không có kết quả; backlog Phase 5 nằm trong `docs/plans/03-delivery-plan.md §8`.
+- [x] Evidence 2026-11-07T10:25:09+07:00–10:27:08+07:00: `deploy/release-dry-run.sh` PASS, không push registry/tag/release. 265 test pass, 0 fail; frontend typecheck/test/build pass; `cargo deny check` advisories/bans/licenses/sources ok; `cargo audit` 0 vulnerability (2 unmaintained warning transitive qua `rmqtt` đã ghi exception trong checklist); Docker image `iot-server:dry-run` build, UID 10001, `--version` = `iot-server 0.1.0`; Trivy gate 0 fixable HIGH/CRITICAL, full report 45 HIGH + 1 CRITICAL không có bản vá; SBOM source 852 package, image 107 package; `SHA256SUMS` được ký/verify bằng khóa cosign tạm; `actionlint` 1.7.12, `sh -n`, `git diff --check` PASS. Thay đổi kèm theo: `deny.toml` (`unmaintained = workspace`, license `CDLA-Permissive-2.0`, private crate ignore) và `Cargo.toml` `publish = false` để `cargo deny` sạch.
 
 ## 13. Kiểm tra cuối Phase 4
 

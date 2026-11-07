@@ -96,5 +96,6 @@ Integration test dùng SQLite và MQTT cục bộ; cần quyền tạo thư mụ
 - [Contract MQTT, SQLite, HTTP và cấu hình](docs/plans/02-contracts.md)
 - [Kế hoạch giao hàng](docs/plans/03-delivery-plan.md)
 - [Baseline tải 2026-11-07](docs/reports/load-baseline-2026-11-07.md)
+- [Checklist release](docs/release-checklist.md)
 - [Checklist Phase 4](docs/todos/TODO_4.md)
 - [Rust style guide](docs/RUST_STYLE_GUIDE.md)
