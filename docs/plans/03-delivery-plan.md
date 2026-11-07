@@ -270,7 +270,7 @@ GitHub Actions (hoặc CI tương đương), các job song song khi có thể:
 - Multi-stage:
   1. `oven/bun:1.4.2`: `bun install --frozen-lockfile && bun run --bun build`.
   2. `rust:1.98-bookworm`: copy web dist + source; `cargo build --release --locked`.
-  3. `debian:bookworm-slim`: `ca-certificates`, `curl` (healthcheck), user `iot` UID 10001.
+  3. `ubuntu:24.04`: `apt-get upgrade`, `ca-certificates`, `curl` (healthcheck), `util-linux`, user `iot` UID 10001.
 - Binary `/usr/local/bin/iot-server`; workdir `/app`; config `/app/conf.toml`; data `/app/data`.
 - `ENTRYPOINT ["/usr/local/bin/iot-server"]`; `CMD ["run", "--config", "/app/conf.toml"]`.
 - Không chạy root; không chứa source/target/node_modules.

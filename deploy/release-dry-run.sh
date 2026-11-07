@@ -9,6 +9,19 @@ tag="v$version"
 out=${OUT_DIR:-target/release-dry-run}
 image="iot-server:dry-run"
 
+# Never delete a caller-supplied path; require a fresh destination.
+case "$out" in
+    "" | "/")
+        echo "refusing unsafe OUT_DIR: '$out'" >&2
+        exit 2
+        ;;
+esac
+if [ -e "$out" ] || [ -L "$out" ]; then
+    echo "refusing to reuse existing OUT_DIR: $out" >&2
+    echo "remove it manually if you intend to replace it" >&2
+    exit 2
+fi
+
 step() {
     printf '\n== %s ==\n' "$*"
 }
@@ -20,13 +33,12 @@ need() {
     }
 }
 
-for tool in cargo bun docker syft trivy cosign; do
+for tool in cargo bun docker syft trivy cosign python3; do
     need "$tool"
 done
 cargo deny --version >/dev/null
 cargo audit --version >/dev/null
 
-rm -rf "$out"
 mkdir -p "$out"
 
 step "Frontend"
@@ -69,13 +81,13 @@ syft scan dir:. \
 step "Image SBOM"
 syft scan "$image" -q -o "spdx-json=$out/sbom-image.spdx.json"
 
-step "Image vulnerability gate (fixable HIGH/CRITICAL)"
-trivy image --quiet --scanners vuln --severity HIGH,CRITICAL \
-    --ignore-unfixed --exit-code 1 "$image"
-
-step "Full image vulnerability report"
+step "Image vulnerability report"
 trivy image --quiet --scanners vuln --severity HIGH,CRITICAL \
     --format json --output "$out/trivy-image.json" --exit-code 0 "$image"
+
+step "Image vulnerability gate (all HIGH/CRITICAL, approved exceptions only)"
+python3 deploy/check-trivy-report.py \
+    "$out/trivy-image.json" deploy/trivy-exceptions.json
 
 step "Artifact and checksums"
 tar -C target/release -czf "$out/iot-server-$tag-linux-x86_64.tar.gz" iot-server

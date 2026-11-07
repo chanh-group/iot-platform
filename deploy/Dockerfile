@@ -18,8 +18,10 @@ COPY migrations ./migrations
 COPY --from=web /web/dist ./web/dist
 RUN cargo build --release --locked
 
-FROM docker.io/library/debian:bookworm-slim AS runtime
-RUN apt-get update && apt-get install -y --no-install-recommends \
+FROM docker.io/library/ubuntu:24.04 AS runtime
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     util-linux \

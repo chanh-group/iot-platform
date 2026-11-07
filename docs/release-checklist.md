@@ -9,7 +9,8 @@ và [operations](operations.md).
 
 - Toolchain: Rust **1.98** (`rust-toolchain.toml`), Bun **1.4.2**, Docker Engine +
   Compose v2, `cargo-deny` **0.20.2**, `cargo-audit` **0.22.2**, `syft` **1.57.0**,
-  `trivy` **0.76.2**, `cosign` **3.1.4**.
+  `trivy` **0.76.2**, `cosign` **3.1.4**, Python 3 (chỉ stdlib, cho
+  `deploy/check-trivy-report.py`).
 - Cập nhật version ở `Cargo.toml` và `web/package.json`; tag phải là
   `v<major>.<minor>.<patch>` khớp cả hai file. Workflow release kiểm tra điều này.
 - Làm việc trên `main` đã xanh, `git status` sạch. Không tag từ nhánh chưa merge.
@@ -94,7 +95,7 @@ từng mục. Các test chính:
 | A04 | `tests/mqtt_acl.rs::subscribe_outside_own_prefix_is_refused_and_keeps_the_connection`, `::cross_device_publish_is_denied_not_routed_and_disconnects` |
 | A05 | `tests/telemetry_flow.rs::valid_telemetry_is_stored_with_server_timestamp_and_raw_hash` |
 | A06 | `tests/telemetry_flow.rs::byte_identical_retry_deduplicates_but_changed_bytes_conflict` |
-| A07 | `tests/telemetry_flow.rs::invalid_payload_is_not_persisted` |
+| A07 | `tests/telemetry_flow.rs::byte_identical_retry_deduplicates_but_changed_bytes_conflict` |
 | A08 | `tests/crash_recovery.rs::kill_before_commit_recovers_without_losing_or_duplicating_event`, `::kill_after_commit_before_ack_retries_as_duplicate`, `::kill_after_ack_preserves_telemetry_and_recovers_pending_command` |
 | A09 | `tests/storage_failure.rs::database_failure_never_publishes_stored_and_recovers`, `::sqlite_full_never_panics_or_publishes_stored_and_recovers`, `::saturated_ingest_queue_stays_bounded_and_exports_rejection_metric` |
 | A10 | `tests/command_offline.rs::offline_command_stays_in_sql_then_restart_recovery_publishes_same_id` |
@@ -153,33 +154,37 @@ SBOM phải được lưu cùng release; không chỉnh sửa sau khi ký.
 ## 8. Quét dependency và OS image
 
 ```sh
-trivy image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed \
-  --exit-code 1 iot-server:local
 trivy image --scanners vuln --severity HIGH,CRITICAL --format json \
   --output target/release-dry-run/trivy-image.json --exit-code 0 iot-server:local
+python3 deploy/check-trivy-report.py \
+  target/release-dry-run/trivy-image.json deploy/trivy-exceptions.json
 ```
 
-- Gate chặn HIGH/CRITICAL **có bản vá** (`--ignore-unfixed`).
-- Báo cáo đầy đủ `trivy-image.json` được lưu cùng release. Mọi CVE không có bản vá
-  phải được release owner review; nếu package nằm trên đường chạy thực tế hoặc có
-  khả năng khai thác, block release và ghi exception có owner/expiry.
-- Baseline dry-run 2026-11-07 trên Debian 12.15: 0 finding có bản vá; 46 finding
-  không có bản vá (45 HIGH, 1 CRITICAL) trong package nền. Đây là rủi ro đã biết,
-  không phải miễn trừ: review lại ở mỗi release và khi base image đổi.
+- Gate chặn **mọi** HIGH/CRITICAL; không dùng `--ignore-unfixed`.
+- Exception nằm trong `deploy/trivy-exceptions.json`. Mỗi entry phải có đủ
+  `id`, `package`, `owner`, `reason`, `mitigation`, `expires` (YYYY-MM-DD).
+  `deploy/check-trivy-report.py` từ chối entry thiếu field, trùng cặp
+  id/package, đã hết hạn, hoặc không khớp finding HIGH/CRITICAL hiện tại.
+- `trivy-image.json` là báo cáo đầy đủ, không áp exception, lưu cùng release.
+- Gate chỉ chấp nhận report image hợp lệ: `ArtifactType` là
+  `container_image`, có `ArtifactName`, `Metadata.OS.Family`, `Results` là
+  array không rỗng. Mỗi result phải có `Target`, `Class`, `Type`; phải có ít
+  nhất một result `Class: os-pkgs` với `Type` khớp `Metadata.OS.Family`. Mọi
+  result/finding phải đúng kiểu và finding HIGH/CRITICAL phải có
+  `VulnerabilityID` + `PkgName`. Report thiếu/sai cấu trúc bị từ chối, không
+  được coi là sạch.
+- Baseline dry-run 2026-11-07 trên Ubuntu 24.04 (sau `apt-get upgrade`):
+  0 finding HIGH/CRITICAL, `deploy/trivy-exceptions.json` rỗng.
 
 ## 9. Ký image và provenance
 
-Workflow release dùng GitHub OIDC keyless:
+Workflow release dùng GitHub OIDC keyless. Image được push tạm ở tag
+`staging-<commit-sha>`, quét, ký, **verify theo digest và verify checksum bundle
+trước khi promote**:
 
 ```sh
 cosign sign --yes "$IMAGE@$DIGEST"
 cosign sign-blob --yes --bundle dist/SHA256SUMS.bundle dist/SHA256SUMS
-```
-
-Docker build dùng `provenance: mode=max` và `sbom: true` để gắn provenance/SBOM
-attestation vào image. Xác minh sau khi ký:
-
-```sh
 cosign verify \
   --certificate-identity "https://github.com/chanh-group/iot-platform/.github/workflows/release.yml@refs/tags/$TAG" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
@@ -188,10 +193,28 @@ cosign verify-blob --bundle dist/SHA256SUMS.bundle \
   --certificate-identity "https://github.com/chanh-group/iot-platform/.github/workflows/release.yml@refs/tags/$TAG" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   dist/SHA256SUMS
+
+# Chỉ chạy sau khi verify pass.
+docker buildx imagetools create \
+  -t "$IMAGE:$VERSION" \
+  -t "$IMAGE:$MAJOR_MINOR" \
+  -t "$IMAGE:latest" \
+  "$IMAGE@$DIGEST"
+tag_digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{.Manifest.Digest}}')
+test "$tag_digest" = "$DIGEST"
+cosign verify \
+  --certificate-identity "https://github.com/chanh-group/iot-platform/.github/workflows/release.yml@refs/tags/$TAG" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  "$IMAGE:$VERSION"
 ```
 
-Dry-run cục bộ dùng khóa tạm và `cosign verify-blob --key`; khóa private bị xóa
-sau khi verify. Không dùng khóa dry-run cho release thật.
+`imagetools create` giữ nguyên digest, nên chữ ký theo digest áp dụng cho các tag
+đã promote. Docker build dùng `provenance: mode=max` và `sbom: true` để gắn
+provenance/SBOM attestation vào image. Nếu scan, ký hoặc verify trước promote
+thất bại, chỉ tag `staging-*` tồn tại; không có tag version, major/minor hay
+`latest` để người dùng pull nhầm. Dry-run cục bộ dùng khóa tạm và
+`cosign verify-blob --key`; khóa private bị xóa sau khi verify. Không dùng khóa
+dry-run cho release thật.
 
 ## 10. Tag, publish và artifact
 
@@ -204,13 +227,20 @@ Workflow `release` chạy khi tag `v*.*.*`:
 
 1. Kiểm tra tag khớp `Cargo.toml` và `web/package.json`.
 2. Build/test/audit như trên.
-3. Build và push image `ghcr.io/chanh-group/iot-platform` với tag semver + digest.
-4. Tạo SBOM, quét image, ký image và checksum.
+3. Build và push image ở tag staging `staging-<commit-sha>`; chưa tạo tag
+   version/major/minor/`latest`.
+4. Tạo SBOM, quét HIGH/CRITICAL, ký digest, verify chữ ký image + checksum
+   bundle, promote tag version/major-minor/`latest`, rồi verify tag trỏ đúng
+   digest đã ký.
 5. Tạo GitHub Release kèm:
    - `iot-server-<tag>-linux-x86_64.tar.gz`
    - `sbom-source.spdx.json`, `sbom-image.spdx.json`
    - `trivy-image.json`
    - `SHA256SUMS`, `SHA256SUMS.bundle`
+
+Nếu bước scan hoặc ký fail, workflow dừng trước khi promote và chỉ còn tag
+`staging-*`; không có tag phát hành để người dùng pull nhầm. Tag staging không
+phải bản phát hành và có thể được dọn định kỳ.
 
 Kiểm tra thủ công sau workflow:
 
@@ -234,7 +264,8 @@ PATH="$HOME/.cargo/bin:$PATH" deploy/release-dry-run.sh
 Script chạy baseline, audit, build release, build Docker image, tạo SBOM, quét
 Trivy, đóng gói artifact, tạo checksum và ký/verify bằng khóa cosign tạm trong
 `target/release-dry-run/`. Script không gọi registry, không tạo tag và không tạo
-GitHub Release. Ghi timestamp + danh sách artifact vào hồ sơ release.
+GitHub Release. Script từ chối chạy nếu `OUT_DIR` đã tồn tại; xóa thư mục cũ bằng
+tay nếu muốn chạy lại. Ghi timestamp + danh sách artifact vào hồ sơ release.
 
 ## 12. Hồ sơ release
 
@@ -245,4 +276,5 @@ GitHub Release. Ghi timestamp + danh sách artifact vào hồ sơ release.
 - Image digest, kết quả `cosign verify`.
 - Đường dẫn SBOM, báo cáo Trivy, checksum/signature.
 - Kết quả load baseline và restore drill.
-- Exception còn hiệu lực (nếu có) và ngày review tiếp theo.
+- Exception còn hiệu lực (nếu có) và ngày review tiếp theo; exception scan image
+  nằm trong `deploy/trivy-exceptions.json` và phải còn `expires`.
