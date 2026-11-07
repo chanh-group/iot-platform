@@ -3,7 +3,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import type { ServerWebSocket } from "bun";
 import { createServer } from "vite";
 import solid from "vite-plugin-solid";
-import { resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import type { Command, Device, LatestValue, TelemetryRow } from "../src/lib/models";
 
 interface DevtoolsTarget {
@@ -460,7 +461,7 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
   });
 
   const chromePath = process.env.CHROME_BIN ?? "google-chrome";
-  const profile = await mkdtemp("/tmp/opencode/iot-dashboard-smoke-");
+  const profile = await mkdtemp(join(tmpdir(), "iot-dashboard-smoke-"));
   let vite: Awaited<ReturnType<typeof createServer>> | undefined;
   let chrome: ReturnType<typeof Bun.spawn> | undefined;
   let devtools: WebSocket | undefined;

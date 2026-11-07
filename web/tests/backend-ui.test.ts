@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { createServer as createTcpServer } from "node:net";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Database } from "bun:sqlite";
 import { expect, it } from "bun:test";
@@ -262,7 +263,7 @@ class MqttDevice {
 
 it("drives the Solid dashboard against the Rust API and MQTT broker", async () => {
   const root = resolve(import.meta.dir, "../..");
-  const temp = await mkdtemp("/tmp/opencode/iot-dashboard-backend-");
+  const temp = await mkdtemp(join(tmpdir(), "iot-dashboard-backend-"));
   const profile = join(temp, "chrome-profile");
   const dataDir = join(temp, "data");
   const dbPath = join(dataDir, "iot.db");

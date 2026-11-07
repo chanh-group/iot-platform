@@ -220,5 +220,12 @@ async fn assert_publish_denied(server: &TestApp, device: &TestDevice, topic: &st
         .await
         .unwrap();
     mqtt_wait_closed(&mut eventloop, WAIT).await;
+    tokio::time::timeout(WAIT, async {
+        while server.presence.is_online(&device.id).unwrap() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("broker did not finish disconnecting the denied client");
     drop(client);
 }
