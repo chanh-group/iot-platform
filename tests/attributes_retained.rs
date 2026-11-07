@@ -337,10 +337,15 @@ async fn retained_replace_clear_and_caps_keep_accounting_consistent() {
 #[tokio::test]
 async fn retained_byte_cap_rejects_oversized_replacement_and_counts_it() {
     let _guard = RETAINED_CAP_TEST_LOCK.lock().await;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("rmqtt::v3=info")
+        .with_test_writer()
+        .try_init();
     let app = TestApp::builder().retained_limits(2, 5).start().await;
     let rejected_before = Metrics::global().retained_cap_rejected_total.get();
     let device = app.create_device("retained-byte-cap", true).await;
     let status = format!("devices/{}/status", device.id);
+    eprintln!("retained byte cap: initial MQTT connect");
     let (client, mut eventloop, _) =
         mqtt_connect(app.mqtt_addr, &device.id, &device.id, &device.token, true).await;
     wait_presence(&app, &device.id, true).await;
@@ -361,6 +366,7 @@ async fn retained_byte_cap_rejects_oversized_replacement_and_counts_it() {
     drop(client);
     drop(eventloop);
 
+    eprintln!("retained byte cap: MQTT reconnect after rejection");
     let (client, mut eventloop, _) =
         mqtt_connect(app.mqtt_addr, &device.id, &device.id, &device.token, true).await;
     wait_presence(&app, &device.id, true).await;
