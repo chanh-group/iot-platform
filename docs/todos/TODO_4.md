@@ -233,11 +233,13 @@ Evidence rerun 2026-11-07T12:53:00+07:00: `cargo fmt --all --check`, Clippy, `ca
 
 ## 14. Rà Rust style và giữ thay đổi tối thiểu
 
-- [ ] Chạy `cargo fmt --all --check` và `cargo clippy --all-targets --all-features -- -D warnings` sau mỗi task; không merge khi còn warning.
-- [ ] Không thêm `unwrap`/`expect` trên path runtime trừ invariant đã chứng minh có comment.
-- [ ] Không thêm dependency mới ngoài `01` nếu chưa ghi ADR; không tạo trait/module chỉ để đủ tên checklist.
-- [ ] Mỗi test dùng data dir riêng; không dùng chung DB; cleanup temp sau test.
-- [ ] Hook crash test chỉ compile trong `debug_assertions`; không bật trong release.
+- [x] `cargo fmt --all --check` và `cargo clippy --all-targets --all-features -- -D warnings` pass cho thay đổi hiện tại; tiếp tục chạy sau mỗi task, không merge khi còn warning.
+- [x] Rà path runtime: Clippy bổ sung `unwrap_used`/`expect_used` chỉ báo `src/observability/logging.rs::prepare_reload`, invariant subscriber toàn cục đã có comment và tồn tại trước Phase 4. Những `unwrap`/`expect` thêm trong diff Phase 4 thuộc test; tiếp tục không thêm trên runtime trừ invariant có chứng minh và comment.
+- [x] So sánh manifest với trước Phase 4 (`4043139`): không thêm dependency; `Cargo.toml` chỉ thêm `publish = false`, `web/package.json` không đổi. Không thêm trait/module chỉ để đủ tên checklist; tiếp tục áp dụng quy tắc dependency/ADR cho thay đổi sau.
+- [x] Rà fixture: `TestApp` và các test process dùng `TempDir` riêng, test SQLite in-memory dùng pool riêng; runner load dùng thư mục riêng và dọn cả khi lệnh test thất bại. `tests/load_runner.rs` kiểm tra hai lượt song song và đường lỗi. Tiếp tục giữ cách ly và cleanup cho test mới.
+- [x] Hook crash test chỉ compile trong `debug_assertions`; không bật trong release (`src/lib.rs`, `src/storage/sqlite/telemetry.rs`, `src/core/telemetry/ingest.rs`, `src/runtime/supervisor.rs`).
+
+Evidence 2026-11-07 khoảng 13:13 +07:00: fmt, Clippy và `cargo test --all` PASS (280 pass, 2 ignored: Docker integration và manual load); `sh -n tests/load/run.sh` PASS. `cargo test --release --locked --test crash_recovery` chạy 0 test như dự kiến vì test crash chỉ có ở debug. Cleanup tự động không chạy khi process bị SIGKILL hoặc máy mất điện; không xóa fixture của lần chạy trước. Đây là rà soát hiện tại, không chứng minh mọi task trước đã chạy gate riêng; các quy tắc vẫn áp dụng cho thay đổi sau.
 
 ## 15. Không làm trong Phase 4
 

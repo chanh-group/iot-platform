@@ -40,3 +40,27 @@ fn load_runs_use_separate_temporary_directories() -> anyhow::Result<()> {
     anyhow::ensure!(!Path::new(&first).exists() && !Path::new(&second).exists());
     Ok(())
 }
+
+#[test]
+fn failed_load_run_cleans_its_temporary_directory() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let cargo = temp.path().join("cargo");
+    std::fs::write(&cargo, "#!/bin/sh\nexit 1\n")?;
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755))?;
+    let runs = temp.path().join("runs");
+    let path = std::env::join_paths(std::iter::once(temp.path().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))?;
+    let status = Command::new("sh")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/load/run.sh"))
+        .env("PATH", path)
+        .env("IOT_LOAD_TMPDIR", &runs)
+        .env("IOT_LOAD_CGROUP", "0")
+        .status()?;
+    anyhow::ensure!(!status.success());
+    anyhow::ensure!(
+        runs.read_dir()?.next().is_none(),
+        "temporary directory remains"
+    );
+    Ok(())
+}

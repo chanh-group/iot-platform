@@ -6,6 +6,7 @@ load_root=${IOT_LOAD_TMPDIR:-"$repo/target/load-tmp"}
 duration=${IOT_LOAD_DURATION_SECONDS:-60}
 mkdir -p "$load_root"
 load_tmp=$(mktemp -d "$load_root/run.XXXXXX")
+trap 'rm -rf -- "$load_tmp"' EXIT
 load_tmp=$(CDPATH= cd -- "$load_tmp" && pwd)
 echo "Load test files: $load_tmp"
 cd "$repo"
@@ -30,4 +31,3 @@ else
     TMPDIR="$load_tmp" IOT_LOAD_DURATION_SECONDS="$duration" \
         cargo test --locked --test load_baseline -- --ignored --nocapture
 fi
-rm -rf -- "$load_tmp"
