@@ -151,13 +151,13 @@ Nguồn sự thật:
 
 ## 11. Tài liệu — P4-11
 
-- [ ] `README.md`: quick start (Docker, SQLite); yêu cầu phần cứng tối thiểu; cảnh báo TLS; badge CI nếu có.
-- [ ] `docs/operations.md`: deploy (Docker/Compose), config mẫu, backup/restore, retention, log, shutdown, monitoring, alert/runbook.
-- [ ] API reference (hoặc đường dẫn đến contract `02`): endpoint, auth, WebSocket subscribe/unsubscribe, lỗi.
-- [ ] MQTT guide: topic, QoS, ACL, application ACK, command flow, LWT.
-- [ ] Troubleshooting: lock conflict (exit 5), migration fail (exit 4), admin đã tồn tại (exit 6), disk full, DB lỗi, MQTT refuse.
-- [ ] Không viết placeholder rỗng; mỗi section phải có nội dung đủ để vận hành.
-- [ ] Evidence: review từng tài liệu; commit; không còn mục TODO/placeholder trong doc.
+- [x] `README.md`: quick start Docker/SQLite, yêu cầu phần cứng tối thiểu, cảnh báo TLS, trạng thái Phase 4. Không có CI workflow nên không thêm badge.
+- [x] `docs/operations.md`: deploy Docker/Compose, config mẫu/env, log, shutdown, backup/restore, retention, monitoring, alert/runbook và troubleshooting.
+- [x] API reference `docs/api.md`: endpoint, auth/CSRF, pagination, telemetry/command/config, WebSocket subscribe/unsubscribe, error envelope; dẫn contract `02`.
+- [x] MQTT guide `docs/mqtt.md`: topic, QoS, ACL, application ACK, command flow/ACK, LWT, status/data, limits và ví dụ client.
+- [x] Troubleshooting: exit 3/4/5/6, disk full, DB lỗi, MQTT refuse/disconnect, login và dashboard; mỗi mục có hành động cụ thể.
+- [x] Không còn placeholder rỗng; README và các doc vận hành liên kết chéo tới contract `02`.
+- [x] Evidence 2026-11-07: review README, `docs/operations.md`, `docs/api.md`, `docs/mqtt.md`; `cargo fmt --all --check`, Clippy `-D warnings`, `cargo test --all` và `git diff --check` PASS. Commit P4-11.
 
 ## 12. Release checklist, SBOM và scan — P4-12
 
