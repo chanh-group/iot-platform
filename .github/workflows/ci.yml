@@ -36,6 +36,8 @@ jobs:
           bun run --bun build
 
       - name: Rust checks
+        env:
+          RUST_BACKTRACE: "1"
         run: |
           cargo fmt --all --check
           cargo clippy --all-targets --all-features -- -D warnings

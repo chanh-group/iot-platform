@@ -953,7 +953,7 @@ url = "sqlite://./data/iot.db"
       values: { temperature: 26 },
     });
     await waitForBrowser("document.body.innerText.includes('Storage is unavailable')", Boolean, "real storage-unavailable warning");
-    expect(await evaluate("document.querySelector('.notice-error[role=alert]')?.textContent?.includes('New telemetry may not be saved')")).toBe(true);
+    await waitForBrowser("document.querySelector('.notice-error[role=alert]')?.textContent?.includes('New telemetry may not be saved')", Boolean, "overview storage-unavailable alert");
     const cleanupDatabase = new Database(dbPath);
     cleanupDatabase.exec("DROP TRIGGER fail_ui_telemetry");
     cleanupDatabase.close();
