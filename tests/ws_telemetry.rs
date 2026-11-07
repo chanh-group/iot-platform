@@ -2,7 +2,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{TestApp, TestWebSocket, mqtt_connect, ws_connect, ws_session_cookie};
+use common::{TestApp, TestWebSocket, mqtt_connect, wait_presence, ws_connect, ws_session_cookie};
 use futures_util::{SinkExt, StreamExt};
 use iot_server::core::events::TelemetryCommitted;
 use iot_server::observability::metrics::Metrics;
@@ -14,6 +14,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 async fn publish(app: &TestApp, device_id: &str, token: &str, event_id: &str, raw: &[u8]) -> Value {
     let (client, mut eventloop, _) =
         mqtt_connect(app.mqtt_addr, device_id, device_id, token, true).await;
+    wait_presence(app, device_id, true).await;
     let ack_topic = format!("devices/{device_id}/telemetry/ack");
     client
         .subscribe(&ack_topic, QoS::AtLeastOnce)
@@ -40,7 +41,7 @@ async fn publish(app: &TestApp, device_id: &str, token: &str, event_id: &str, ra
         )
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(3), async {
+    let ack = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if let Event::Incoming(Packet::Publish(packet)) = eventloop.poll().await.unwrap()
                 && packet.topic == ack_topic
@@ -52,7 +53,11 @@ async fn publish(app: &TestApp, device_id: &str, token: &str, event_id: &str, ra
         }
     })
     .await
-    .unwrap()
+    .unwrap();
+    drop(client);
+    drop(eventloop);
+    wait_presence(app, device_id, false).await;
+    ack
 }
 
 async fn next_json(
