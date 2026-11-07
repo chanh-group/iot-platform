@@ -251,12 +251,24 @@ Evidence 2026-11-07 khoảng 13:13 +07:00: fmt, Clippy và `cargo test --all` PA
 - Tính năng dashboard mới ngoài những gì Phase 3 đã ship.
 - Thay đổi schema migration đã áp dụng.
 
+Giữ nguyên phạm vi trên; các mục này không phải việc cần triển khai để hoàn tất Phase 4.
+
 ## 16. Commit và hồ sơ bàn giao
 
-- [ ] Commit theo nhóm task; mỗi commit build/test được.
-- [ ] Message gợi ý: `feat(reliability): bounded resources audit`, `feat(crash): crash recovery hooks`, `feat(shutdown): graceful drain and kick`, `feat(security): security suite`, `feat(ws): slow client and A15 gate`, `build(docker): multi-stage Dockerfile`, `docs: operations and release checklist`, `release: MVP v0.1.0`.
-- [ ] Không commit `target/`, `data/`, `web/dist/`, `web/node_modules/`, log, secret.
-- [ ] Hồ sơ bàn giao Phase 4: ghi vào phần này sau khi hoàn tất — timestamp chạy, số test pass, Docker image digest, SBOM artifact, kết quả load test và restore drill.
+- [x] Các task Phase 4 đã được commit theo nhóm (`0c30af0` đến `4d6c8ae`); build/test của commit hiện tại có evidence ở §13–14. Chưa chạy lại build/test độc lập trên từng commit cũ.
+- [x] Message trong lịch sử mô tả nhóm task; các message liệt kê ban đầu chỉ là gợi ý, không bắt buộc tạo commit release trước khi phát hành.
+- [x] `git ls-files` không liệt kê file trong `target/`, `data/`, `web/dist/`, `web/node_modules/`, hoặc file `*.log`, `*.key`, `*.pem`, `.env`, `.env.*`. Đây là kiểm tra đường dẫn, không chứng minh toàn bộ nội dung hay lịch sử Git không có secret; tiếp tục review secret trước mỗi commit.
+- [x] Hồ sơ bàn giao Phase 4 cục bộ được ghi bên dưới, kèm timestamp, test, image ID và SBOM dry-run, load và restore. Bằng chứng release registry vẫn mở riêng, không thay bằng image ID cục bộ.
+
+### Hồ sơ hiện có — chưa phải release
+
+- Commit code/test được kiểm tra gần nhất: `4d6c8ae10bde076df6fe2cd72ab08e5e0ef59c14`; hồ sơ này là thay đổi tài liệu sau commit đó. Các nhóm task trước đã được commit riêng; chưa xác minh lại từng commit độc lập. Chưa tạo tag hoặc publish trong lượt này.
+- Test và gate: lần chạy 2026-11-07 khoảng 13:13 +07:00 ở §14 có 280 test pass, 2 ignored; gate A01–A17/A19/A20 và lần chạy release/frontend trước đó được ghi ở §13. Docker smoke và load test ignored có evidence riêng ở §8, §10 và §12.
+- Dry-run cục bộ 2026-11-07 11:46:28–11:48:27 +07:00: kết quả chi tiết ở §12. Report scan `target/release-dry-run/trivy-image.json` ghi image ID `sha256:1188a53955cfd2b19ff130ae2ffd3ebb746a8ab1e08d7ff95f811d972352bada`; image cục bộ `iot-server:dry-run` hiện khớp ID này. Đây là ID image cục bộ, **không phải digest release GHCR đã ký**; chưa xác nhận commit nguồn chính xác của artifact dry-run.
+- Artifact cục bộ, không được commit và có thể bị dọn: `target/release-dry-run/sbom-source.spdx.json`, `sbom-image.spdx.json`, `trivy-image.json`, `iot-server-v0.1.0-linux-x86_64.tar.gz`, `SHA256SUMS`, `SHA256SUMS.bundle` và `cosign.pub`. `sha256sum -c SHA256SUMS` PASS lúc kiểm tra khoảng 13:08; chữ ký dùng khóa tạm của dry-run, không phải OIDC release.
+- Load: [baseline 2026-11-07](../reports/load-baseline-2026-11-07.md), 59.999 publish request trong 60 giây, application ACK 51,201% và 29.279 ACK drop; không phải cam kết throughput, chưa đo retry. Restore: [drill 2026-11-07](../reports/restore-drill-2026-11-07.md) PASS ở mức artifact tự động với fake Docker adapter; smoke Docker thật được ghi riêng ở §8–9.
+- Exception: image scan hiện không có exception; hai cảnh báo dependency unmaintained và hạn review ghi trong [release checklist](../release-checklist.md#exception-đang-áp-dụng).
+- **Còn mở trước bàn giao release:** chạy checklist trên đúng commit sẽ tag; ghi timestamp, commit/tag, digest GHCR, kết quả verify OIDC, SBOM/scan/checksum và đường dẫn artifact release; xác nhận workflow GHCR thực tế và kiểm tra lại dữ liệu nhạy cảm trước commit. Không thay các bằng chứng này bằng dry-run cục bộ.
 
 ---
 
