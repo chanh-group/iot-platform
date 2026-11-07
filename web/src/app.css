@@ -111,4 +111,6 @@ td .button { min-height: 2rem; padding: .35rem .6rem; }
   .split-grid { grid-template-columns: 1fr; }
   th, td { padding: .65rem .45rem; }
   .heading-row { align-items: flex-start; flex-direction: column; }
+  .panel-head { align-items: flex-start; flex-direction: column; }
+  .panel-head > .inline-actions { align-self: stretch; }
 }
