@@ -124,21 +124,44 @@ async fn cross_device_publish_is_denied_not_routed_and_disconnects() {
 #[tokio::test]
 async fn server_only_and_system_topics_are_denied_for_publish() {
     let server = TestApp::start().await;
-    let device = server.create_device("acl-deny", true).await;
-
-    for topic in [
-        format!("devices/{}/telemetry/ack", device.id),
-        format!("devices/{}/commands", device.id),
-        "$SYS/brokers".to_owned(),
-        format!("$share/group/devices/{}/data/x", device.id),
-    ] {
-        assert_publish_denied(&server, &device, &topic).await;
-    }
+    let telemetry_ack = server.create_device("acl-deny-ack", true).await;
+    let commands = server.create_device("acl-deny-commands", true).await;
+    let sys = server.create_device("acl-deny-sys", true).await;
+    let shared = server.create_device("acl-deny-shared", true).await;
+    assert_publish_denied(
+        &server,
+        &telemetry_ack,
+        &format!("devices/{}/telemetry/ack", telemetry_ack.id),
+    )
+    .await;
+    assert_publish_denied(
+        &server,
+        &commands,
+        &format!("devices/{}/commands", commands.id),
+    )
+    .await;
+    assert_publish_denied(&server, &sys, "$SYS/brokers").await;
+    assert_publish_denied(
+        &server,
+        &shared,
+        &format!("$share/group/devices/{}/data/x", shared.id),
+    )
+    .await;
 
     // Wildcards in a publish topic never reach the broker through rumqttc.
-    for topic in [
-        format!("devices/{}/data/+", device.id),
-        format!("devices/{}/telemetry/#", device.id),
+    let data_wildcard = server.create_device("acl-deny-data-wildcard", true).await;
+    let telemetry_wildcard = server
+        .create_device("acl-deny-telemetry-wildcard", true)
+        .await;
+    for (device, topic) in [
+        (
+            &data_wildcard,
+            format!("devices/{}/data/+", data_wildcard.id),
+        ),
+        (
+            &telemetry_wildcard,
+            format!("devices/{}/telemetry/#", telemetry_wildcard.id),
+        ),
     ] {
         assert!(
             raw_publish_denied(
