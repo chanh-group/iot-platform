@@ -215,17 +215,22 @@ async fn assert_publish_denied(server: &TestApp, device: &TestDevice, topic: &st
         true,
     )
     .await;
+    wait_presence(server, device, true).await;
     client
         .publish(topic, QoS::AtLeastOnce, false, b"{}".as_slice())
         .await
         .unwrap();
     mqtt_wait_closed(&mut eventloop, WAIT).await;
+    wait_presence(server, device, false).await;
+    drop(client);
+}
+
+async fn wait_presence(server: &TestApp, device: &TestDevice, online: bool) {
     tokio::time::timeout(WAIT, async {
-        while server.presence.is_online(&device.id).unwrap() {
+        while server.presence.is_online(&device.id).unwrap() != online {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("broker did not finish disconnecting the denied client");
-    drop(client);
+    .expect("broker presence did not reach the expected connection state");
 }
