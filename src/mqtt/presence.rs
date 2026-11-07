@@ -505,6 +505,23 @@ impl PresenceHooks {
     }
 }
 
+struct PresenceHookInFlight;
+
+impl PresenceHookInFlight {
+    fn new() -> Self {
+        let metrics = Metrics::global();
+        let inflight = metrics.mqtt_presence_hook_inflight.inc_and_get();
+        metrics.mqtt_presence_hook_inflight_max.set_max(inflight);
+        Self
+    }
+}
+
+impl Drop for PresenceHookInFlight {
+    fn drop(&mut self) {
+        Metrics::global().mqtt_presence_hook_inflight.dec();
+    }
+}
+
 async fn transition_presence(
     presence: &Presence,
     transition_order: &AsyncMutex<()>,
@@ -536,6 +553,7 @@ impl Handler for PresenceHooks {
     async fn hook(&self, param: &Parameter, _acc: Option<HookResult>) -> ReturnType {
         match param {
             Parameter::ClientConnected(session) => {
+                let _inflight = PresenceHookInFlight::new();
                 let device_id: &str = &session.id.client_id;
                 let generation = session.id.to_string();
                 if let Err(error) = self.connections.connected(device_id, &generation) {
@@ -593,6 +611,7 @@ impl Handler for PresenceHooks {
                 self.record_last_seen(device_id, last_seen_at).await;
             }
             Parameter::ClientDisconnected(session, _reason) => {
+                let _inflight = PresenceHookInFlight::new();
                 let device_id: &str = &session.id.client_id;
                 let generation = session.id.to_string();
                 if let Err(error) = self.connections.disconnected(device_id, &generation) {

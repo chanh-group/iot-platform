@@ -1,0 +1,229 @@
+rule_files:
+  - prometheus.rules.yml
+evaluation_interval: 1m
+tests:
+  - name: server unavailable fires and clears
+    interval: 1m
+    input_series:
+      - series: 'up{job="iot-server"}'
+        values: '0 0 0 1'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: IotServerUnavailable
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: iot-server
+            exp_annotations:
+              summary: IoT server metrics endpoint is unavailable
+      - eval_time: 3m
+        alertname: IotServerUnavailable
+        exp_alerts: []
+
+  - name: readiness fires and clears
+    interval: 1m
+    input_series:
+      - series: 'probe_success{job="iot-server-readyz"}'
+        values: '0 0 0 1'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: IotServerNotReady
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: iot-server-readyz
+            exp_annotations:
+              summary: IoT server readiness check is failing
+      - eval_time: 3m
+        alertname: IotServerNotReady
+        exp_alerts: []
+
+  - name: readiness probe scrape failure fires
+    interval: 1m
+    input_series:
+      - series: 'up{job="iot-server-readyz"}'
+        values: '0 0 0 1'
+      - series: 'probe_success{job="iot-server-readyz"}'
+        values: '1 1 1 1'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: IotReadinessProbeUnavailable
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: iot-server-readyz
+            exp_annotations:
+              summary: IoT readiness probe scrape failed or its metric is missing
+      - eval_time: 3m
+        alertname: IotReadinessProbeUnavailable
+        exp_alerts: []
+
+  - name: missing readiness metric fires while server metrics remain up and clears on recovery
+    interval: 1m
+    input_series:
+      - series: 'up{job="iot-server"}'
+        values: '1 1 1 1 1 1 1 1 1 1'
+      - series: 'probe_success{job="iot-server-readyz"}'
+        values: '_ _ _ _ _ _ _ _ 1 1'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: IotReadinessProbeUnavailable
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: iot-server-readyz
+            exp_annotations:
+              summary: IoT readiness probe scrape failed or its metric is missing
+      - eval_time: 8m
+        alertname: IotReadinessProbeUnavailable
+        exp_alerts: []
+
+  - name: disk fires at exactly eighty percent full and clears above
+    interval: 1m
+    input_series:
+      - series: 'node_filesystem_avail_bytes{mountpoint="/var/lib/iot-server",fstype="ext4"}'
+        values: '20 20 20 20 20 20 30'
+      - series: 'node_filesystem_size_bytes{mountpoint="/var/lib/iot-server",fstype="ext4"}'
+        values: '100 100 100 100 100 100 100'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: IotDataDiskLow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              fstype: ext4
+              mountpoint: /var/lib/iot-server
+            exp_annotations:
+              summary: IoT data filesystem has less than 20% free space
+      - eval_time: 6m
+        alertname: IotDataDiskLow
+        exp_alerts: []
+
+  - name: queue saturation fires and clears
+    interval: 1m
+    input_series:
+      - series: 'iot_ingest_rejected_total{reason="queue_full"}'
+        values: '0 0 2 2 2 2 2 2 2'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: IotTelemetryQueueSaturated
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reason: queue_full
+            exp_annotations:
+              summary: Telemetry submissions are being rejected because the queue is full
+      - eval_time: 8m
+        alertname: IotTelemetryQueueSaturated
+        exp_alerts: []
+
+  - name: ingest rejection fires and clears
+    interval: 1m
+    input_series:
+      - series: 'iot_ingest_rejected_total{reason="invalid_payload"}'
+        values: '0 0 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: IotIngestRejected
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: Telemetry ingest rejected one or more submissions
+      - eval_time: 8m
+        alertname: IotIngestRejected
+        exp_alerts: []
+
+  - name: telemetry ACK drops fire and clear
+    interval: 1m
+    input_series:
+      - series: 'iot_telemetry_ack_dropped_total'
+        values: '0 0 2 2 2 2 2 2 2'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: IotTelemetryAckDropped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: Telemetry application ACKs are being dropped
+      - eval_time: 8m
+        alertname: IotTelemetryAckDropped
+        exp_alerts: []
+
+  - name: database errors fire and clear
+    interval: 1m
+    input_series:
+      - series: 'iot_telemetry_commit_errors_total'
+        values: '0 0 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: IotDatabaseCommitErrors
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: SQLite telemetry commits are failing
+      - eval_time: 8m
+        alertname: IotDatabaseCommitErrors
+        exp_alerts: []
+
+  - name: backup missing and stale fire; recent backup clears
+    interval: 1m
+    input_series:
+      - series: 'iot_backup_last_success_timestamp_seconds'
+        values: '0'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: IotBackupMissing
+        exp_alerts: []
+      - eval_time: 25h
+        alertname: IotBackupMissing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: No successful SQLite backup has been recorded in the last 24 hours
+
+  - name: backup metric absence fires
+    interval: 1m
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: IotBackupMissing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: No successful SQLite backup has been recorded in the last 24 hours
+      - eval_time: 6m
+        alertname: IotBackupFailed
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: Backup attempt failed or no attempt status is available
+
+  - name: latest backup attempt failure fires and clears on success
+    interval: 1m
+    input_series:
+      - series: 'iot_backup_last_attempt_success'
+        values: '1 0 0 1'
+      - series: 'iot_backup_last_success_timestamp_seconds'
+        values: '0 0 0 0'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: IotBackupFailed
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: IotBackupMissing
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: IotBackupFailed
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: Backup attempt failed or no attempt status is available
+      - eval_time: 3m
+        alertname: IotBackupFailed
+        exp_alerts: []

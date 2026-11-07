@@ -140,13 +140,14 @@ Nguồn sự thật:
 
 ## 10. Load test baseline — P4-10
 
-- [ ] Thiết lập test tải tối thiểu: 1 000 connection MQTT đồng thời, gửi telemetry QoS 1 với event_id, kiểm tra ACK rate và latency p95.
-- [ ] Ghi rõ hardware (vCPU, RAM, disk type), engine SQLite, kích thước message, QoS, số connection, tốc độ ingest target, kết quả p95 latency, RAM peak và disk growth/phút.
-- [ ] Không commit throughput làm cam kết release; chỉ báo cáo số đo thực tế trên hardware đã ghi.
-- [ ] Định nghĩa alert rules cho: DB/readiness lỗi, disk gần đầy (≥80%), queue saturation, ingest rejection và backup lỗi; lưu tại `deploy/alerts/` hoặc doc.
-- [ ] Test alert rules: kiểm tra rule syntax (ví dụ PromQL nếu dùng Prometheus); mỗi rule có ít nhất một test case firing/non-firing.
-- [ ] Diễn tập restore: chạy `deploy/backup.sh` → phá file DB → restore → assert data đúng; record kết quả.
-- [ ] Evidence: `tests/load/` (script hoặc binary) + báo cáo kết quả; `deploy/alerts/` rules + test; restore drill log.
+- [x] Thiết lập test tải tối thiểu: `tests/load/run.sh` chạy 1 000 MQTT client đồng thời, telemetry QoS 1/event_id và ghi PUBACK, application ACK rate, latency p95, commit count.
+- [x] Ghi hardware, SQLite/WAL, message, QoS, connection count, publish-request target, p95, peak RSS và disk growth/phút tại `docs/reports/load-baseline-2026-11-07.md`. Baseline 4 vCPU/8 GiB: 59 999 yêu cầu publish được tạo trong cửa sổ (thiếu 1 so với mục tiêu 60 000; runner không ghi riêng nhịp trễ), 59 999 PUBACK/commit sau drain, 999.983 yêu cầu/s; application ACK 51.201% (29 279 ACK dropped) là tín hiệu lỗi ở tải này, không phải throughput promise.
+- [x] Không commit throughput làm cam kết release; report giới hạn baseline cục bộ và cảnh báo application ACK drop.
+- [x] Định nghĩa `deploy/alerts/prometheus.rules.yml`: scrape/readiness failure và probe metric missing, filesystem còn ≤20% (80% full), ingest queue full, ingest rejection, dropped application ACK, SQLite commit error, backup failure và freshness.
+- [x] `tests/alerts.sh` chạy Prometheus `promtool check rules` và `promtool test rules`; đủ firing/non-firing cases — PASS.
+- [x] Restore drill chạy `deploy/backup.sh`, inject copy failure, tạo backup thành công, làm hỏng DB đích, restore artifact, start server và assert admin/device/telemetry/runtime revision qua API; log tại `docs/reports/restore-drill-2026-11-07.md`.
+- [x] Evidence: `tests/load/` + report baseline; `deploy/alerts/` rules + promtool tests; restore drill log. `sh tests/alerts.sh` PASS.
+- [x] Evidence 2026-11-07: 60 s load baseline trên Ryzen 7 H 255 / WD NVMe Btrfs, cgroup 4 vCPU/8 GiB; 59 999 yêu cầu publish được tạo trong cửa sổ (999.983 yêu cầu/s; thiếu 1 so với mục tiêu), PUBACK/commit sau drain, ACK 51.201% (29 279 dropped), ACK p95 515.627 ms chỉ trên ACK nhận được, CONNACK p95 1 510.652 ms, peak presence hooks 711, peak RSS 136 008 KiB, SQLite growth 22 731 624 bytes. `tests/backup_restore.rs` PASS after DB corruption/restore; Prometheus rules and firing/non-firing cases PASS. Results and constraints are recorded in the linked reports.
 
 ## 11. Tài liệu — P4-11
 

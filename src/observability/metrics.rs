@@ -95,6 +95,16 @@ impl Gauge {
         self.0.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increments the gauge and returns its new value for high-water tracking.
+    pub fn inc_and_get(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::Relaxed).saturating_add(1)
+    }
+
+    /// Keeps the largest observed value.
+    pub fn set_max(&self, value: u64) {
+        self.0.fetch_max(value, Ordering::Relaxed);
+    }
+
     /// Decrements an active-resource gauge.
     pub fn dec(&self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
@@ -159,6 +169,8 @@ const COMMIT_BUCKETS_MICROS: [u64; 11] = [
 #[derive(Debug, Default)]
 pub struct Metrics {
     pub mqtt_connections_active: Gauge,
+    pub mqtt_presence_hook_inflight: Gauge,
+    pub mqtt_presence_hook_inflight_max: Gauge,
     pub mqtt_kick_failures_total: Counter,
     pub ingest_accepted_total: Counter,
     pub ingest_rejected_total: Counter,
@@ -235,6 +247,16 @@ impl Metrics {
             &mut output,
             "iot_mqtt_connections_active",
             self.mqtt_connections_active.get(),
+        );
+        gauge(
+            &mut output,
+            "iot_mqtt_presence_hook_inflight",
+            self.mqtt_presence_hook_inflight.get(),
+        );
+        gauge(
+            &mut output,
+            "iot_mqtt_presence_hook_inflight_max",
+            self.mqtt_presence_hook_inflight_max.get(),
         );
         counter(
             &mut output,
@@ -383,6 +405,11 @@ mod tests {
 
         metrics.telemetry_queue_depth.set(7);
         assert_eq!(metrics.telemetry_queue_depth.get(), 7);
+        assert_eq!(metrics.mqtt_presence_hook_inflight.inc_and_get(), 1);
+        metrics.mqtt_presence_hook_inflight_max.set_max(1);
+        metrics.mqtt_presence_hook_inflight.dec();
+        assert_eq!(metrics.mqtt_presence_hook_inflight.get(), 0);
+        assert_eq!(metrics.mqtt_presence_hook_inflight_max.get(), 1);
     }
 
     #[test]

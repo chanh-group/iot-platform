@@ -62,4 +62,20 @@ Do not run `prepare-data.sh` on a non-empty directory owned by another user. Ver
 
 SQLite uses WAL with `synchronous=FULL` and automatic checkpoints. The `-wal` and `-shm` files are normal while the server is running; their presence alone is not a failure. Do not delete or rename them under a running process. Monitor `df -h` for the data filesystem (alert at 80%), `du -h deploy/data/iot.db*` for database/WAL growth, `/readyz` for readiness, and backup job exit status plus checksum verification. Monitor backup destination space separately. Disk exhaustion degrades readiness and causes telemetry writes to be retried/rejected rather than acknowledged as stored.
 
+## Alert rules
+
+`deploy/alerts/prometheus.rules.yml` contains Prometheus rules for the metrics scrape, `/readyz` result and probe availability (scrape down or `probe_success` missing), data filesystem, telemetry queue saturation, ingest rejections, dropped application ACKs, SQLite commit errors, and failed/stale backups. The example assumes Prometheus scrapes `/metrics` as `job="iot-server"`, a Blackbox Exporter probes `/readyz` as `job="iot-server-readyz"`, and Node Exporter reports the data filesystem at `mountpoint="/var/lib/iot-server"`. Adjust that mountpoint matcher to the host filesystem containing `IOT_DATA_DIR`; keep the scrape/probe job labels consistent with the rules. To enable the authenticated metrics endpoint, set `metrics = true` and `metrics_bearer_token_env = "IOT_METRICS_TOKEN"` in `[http]` in `conf.docker.toml`, then provide `IOT_METRICS_TOKEN` to Compose from a secret manager. Do not expose the endpoint publicly.
+
+To alert on backup freshness, enable Node Exporter's textfile collector and run backups with its existing collector directory, for example:
+
+```sh
+cd deploy
+IOT_BACKUP_METRICS_DIR=/var/lib/node_exporter/textfile_collector \
+  ./backup.sh /path/to/backups/iot-2026-11-06
+```
+
+Every valid backup run atomically updates `iot_backup_last_attempt_timestamp_seconds` and `iot_backup_last_attempt_success`; `IotBackupFailed` alerts when the latest result failed or its status metric is missing, while `iot_backup_last_success_timestamp_seconds` remains unchanged until a backup succeeds. `IotBackupMissing` also alerts if no success has been recorded in 24 hours. Ensure the textfile collector directory is writable by the backup operator. Schedule backups more frequently than the freshness threshold and monitor backup destination capacity separately. Check rule syntax and firing/clearing cases with `sh tests/alerts.sh` (requires Docker; uses Prometheus `promtool`).
+
+If updating the textfile fails, the script warns but retains the backup's exit status; the previous metric can remain stale. Monitor scheduler exit status and script stderr independently, including collector write failures.
+
 After an unclean stop or suspected storage issue, preserve a copy of the complete data directory before repair, then use SQLite integrity checks on a stopped copy (for example `sqlite3 iot.db 'PRAGMA integrity_check;'`). A healthy database returns `ok`.

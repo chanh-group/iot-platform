@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+use anyhow::Context;
 use common::TestApp;
 use iot_server::core::auth;
 use iot_server::core::telemetry::{self, TelemetryPayload};
@@ -140,6 +141,8 @@ fn run_backup_script(
     stub_bin: &Path,
     fail_copy: bool,
 ) -> anyhow::Result<std::process::Output> {
+    let metrics_dir = stub_bin.join("metrics");
+    std::fs::create_dir_all(&metrics_dir)?;
     let path = std::env::join_paths(std::iter::once(stub_bin.to_path_buf()).chain(
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
     ))?;
@@ -150,6 +153,7 @@ fn run_backup_script(
         .env("FAKE_DATA_DIR", data_dir)
         .env("FAKE_COPY_BIN", stub_bin)
         .env("FAIL_BACKUP_COPY", if fail_copy { "1" } else { "0" })
+        .env("IOT_BACKUP_METRICS_DIR", metrics_dir)
         .current_dir(repo)
         .output()?)
 }
@@ -222,6 +226,12 @@ async fn stopped_sqlite_backup_restores_device_telemetry_and_runtime_revision() 
         !failed_backup.exists(),
         "failed copy was published as a backup"
     );
+    let failed_metrics = std::fs::read_to_string(stub_bin.join("metrics/iot_backup.prom"))?;
+    anyhow::ensure!(
+        failed_metrics.contains("iot_backup_last_attempt_success 0\n")
+            && failed_metrics.contains("iot_backup_last_success_timestamp_seconds 0\n"),
+        "failed backup did not publish its failed-attempt status"
+    );
 
     let backup_dir = restored_root.path().join("backup-output");
     let backup = run_backup_script(&repo_root(), &source_data, &backup_dir, &stub_bin, false)?;
@@ -230,6 +240,15 @@ async fn stopped_sqlite_backup_restores_device_telemetry_and_runtime_revision() 
         "backup script failed: {}",
         String::from_utf8_lossy(&backup.stderr)
     );
+    let backup_metric = std::fs::read_to_string(stub_bin.join("metrics/iot_backup.prom"))?;
+    anyhow::ensure!(
+        backup_metric.contains("iot_backup_last_attempt_success 1\n"),
+        "successful backup did not update its attempt status"
+    );
+    let last_success = backup_metric
+        .lines()
+        .find_map(|line| line.strip_prefix("iot_backup_last_success_timestamp_seconds "))
+        .context("successful backup metric omitted its timestamp")?;
     let checksum = Command::new("sha256sum")
         .args(["-c", "SHA256SUMS"])
         .current_dir(&backup_dir)
@@ -238,6 +257,26 @@ async fn stopped_sqlite_backup_restores_device_telemetry_and_runtime_revision() 
         checksum.status.success(),
         "backup checksum verification failed"
     );
+    let failed_after_success = restored_root.path().join("failed-after-success");
+    let failed = run_backup_script(
+        &repo_root(),
+        &source_data,
+        &failed_after_success,
+        &stub_bin,
+        true,
+    )?;
+    anyhow::ensure!(!failed.status.success());
+    anyhow::ensure!(!failed_after_success.exists());
+    let failed_metrics = std::fs::read_to_string(stub_bin.join("metrics/iot_backup.prom"))?;
+    anyhow::ensure!(failed_metrics.contains("iot_backup_last_attempt_success 0\n"));
+    anyhow::ensure!(
+        failed_metrics
+            .lines()
+            .find_map(|line| line.strip_prefix("iot_backup_last_success_timestamp_seconds "))
+            == Some(last_success),
+        "failed backup overwrote the last successful backup timestamp"
+    );
+    std::fs::write(restored_data.join("iot.db"), b"corrupted database")?;
     for name in ["iot.db", "iot.db-wal", "iot.db-shm", "runtime.toml"] {
         let source = backup_dir.join(name);
         if source.is_file() {

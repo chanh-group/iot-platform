@@ -1,6 +1,8 @@
 services:
   iot-server:
     image: iot-server:local
+    environment:
+      IOT_METRICS_TOKEN: ${IOT_METRICS_TOKEN:-}
     # Run prepare-data.sh before first start; localhost-only, no plaintext MQTT on the Internet.
     ports:
       - "127.0.0.1:${IOT_HTTP_PORT:-8080}:8080"

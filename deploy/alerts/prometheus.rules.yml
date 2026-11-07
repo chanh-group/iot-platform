@@ -1,0 +1,83 @@
+groups:
+  - name: iot-server
+    rules:
+      - alert: IotServerUnavailable
+        expr: up{job="iot-server"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: IoT server metrics endpoint is unavailable
+
+      - alert: IotServerNotReady
+        expr: probe_success{job="iot-server-readyz"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: IoT server readiness check is failing
+
+      - alert: IotReadinessProbeUnavailable
+        expr: up{job="iot-server-readyz"} == 0 or absent_over_time(probe_success{job="iot-server-readyz"}[5m])
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: IoT readiness probe scrape failed or its metric is missing
+
+      - alert: IotDataDiskLow
+        expr: node_filesystem_avail_bytes{mountpoint="/var/lib/iot-server",fstype!="tmpfs"} / node_filesystem_size_bytes{mountpoint="/var/lib/iot-server",fstype!="tmpfs"} <= 0.20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: IoT data filesystem has less than 20% free space
+
+      - alert: IotTelemetryQueueSaturated
+        expr: increase(iot_ingest_rejected_total{reason="queue_full"}[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: Telemetry submissions are being rejected because the queue is full
+
+      - alert: IotTelemetryAckDropped
+        expr: increase(iot_telemetry_ack_dropped_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: Telemetry application ACKs are being dropped
+
+      - alert: IotIngestRejected
+        expr: sum(increase(iot_ingest_rejected_total[5m])) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: Telemetry ingest rejected one or more submissions
+
+      - alert: IotDatabaseCommitErrors
+        expr: increase(iot_telemetry_commit_errors_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: SQLite telemetry commits are failing
+
+      - alert: IotBackupMissing
+        expr: absent(iot_backup_last_success_timestamp_seconds) or time() - iot_backup_last_success_timestamp_seconds > 86400
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: No successful SQLite backup has been recorded in the last 24 hours
+
+
+      - alert: IotBackupFailed
+        expr: absent(iot_backup_last_attempt_success) or iot_backup_last_attempt_success == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Backup attempt failed or no attempt status is available
