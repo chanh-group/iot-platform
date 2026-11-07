@@ -250,18 +250,18 @@ GitHub Actions (hoặc CI tương đương), các job song song khi có thể:
 
 | Job | Bước |
 | --- | --- |
-| `rust` | `cargo fmt --check`; `cargo clippy --all-targets --all-features -- -D warnings`; `cargo test --all` |
-| `frontend` | `bun install --frozen-lockfile`; `bun run --bun typecheck`; `bun run --bun test`; `bun run --bun build`; upload `web/dist` |
-| `integration` | Build web; `cargo test --test mqtt_protocol --test telemetry_flow ...` (SQLite) |
-| `docker` | Build image; chạy container; `/healthz`; recreate volume; chạy A17 smoke |
-| `audit` | `cargo deny check`; `cargo audit`; quét dependency + OS image; advisory chỉ được bỏ qua với exception có owner/expiry |
+| `rust` | `cargo fmt --all --check`; Clippy; `cargo test --all`; `cargo test --release --locked`; release build |
+| `frontend` | `bun install --frozen-lockfile`; `bun run --bun typecheck`; `bun run --bun test`; `bun run --bun build` |
+| `integration` | Được bao phủ bởi `cargo test --all` trong job `rust` (SQLite protocol/integration suites) |
+| `docker` | Build image; recreate volume/A17 smoke; validate alert rules; scan OS image với Trivy gate |
+| `audit` | `cargo deny check`; `cargo audit`; advisory chỉ được bỏ qua với exception có owner/expiry |
 | `release` | Tag: build release; tạo SBOM; ký image + provenance/checksum; publish image và lưu artifact |
 
 - Cache Cargo registry/target và Bun; cache key theo lockfile.
 - Không cần service Postgres/MySQL ở MVP.
 - Build order: frontend trước `cargo build --release` vì `rust-embed`.
 - Artifact: binary Linux x86_64 + image; không commit `web/dist`.
-- CI phải chạy trên PR và main; tag chỉ sau khi main xanh.
+- CI phải chạy trên PR và nhánh mặc định (hiện là `master`); tag chỉ sau khi nhánh mặc định xanh.
 
 ## 11. Docker và vận hành
 

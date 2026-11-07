@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - name: Build frontend assets for rust-embed
+        working-directory: web
+        run: |
+          bun install --frozen-lockfile
+          bun run --bun build
+
+      - name: Rust checks
+        run: |
+          cargo fmt --all --check
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all
+          cargo test --release --locked
+          cargo build --release --locked
+          git diff --check
+
+  frontend:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - name: Frontend checks
+        working-directory: web
+        run: |
+          bun install --frozen-lockfile
+          bun run --bun typecheck
+          bun run --bun test
+          bun run --bun build
+
+  docker:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - name: Build frontend assets
+        working-directory: web
+        run: |
+          bun install --frozen-lockfile
+          bun run --bun build
+
+      - name: Docker recreate and alert tests
+        run: |
+          docker build -f deploy/Dockerfile -t iot-server:ci .
+          sh tests/docker_smoke.sh
+          sh tests/alerts.sh
+
+      - name: Scan Docker image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: iot-server:ci
+          version: v0.76.2
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+          exit-code: "0"
+          format: json
+          output: trivy-image.json
+
+      - name: Enforce image vulnerability gate
+        run: python3 deploy/check-trivy-report.py trivy-image.json deploy/trivy-exceptions.json
+
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.98.0
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2,cargo-audit@0.22.2
+
+      - name: Dependency, license and advisory checks
+        run: |
+          cargo deny check
+          cargo audit

@@ -13,7 +13,8 @@ và [operations](operations.md).
   `deploy/check-trivy-report.py`).
 - Cập nhật version ở `Cargo.toml` và `web/package.json`; tag phải là
   `v<major>.<minor>.<patch>` khớp cả hai file. Workflow release kiểm tra điều này.
-- Làm việc trên `main` đã xanh, `git status` sạch. Không tag từ nhánh chưa merge.
+- Làm việc trên nhánh mặc định đã xanh (hiện là `master`), `git status` sạch.
+  Không tag từ nhánh chưa merge.
 - Ký image bằng keyless OIDC trong GitHub Actions. Dry-run cục bộ dùng khóa
   cosign tạm thời và **không push** image hay release.
 
