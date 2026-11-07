@@ -80,6 +80,8 @@ fn write_config(dir: &TempDir, port: u16) -> PathBuf {
              shutdown_timeout_ms = 5000\n\
              [http]\n\
              listen = \"127.0.0.1:{port}\"\n\
+             [mqtt]\n\
+             listen = \"127.0.0.1:0\"\n\
              [database]\n\
              url = \"sqlite://./data/iot.db\"\n"
         ),

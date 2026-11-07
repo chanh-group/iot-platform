@@ -206,28 +206,30 @@ cargo build --release --locked
 Docker:
 
 ```sh
-docker build -t iot-server:local .
+docker build -f deploy/Dockerfile -t iot-server:local .
 docker run --rm iot-server:local --version
 ```
 
 Checklist gate — ghi tên test và timestamp thực tế khi tick:
 
-- [ ] A01: `tests/e2e_boot.rs` (hoặc tương đương) pass — binary mới với SQLite: migrate, dashboard/API và MQTT sẵn sàng.
-- [ ] A04 đầy đủ: `tests/mqtt_acl.rs` wildcard/cross-device và `tests/security.rs` ACL regression pass.
+- [x] A01: bộ tương đương `tests/migration.rs`, `tests/http_shell.rs`, `tests/assets.rs`, `tests/mqtt_boot.rs` pass — migrate, dashboard/API và MQTT readiness trên SQLite.
+- [x] A04 đầy đủ: `tests/mqtt_acl.rs` wildcard/cross-device pass; các regression auth/CSRF/rotate/redaction được chạy trong `tests/auth.rs`, `tests/credential_rotate.rs`, `tests/device_api.rs`, `tests/audit.rs`. Không tạo `tests/security.rs`; các scenario được giữ tại suite sở hữu chúng (§5).
 - [x] A08: `tests/crash_recovery.rs` — kill trước commit, sau commit trước ACK, sau ACK — tất cả pass (evidence §3).
-- [ ] A09: `tests/storage_failure.rs` — DB lỗi (readiness false, không ACK), disk full, queue đầy (bounded RAM, metric), phục hồi — pass.
+- [x] A09: `tests/storage_failure.rs` — DB lỗi/readiness/không ACK thành công, SQLite full, queue bounded + metric và phục hồi — pass.
 - [x] A15 release gate: `tests/ws_telemetry.rs::slow_websocket_is_closed_and_releases_its_connection_slot`, `::subscribed_clients_receive_only_committed_telemetry_and_refetch_after_reconnect` — slow consumer close 1013, commit-order reconnect backfill, logout close 4401 — pass (evidence §6, 2026-11-03T00:01:36+07:00).
 - [x] A16: `tests/shutdown_http.rs` — SIGTERM drain, không ACK trước commit, kick session, lock release, exit 0 — pass (evidence §4).
 - [x] A17: `tests/docker_smoke.sh` / `tests/docker_smoke.rs::compose_recreate_preserves_data_and_live_interfaces` — Docker recreate cùng volume giữ device, credential, telemetry, runtime revision; API và MQTT credential được dùng sau restart; fixture được dọn sau test — pass (evidence §8, 2026-11-05T23:12:35+07:00).
-- [ ] A19 regression: `tests/mqtt_protocol.rs` — QoS/wildcard/retain/LWT/session/dup client/version matrix — pass.
-- [ ] Bounded resources: không còn `unbounded_channel` nghiệp vụ; audit checklist P4-01 hoàn tất.
-- [ ] Security: `tests/security.rs` tất cả scenario pass; không regression từ Phase 2/3.
-- [ ] Backup/restore drill: `deploy/backup.sh` + restore test pass; `docs/operations.md` có hướng dẫn.
-- [ ] Load test baseline: báo cáo có hardware/số liệu; alert rules commit; restore drill log.
-- [ ] Tài liệu: README, operations, API, MQTT, troubleshooting — không còn placeholder.
-- [ ] Release checklist: `docs/release-checklist.md` commit; CI workflow file; `cargo deny check` + `cargo audit` sạch; SBOM + scan dry-run pass.
-- [ ] `cargo fmt --check`, `clippy -D warnings`, `cargo test --all`, strict TypeScript, Docker smoke — tất cả PASS.
-- [ ] Không còn TODO/P0/P1 trong `src/`; backlog Phase 5 ghi rõ.
+- [x] A19 regression: `tests/mqtt_protocol.rs` QoS/wildcard/retain/LWT/session/limits và `tests/mqtt_auth.rs` duplicate client/protocol-version matrix — pass.
+- [x] Bounded resources: không có `unbounded_channel` trong `src/`; queue/channel limits và P4-01 audit được kiểm tra.
+- [x] Security: toàn bộ scenario trong `tests/mqtt_acl.rs`, `tests/auth.rs`, `tests/credential_rotate.rs`, `tests/device_api.rs`, `tests/audit.rs` pass; không cần file tổng hợp `tests/security.rs` (§5).
+- [x] Backup/restore drill: `deploy/backup.sh`, `tests/backup_restore.rs`, `docs/operations.md` và `docs/reports/restore-drill-2026-11-07.md` pass/evidence ghi nhận.
+- [x] Load test baseline: `docs/reports/load-baseline-2026-11-07.md` có hardware/số liệu; alert rules và restore drill log đã ghi nhận (§10).
+- [x] Tài liệu: README, operations, API, MQTT, troubleshooting đã review và không còn placeholder (§11).
+- [x] Release checklist: `docs/release-checklist.md`, `.github/workflows/release.yml`, `cargo deny check`, `cargo audit`, SBOM, Trivy gate và release dry-run pass theo evidence §12. Audit không có vulnerability; 2 unmaintained advisory transitive qua RMQTT có exception đã ghi.
+- [x] `cargo fmt --all --check`, Clippy `-D warnings`, `cargo test --all`, release tests/build, strict TypeScript, frontend tests/build và Docker smoke — PASS (evidence hiện tại và §7–§12).
+- [x] Không còn TODO/P0/P1 trong `src/`; backlog Phase 5 được ghi rõ (§12).
+
+Evidence rerun 2026-11-07T12:53:00+07:00: `cargo fmt --all --check`, Clippy, `cargo test --all` (279 passed; 2 ignored: Docker Engine integration và manual load), `cargo test --release --locked` pass (debug-only crash/race hooks và manual Docker/load tests bị cfg/ignore như thiết kế), `cargo build --release --locked`, `git diff --check`. Bun 1.4.4 frozen install, typecheck, 29 tests/195 assertions và build vào `/tmp/opencode/todo4-section13-final-dist` pass tại 12:30. Release suite từng lộ xung đột port; test config hiện bind MQTT trên `127.0.0.1:0`, suite release rerun pass. Docker build dùng `-f deploy/Dockerfile`; Docker/Compose smoke, SBOM/scan và dry-run evidence gần nhất nằm ở §7, §8 và §12; không push registry/tag/release.
 
 ## 14. Rà Rust style và giữ thay đổi tối thiểu
 
