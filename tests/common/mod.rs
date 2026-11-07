@@ -70,6 +70,16 @@ pub async fn wait_ready(client: &reqwest::Client, base: &str) {
     panic!("server at {base} did not become ready");
 }
 
+pub async fn wait_presence(app: &TestApp, device_id: &str, online: bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while app.presence.is_online(device_id).unwrap() != online {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("broker presence did not reach the expected connection state");
+}
+
 pub struct TestApp {
     pub base: String,
     pub pool: SqlitePool,

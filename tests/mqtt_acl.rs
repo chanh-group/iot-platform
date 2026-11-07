@@ -4,7 +4,10 @@ mod common;
 
 use std::time::Duration;
 
-use common::{TestApp, TestDevice, mqtt_connect, mqtt_next, mqtt_wait_closed, raw_publish_denied};
+use common::{
+    TestApp, TestDevice, mqtt_connect, mqtt_next, mqtt_wait_closed, raw_publish_denied,
+    wait_presence,
+};
 use rumqttc::{AsyncClient, Event as MqttEvent, EventLoop, Packet, QoS, SubscribeReasonCode};
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -238,22 +241,12 @@ async fn assert_publish_denied(server: &TestApp, device: &TestDevice, topic: &st
         true,
     )
     .await;
-    wait_presence(server, device, true).await;
+    wait_presence(server, &device.id, true).await;
     client
         .publish(topic, QoS::AtLeastOnce, false, b"{}".as_slice())
         .await
         .unwrap();
     mqtt_wait_closed(&mut eventloop, WAIT).await;
-    wait_presence(server, device, false).await;
+    wait_presence(server, &device.id, false).await;
     drop(client);
-}
-
-async fn wait_presence(server: &TestApp, device: &TestDevice, online: bool) {
-    tokio::time::timeout(WAIT, async {
-        while server.presence.is_online(&device.id).unwrap() != online {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("broker presence did not reach the expected connection state");
 }

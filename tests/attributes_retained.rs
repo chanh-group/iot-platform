@@ -1,6 +1,8 @@
 mod common;
 
-use common::{TestApp, mqtt_connect, mqtt_subscribe, mqtt_wait_closed, mqtt_wait_publish};
+use common::{
+    TestApp, mqtt_connect, mqtt_subscribe, mqtt_wait_closed, mqtt_wait_publish, wait_presence,
+};
 use iot_server::observability::metrics::Metrics;
 use rumqttc::{Event, Packet, QoS};
 use std::time::Duration;
@@ -341,6 +343,7 @@ async fn retained_byte_cap_rejects_oversized_replacement_and_counts_it() {
     let status = format!("devices/{}/status", device.id);
     let (client, mut eventloop, _) =
         mqtt_connect(app.mqtt_addr, &device.id, &device.id, &device.token, true).await;
+    wait_presence(&app, &device.id, true).await;
 
     publish_qos1(&client, &mut eventloop, &status, true, b"12345").await;
     client
@@ -348,6 +351,7 @@ async fn retained_byte_cap_rejects_oversized_replacement_and_counts_it() {
         .await
         .expect("queue retained payload over byte cap");
     mqtt_wait_closed(&mut eventloop, Duration::from_secs(2)).await;
+    wait_presence(&app, &device.id, false).await;
 
     assert_eq!(app.retained_count().await, 1);
     assert!(
@@ -359,6 +363,7 @@ async fn retained_byte_cap_rejects_oversized_replacement_and_counts_it() {
 
     let (client, mut eventloop, _) =
         mqtt_connect(app.mqtt_addr, &device.id, &device.id, &device.token, true).await;
+    wait_presence(&app, &device.id, true).await;
     assert_eq!(
         mqtt_subscribe(&client, &mut eventloop, &status, QoS::AtLeastOnce).await,
         rumqttc::SubscribeReasonCode::Success(QoS::AtLeastOnce)
