@@ -346,7 +346,7 @@ url = "sqlite://./data/iot.db"
     const address = vite.httpServer?.address();
     if (!address || typeof address === "string") throw new Error("Vite did not open a browser-test listener.");
 
-    chrome = Bun.spawn([
+    const chromeProcess = Bun.spawn([
       process.env.CHROME_BIN ?? "google-chrome",
       "--headless=new",
       "--no-sandbox",
@@ -356,9 +356,20 @@ url = "sqlite://./data/iot.db"
       "--remote-debugging-port=0",
       `--user-data-dir=${profile}`,
       "about:blank",
-    ], { stdout: "ignore", stderr: "ignore" });
+    ], { stdout: "ignore", stderr: "pipe" });
+    chrome = chromeProcess;
+    const chromeStderr = new Response(chromeProcess.stderr).text();
+    let chromeExitCode: number | null = null;
+    void chromeProcess.exited.then((code) => { chromeExitCode = code; });
     const activePortFile = join(profile, "DevToolsActivePort");
-    await waitFor(async () => await Bun.file(activePortFile).exists(), "Chrome DevTools port", 10_000);
+    await waitFor(async () => {
+      if (await Bun.file(activePortFile).exists()) return true;
+      if (chromeExitCode !== null) {
+        const details = (await chromeStderr).trim().slice(-2_000);
+        throw new Error(`Chrome exited with status ${chromeExitCode} before opening DevTools.${details ? ` stderr: ${details}` : ""}`);
+      }
+      return false;
+    }, "Chrome DevTools port", 30_000);
     const devtoolsPort = (await Bun.file(activePortFile).text()).split("\n")[0];
     if (!devtoolsPort) throw new Error("Chrome did not publish its remote debugging port.");
     let target: DevtoolsTarget | undefined;
