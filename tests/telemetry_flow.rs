@@ -86,6 +86,10 @@ async fn valid_telemetry_is_stored_with_server_timestamp_and_raw_hash() {
 
 #[tokio::test]
 async fn byte_identical_retry_deduplicates_but_changed_bytes_conflict() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("rmqtt::v3=info")
+        .with_test_writer()
+        .try_init();
     let app = TestApp::start().await;
     let device = app.create_device("telemetry-dedup", true).await;
     let first = br#"{"event_id":"evt-retry","values":{"x":1}}"#;
