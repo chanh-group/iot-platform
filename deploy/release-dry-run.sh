@@ -7,7 +7,7 @@ cd "$repo_root"
 version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
 tag="v$version"
 out=${OUT_DIR:-target/release-dry-run}
-image="iot-server:dry-run"
+image=${IOT_RELEASE_IMAGE:-iot-server:dry-run}
 
 # Never delete a caller-supplied path; require a fresh destination.
 case "$out" in
@@ -32,6 +32,12 @@ need() {
         exit 1
     }
 }
+
+need docker
+if docker image inspect "$image" >/dev/null 2>&1; then
+    echo "refusing to overwrite existing image: $image" >&2
+    exit 2
+fi
 
 for tool in cargo bun docker syft trivy cosign python3; do
     need "$tool"

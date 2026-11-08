@@ -266,7 +266,9 @@ Script chạy baseline, audit, build release, build Docker image, tạo SBOM, qu
 Trivy, đóng gói artifact, tạo checksum và ký/verify bằng khóa cosign tạm trong
 `target/release-dry-run/`. Script không gọi registry, không tạo tag và không tạo
 GitHub Release. Script từ chối chạy nếu `OUT_DIR` đã tồn tại; xóa thư mục cũ bằng
-tay nếu muốn chạy lại. Ghi timestamp + danh sách artifact vào hồ sơ release.
+tay nếu muốn chạy lại. Script cũng từ chối tag image đã tồn tại; dùng
+`IOT_RELEASE_IMAGE=iot-server:dry-run-<id>` để chọn tag cục bộ mới, không ghi đè
+image khác. Ghi timestamp + danh sách artifact vào hồ sơ release.
 
 ## 12. Hồ sơ release
 

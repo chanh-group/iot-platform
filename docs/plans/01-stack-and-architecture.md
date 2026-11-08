@@ -56,6 +56,7 @@ Các version dưới đây là version đã kiểm tra tại thời điểm lậ
 | `tokio-tungstenite` | 0.30.0 | WebSocket test |
 | `tempfile` | 3.27.0 | data dir tạm |
 | `assert_cmd` / `predicates` | 2.2.2 / 3.1.4 | CLI test |
+| `paho-mqtt` (Python, chỉ probe thủ công) | 2.1.0 | Giả lập client độc lập để kiểm tra retry MQTT; không thêm vào binary sản phẩm hoặc thay test `rumqttc` |
 
 ## 3. ADR-001 — MQTT broker: RMQTT library mode
 
