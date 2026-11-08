@@ -652,12 +652,14 @@ async fn dispatcher_rechecks_expiry_after_online_check_before_publish() {
         closed_wakes(),
     );
     let now = auth::now_ms();
-    let task = tokio::spawn(async move { dispatcher.run_once(now - 1).await });
+    let task = tokio::spawn(async move { dispatcher.run_once(now).await });
     tokio::time::timeout(Duration::from_secs(1), started.notified())
         .await
         .expect("dispatcher checks online state");
-    sqlx::query("UPDATE commands SET expires_at = ? WHERE id = ?")
-        .bind(auth::now_ms() - 1)
+    let expired_at = auth::now_ms() - 1;
+    sqlx::query("UPDATE commands SET created_at = ?, expires_at = ? WHERE id = ?")
+        .bind(expired_at - 1)
+        .bind(expired_at)
         .bind(&command_id)
         .execute(&pool)
         .await
