@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock build.rs build_support.rs ./
+COPY vendor ./vendor
 COPY src ./src
 COPY migrations ./migrations
 COPY --from=web /web/dist ./web/dist

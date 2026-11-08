@@ -1,0 +1,643 @@
+//! MQTT Server Runtime Context Management
+//!
+//! Provides core infrastructure for building scalable MQTT brokers with:
+//! - Resource-managed task execution pipelines
+//! - Dynamic configuration of server capabilities
+//! - System health monitoring and overload protection
+//!
+//! ## Architectural Components
+//! 1. ​**​ServerContextBuilder​**​: Fluent interface for configuring:
+//!    - Cluster node properties
+//!    - Task execution parameters (workers/queue sizes)
+//!    - Connection/session limits
+//!    - Plugin system integration
+//!
+//! 2. ​**​Runtime Features​**​:
+//!    - Asynchronous task execution with backpressure control
+//!    - Busy state detection (handshake/connection thresholds)
+//!    - Metrics collection and statistical tracking
+//!    - Delayed message publishing with configurable policies
+//!
+//! 3. ​**​Resource Management​**​:
+//!    - Atomic counters for connection/session tracking
+//!    - DashMap-based listener configuration storage
+//!    - Extension points for router/shared state customization
+//!
+//! ## Implementation Highlights
+//! - Zero-cost abstractions through Arc-based sharing
+//! - Tokio-powered async task scheduling
+//! - Feature-gated components (metrics/plugins/stats)
+//! - Thread-safe counters with lock-free operations
+//!
+//! Typical usage flow:
+//! 1. Configure via ServerContextBuilder
+//! 2. Initialize shared components (router/delayed sender)
+//! 3. Monitor system state via is_busy() checks
+//! 4. Access execution metrics through TaskExecStats
+//!
+//! ```rust
+//! use std::sync::Arc;
+//! use rmqtt::context::{ServerContext, TaskExecStats};
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! // Create server context with custom configuration
+//! let ctx = ServerContext::new()
+//!     .node_id(1)
+//!     .task_exec_workers(2500)
+//!     .mqtt_max_sessions(5000)
+//!     .build()
+//!     .await;
+//!
+//! Ok(())
+//! }
+//! ```
+
+use std::fmt;
+use std::iter::Sum;
+use std::ops::Deref;
+use std::sync::Arc;
+use std::time::Duration;
+
+use rust_box::task_exec_queue::{Builder, TaskExecQueue};
+use serde::{Deserialize, Serialize};
+
+use crate::args::CommandArgs;
+use crate::executor::HandshakeExecutor;
+use crate::extend;
+#[cfg(feature = "metrics")]
+use crate::metrics::Metrics;
+use crate::node::Node;
+#[cfg(feature = "plugin")]
+use crate::plugin;
+#[cfg(feature = "plugin")]
+use crate::plugin::PluginManagerConfig;
+use crate::router::DefaultRouter;
+use crate::shared::DefaultShared;
+#[cfg(feature = "stats")]
+use crate::stats::Stats;
+use crate::types::{DashMap, HashMap, ListenerConfig, ListenerId, NodeId};
+use crate::utils::Counter;
+/// Builder for constructing ServerContext with configurable parameters
+/// # Example
+/// ```
+/// use rmqtt::context::ServerContextBuilder;
+/// let builder = ServerContextBuilder::new()
+///     .mqtt_max_sessions(100_000)
+///     .busy_handshaking_limit(100);
+/// ```
+pub struct ServerContextBuilder {
+    /// Command line arguments configuration
+    pub args: CommandArgs,
+    /// Cluster node information
+    pub node: Node,
+
+    /// Number of worker threads for task execution
+    pub task_exec_workers: usize,
+    /// Maximum capacity for task execution queue
+    pub task_exec_queue_max: usize,
+
+    /// Enable/disable busy state checking
+    pub busy_check_enable: bool,
+    /// Maximum allowed concurrent handshakes before busy state
+    pub busy_handshaking_limit: isize,
+
+    /// Maximum concurrent MQTT sessions (0 = unlimited)
+    pub mqtt_max_sessions: isize,
+
+    /// plugins config, path or configMap<plugin_name, toml_string>
+    #[cfg(feature = "plugin")]
+    pub plugins_config: PluginManagerConfig,
+
+    /// Circuit-breaker configuration for gRPC clients.
+    /// Built by `rmqtt-bin` from `Settings::instance().circuit_breaker`.
+    /// Defaults to `CircuitBreakerConfig::default()` when not explicitly set.
+    pub circuit_breaker_config: CircuitBreakerConfig,
+}
+
+impl Default for ServerContextBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ServerContextBuilder {
+    /// Creates a new ServerContextBuilder with default values
+    pub fn new() -> ServerContextBuilder {
+        Self {
+            args: CommandArgs::default(),
+            node: Node::default(),
+            task_exec_workers: 2000,
+            task_exec_queue_max: 300_000,
+            busy_check_enable: true,
+            busy_handshaking_limit: 0,
+            mqtt_max_sessions: 0,
+            #[cfg(feature = "plugin")]
+            plugins_config: PluginManagerConfig::default(),
+            circuit_breaker_config: CircuitBreakerConfig::default(),
+        }
+    }
+
+    /// Sets command line arguments configuration
+    pub fn args(mut self, args: CommandArgs) -> Self {
+        self.args = args;
+        self
+    }
+
+    /// Configures cluster node identifier
+    pub fn node_id(mut self, id: NodeId) -> Self {
+        self.node.id = id;
+        self
+    }
+
+    /// Sets complete Node configuration
+    pub fn node(mut self, node: Node) -> Self {
+        self.node = node;
+        self
+    }
+
+    /// Configures task executor worker thread count
+    pub fn task_exec_workers(mut self, task_exec_workers: usize) -> Self {
+        self.task_exec_workers = task_exec_workers;
+        self
+    }
+
+    /// Sets maximum capacity for task execution queue
+    pub fn task_exec_queue_max(mut self, task_exec_queue_max: usize) -> Self {
+        self.task_exec_queue_max = task_exec_queue_max;
+        self
+    }
+
+    /// Enables/disables busy state checking
+    pub fn busy_check_enable(mut self, busy_check_enable: bool) -> Self {
+        self.busy_check_enable = busy_check_enable;
+        self
+    }
+
+    /// Sets maximum concurrent handshakes threshold
+    pub fn busy_handshaking_limit(mut self, busy_handshaking_limit: isize) -> Self {
+        self.busy_handshaking_limit = busy_handshaking_limit;
+        self
+    }
+
+    /// Sets maximum allowed MQTT sessions
+    pub fn mqtt_max_sessions(mut self, mqtt_max_sessions: isize) -> Self {
+        self.mqtt_max_sessions = mqtt_max_sessions;
+        self
+    }
+
+    /// Sets plugin configuration via a directory path.
+    #[cfg(feature = "plugin")]
+    pub fn plugins_config_dir<N: Into<String>>(mut self, plugins_dir: N) -> Self {
+        self.plugins_config = self.plugins_config.path(plugins_dir.into());
+        self
+    }
+
+    /// Sets the circuit-breaker configuration for gRPC clients.
+    pub fn circuit_breaker_config(mut self, config: CircuitBreakerConfig) -> Self {
+        self.circuit_breaker_config = config;
+        self
+    }
+
+    /// Sets plugin configuration via a key-value map of plugin name to TOML config string.
+    #[cfg(feature = "plugin")]
+    pub fn plugins_config_map(mut self, plugins_config_map: HashMap<String, String>) -> Self {
+        self.plugins_config = self.plugins_config.map(plugins_config_map);
+        self
+    }
+
+    /// Adds a single plugin configuration entry to the plugin config map.
+    /// Adds a single plugin configuration entry to the plugin map.
+    #[cfg(feature = "plugin")]
+    pub fn plugins_config_map_add<N: Into<String>, C: Into<String>>(mut self, name: N, cfg: C) -> Self {
+        self.plugins_config = self.plugins_config.add(name.into(), cfg.into());
+        self
+    }
+
+    /// Sets plugin configuration from a `PluginManagerConfig` instance.
+    /// Merges directory path and map entries into the existing configuration.
+    /// Sets the complete plugin configuration from a `PluginManagerConfig` instance.
+    /// Merges the path and map from the provided config into the builder.
+    #[cfg(feature = "plugin")]
+    pub fn plugins_config(mut self, plugins_config: PluginManagerConfig) -> Self {
+        if let Some(path) = plugins_config.path {
+            self.plugins_config = self.plugins_config.path(path);
+        }
+        self.plugins_config = self.plugins_config.map(plugins_config.map);
+        self
+    }
+
+    /// Constructs the ServerContext with configured parameters
+    pub async fn build(self) -> ServerContext {
+        ServerContext {
+            inner: Arc::new(ServerContextInner {
+                args: self.args,
+                node: self.node,
+                listen_cfgs: DashMap::default(),
+                extends: extend::Manager::new(),
+                #[cfg(feature = "plugin")]
+                plugins: plugin::Manager::new(self.plugins_config),
+                #[cfg(feature = "metrics")]
+                metrics: Metrics::new(),
+                #[cfg(feature = "stats")]
+                stats: Stats::new(),
+                handshake_exec: HandshakeExecutor::new(self.busy_handshaking_limit),
+                execs: DashMap::default(),
+
+                busy_check_enable: self.busy_check_enable,
+                mqtt_max_sessions: self.mqtt_max_sessions,
+
+                handshakings: Counter::new(),
+                connections: Counter::new(),
+                sessions: Counter::new(),
+
+                task_exec_workers: self.task_exec_workers,
+                task_exec_queue_max: self.task_exec_queue_max,
+
+                circuit_breaker_config: self.circuit_breaker_config,
+            }),
+        }
+        .config()
+        .await
+        .start_cpuload_monitoring()
+    }
+}
+
+/// Main server runtime context container
+#[derive(Clone)]
+pub struct ServerContext {
+    inner: Arc<ServerContextInner>,
+}
+
+/// Inner container for server context components
+pub struct ServerContextInner {
+    /// Cluster node information
+    pub node: Node,
+    /// Port-to-listener configuration mappings
+    pub listen_cfgs: DashMap<ListenerId, ListenerConfig>,
+    /// Command line arguments
+    pub args: CommandArgs,
+    /// Extension point manager
+    pub extends: extend::Manager,
+    #[cfg(feature = "plugin")]
+    /// Plugin management system
+    pub plugins: plugin::Manager,
+    #[cfg(feature = "metrics")]
+    /// Metrics collection system
+    pub metrics: Metrics,
+    #[cfg(feature = "stats")]
+    /// Statistical data tracking
+    pub stats: Stats,
+    /// Handshake process executor
+    pub handshake_exec: HandshakeExecutor,
+    /// Task execution queues
+    execs: DashMap<&'static str, TaskExecQueue>,
+
+    /// Busy state check flag
+    pub busy_check_enable: bool,
+    /// Maximum allowed MQTT sessions
+    pub mqtt_max_sessions: isize,
+
+    /// Active handshake counter
+    pub handshakings: Counter,
+    /// Established connection counter
+    pub connections: Counter,
+    /// Active session counter
+    pub sessions: Counter,
+
+    task_exec_workers: usize,
+    task_exec_queue_max: usize,
+
+    /// Circuit-breaker configuration for gRPC clients.
+    /// The `CircuitBreakerLayer` is built from this config on first use.
+    /// Defaults to `CircuitBreakerConfig::default()` when not explicitly set.
+    pub circuit_breaker_config: CircuitBreakerConfig,
+}
+
+impl Deref for ServerContext {
+    type Target = ServerContextInner;
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.inner.as_ref()
+    }
+}
+
+impl ServerContext {
+    /// Creates new ServerContextBuilder instance
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new() -> ServerContextBuilder {
+        ServerContextBuilder::new()
+    }
+
+    /// Configures core system components
+    async fn config(self) -> Self {
+        *self.extends.shared_mut().await = Box::new(DefaultShared::new(Some(self.clone())));
+        *self.extends.router_mut().await = Box::new(DefaultRouter::new(Some(self.clone())));
+        self
+    }
+
+    /// Starts a background asynchronous task that periodically updates the node's CPU load.
+    ///
+    /// If `busy_check_enable` is set to `true`, this function will:
+    /// - Clone the current `ServerContext` instance.
+    /// - Spawn a Tokio task that runs in an infinite loop.
+    /// - In each loop iteration:
+    ///   1. Sleep for `node.busy_update_interval`.
+    ///   2. Call `node.update_cpuload()` to refresh the CPU load metrics.
+    ///
+    /// This method is typically used for monitoring server load to support
+    /// busy-state detection and performance management.
+    ///
+    /// Returns the original `ServerContext` so the call can be chained.
+    fn start_cpuload_monitoring(self) -> ServerContext {
+        if self.busy_check_enable {
+            let scx = self.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(scx.node.busy_update_interval).await;
+                    scx.node.update_cpuload().await;
+                }
+            });
+        }
+        self
+    }
+
+    /// Checks if server is in busy state
+    /// # Returns
+    /// true if server is overloaded or at capacity
+    #[inline]
+    pub async fn is_busy(&self) -> bool {
+        if self.busy_check_enable {
+            self.handshake_exec.is_busy(self).await || self.node.sys_is_busy()
+        } else {
+            false
+        }
+    }
+
+    /// Retrieves or lazily creates a `TaskExecQueue` identified by the given key.
+    ///
+    /// If a queue for this key does not exist, it will be created with the
+    /// configured worker count and queue capacity, then spawned as a background
+    /// Tokio task.
+    #[inline]
+    pub fn get_exec<K: ExecKey>(&self, key: K) -> TaskExecQueue {
+        self.execs
+            .entry(key.get())
+            .or_insert_with(|| {
+                let (exec, task_runner) = Builder::default()
+                    .workers(key.workers().unwrap_or(self.task_exec_workers))
+                    .queue_max(key.queue_max().unwrap_or(self.task_exec_queue_max))
+                    .build();
+
+                tokio::spawn(async move {
+                    task_runner.await;
+                });
+                exec
+            })
+            .value()
+            .clone()
+    }
+
+    /// Returns a snapshot of all registered task execution queues as a map of name to queue.
+    #[inline]
+    pub fn execs(&self) -> HashMap<String, TaskExecQueue> {
+        self.execs.iter().map(|entry| (entry.key().to_string(), entry.value().clone())).collect()
+    }
+}
+
+impl fmt::Debug for ServerContext {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "ServerContext node: {:?}, \
+            handshake_exec.active_count: {}, \
+            busy_check_enable: {}, mqtt_max_sessions: {}",
+            self.node,
+            self.handshake_exec.active_count(),
+            self.busy_check_enable,
+            self.mqtt_max_sessions
+        )?;
+        Ok(())
+    }
+}
+
+/// Number of worker threads for task execution.
+pub type ExecWorkers = usize;
+
+/// Maximum capacity for a task execution queue.
+pub type ExecQueueMax = usize;
+
+/// Key trait for identifying and configuring task execution queues.
+///
+/// Implementors provide a static key name and optional worker/queue parameters
+/// for lazy initialization of `TaskExecQueue` instances via `ServerContext::get_exec`.
+pub trait ExecKey {
+    /// Returns the static key name identifying this execution queue.
+    fn get(&self) -> &'static str;
+    /// Returns the optional worker thread count for this queue.
+    fn workers(&self) -> Option<ExecWorkers>;
+    /// Returns the optional maximum queue capacity for this queue.
+    fn queue_max(&self) -> Option<ExecQueueMax>;
+}
+
+impl ExecKey for &'static str {
+    fn get(&self) -> &'static str {
+        self
+    }
+
+    fn workers(&self) -> Option<ExecWorkers> {
+        None
+    }
+
+    fn queue_max(&self) -> Option<ExecQueueMax> {
+        None
+    }
+}
+
+impl ExecKey for (&'static str, ExecWorkers, ExecQueueMax) {
+    fn get(&self) -> &'static str {
+        self.0
+    }
+
+    fn workers(&self) -> Option<ExecWorkers> {
+        Some(self.1)
+    }
+
+    fn queue_max(&self) -> Option<ExecQueueMax> {
+        Some(self.2)
+    }
+}
+
+/// Execution statistics for task queues
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+pub struct TaskExecStats {
+    /// Currently active tasks
+    pub active_count: isize,
+    /// Total completed tasks
+    pub completed_count: isize,
+    /// Pending wake-up notifications
+    pub pending_wakers_count: usize,
+    /// Waiting wake-up notifications
+    pub waiting_wakers_count: usize,
+    /// Tasks waiting in queue
+    pub waiting_count: isize,
+    /// Tasks processed per second
+    pub rate: f64,
+}
+
+impl TaskExecStats {
+    /// Collects statistics from task execution queue
+    /// # Arguments
+    /// * `exec` - Task queue to analyze
+    #[inline]
+    pub async fn from_exec(exec: &TaskExecQueue) -> Self {
+        Self {
+            active_count: exec.active_count(),
+            completed_count: exec.completed_count().await,
+            pending_wakers_count: exec.pending_wakers_count(),
+            waiting_wakers_count: exec.waiting_wakers_count(),
+            waiting_count: exec.waiting_count(),
+            rate: exec.rate().await,
+        }
+    }
+
+    /// Combines two statistics instances (consuming self)
+    #[inline]
+    fn add2(mut self, other: &Self) -> Self {
+        self.add(other);
+        self
+    }
+
+    /// Aggregates statistics from another instance
+    #[inline]
+    pub fn add(&mut self, other: &Self) {
+        self.active_count += other.active_count;
+        self.completed_count += other.completed_count;
+        self.pending_wakers_count += other.pending_wakers_count;
+        self.waiting_wakers_count += other.waiting_wakers_count;
+        self.waiting_count += other.waiting_count;
+        self.rate += other.rate;
+    }
+}
+
+impl Sum for TaskExecStats {
+    fn sum<I: Iterator<Item = TaskExecStats>>(iter: I) -> Self {
+        iter.fold(TaskExecStats::default(), |acc, x| acc.add2(&x))
+    }
+}
+
+impl Sum<&'static TaskExecStats> for TaskExecStats {
+    fn sum<I: Iterator<Item = &'static TaskExecStats>>(iter: I) -> Self {
+        iter.fold(TaskExecStats::default(), |acc, x| acc.add2(x))
+    }
+}
+
+// ─── Circuit Breaker Configuration ───────────────────────────────────────
+
+/// Unified circuit-breaker configuration for gRPC client resilience.
+///
+/// This is a pure-configuration struct. The actual `CircuitBreakerLayer`
+/// (from `tower_resilience_circuitbreaker`) is built from this config
+/// in `GrpcClient::new()`.
+///
+/// The model is **sliding-window failure-rate**: calls are tracked within a
+/// sliding window (count-based or time-based), and when the failure rate
+/// exceeds `failure_rate_threshold` (and `minimum_number_of_calls` has been
+/// reached), the circuit opens. After `wait_duration_in_open` elapses, a
+/// probe is allowed (HALF_OPEN). Slow calls beyond `slow_call_duration_threshold`
+/// are also counted as failures when their rate exceeds
+/// `slow_call_rate_threshold`.
+#[derive(Debug, Clone)]
+pub struct CircuitBreakerConfig {
+    /// Failure rate threshold (0.0 – 1.0). Default: 0.25
+    pub failure_rate_threshold: f64,
+    /// Sliding window configuration (enum — see [`WindowConfig`]).
+    /// Default: `WindowConfig::TimeBased` with [`TimeBasedWindowConfig`] defaults.
+    pub window: WindowConfig,
+    /// Minimum number of calls before the breaker can trip. Default: 10
+    pub minimum_number_of_calls: usize,
+    /// Duration the breaker stays Open before transitioning to HalfOpen. Default: 30 s
+    pub wait_duration_in_open: Duration,
+    /// Slow call duration threshold. Default: 2 s
+    pub slow_call_duration_threshold: Duration,
+    /// Slow call rate threshold. Default: 1.0 (disabled)
+    pub slow_call_rate_threshold: f64,
+    /// Name label for observability. Default: "grpc"
+    pub name: String,
+}
+
+/// CountBased 滑动窗口专有配置。
+///
+/// 仅在 `WindowConfig::CountBased` 时生效。
+#[derive(Debug, Clone)]
+pub struct CountBasedWindowConfig {
+    /// 滑动窗口大小（调用次数）。默认: 20
+    pub sliding_window_size: usize,
+}
+
+impl Default for CountBasedWindowConfig {
+    fn default() -> Self {
+        Self { sliding_window_size: 20 }
+    }
+}
+
+impl From<CountBasedWindowConfig> for WindowConfig {
+    fn from(cfg: CountBasedWindowConfig) -> Self {
+        Self::CountBased(cfg)
+    }
+}
+
+/// TimeBased 滑动窗口专有配置。
+///
+/// 仅在 `WindowConfig::TimeBased` 时生效。
+#[derive(Debug, Clone)]
+pub struct TimeBasedWindowConfig {
+    /// 滑动窗口时间跨度。默认: 45s
+    pub sliding_window_duration: Duration,
+    /// 最大跟踪调用数（影响 `minimum_number_of_calls` 默认值）。默认: 20
+    pub sliding_window_size: usize,
+}
+
+impl Default for TimeBasedWindowConfig {
+    fn default() -> Self {
+        Self { sliding_window_duration: Duration::from_secs(45), sliding_window_size: 20 }
+    }
+}
+
+impl From<TimeBasedWindowConfig> for WindowConfig {
+    fn from(cfg: TimeBasedWindowConfig) -> Self {
+        Self::TimeBased(cfg)
+    }
+}
+
+/// 滑动窗口配置枚举。
+///
+/// - `CountBased` — 基于调用次数的滑动窗口
+/// - `TimeBased` — 基于时间跨度的滑动窗口
+#[derive(Debug, Clone)]
+pub enum WindowConfig {
+    /// 基于调用次数的滑动窗口（携带 `CountBasedWindowConfig`）
+    CountBased(CountBasedWindowConfig),
+    /// 基于时间跨度的滑动窗口（携带 `TimeBasedWindowConfig`）
+    TimeBased(TimeBasedWindowConfig),
+}
+
+impl Default for WindowConfig {
+    fn default() -> Self {
+        Self::TimeBased(TimeBasedWindowConfig::default())
+    }
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            failure_rate_threshold: 0.25,
+            window: WindowConfig::default(),
+            minimum_number_of_calls: 10,
+            wait_duration_in_open: Duration::from_secs(30),
+            slow_call_duration_threshold: Duration::from_secs(2),
+            slow_call_rate_threshold: 1.0,
+            name: "grpc".into(),
+        }
+    }
+}

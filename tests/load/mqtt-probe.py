@@ -162,7 +162,8 @@ def main():
                 reasons = [future.result(timeout=10) for future in futures]
             if 'Server unavailable' not in reasons:
                 raise RuntimeError('no server-unavailable response observed')
-            retries = retry_connect(device_id, token, port, 'Server unavailable')
+            retry_reason = next(reason for reason in reasons if reason == 'Server unavailable')
+            retries = retry_connect(device_id, token, port, retry_reason)
             time.sleep(0.1)
             events = [(did, secret, 'probe-' + uuid.uuid4().hex) for did, secret in devices]
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(events)) as executor:
@@ -174,7 +175,7 @@ def main():
                 raise RuntimeError(f'unexpected row count: {rows}')
             print(json.dumps({'connect_attempts': len(reasons),
                               'connack_counts': {reason: reasons.count(reason) for reason in sorted(set(reasons))},
-                              'initial_retry_reason': 'Server unavailable',
+                              'initial_retry_reason': retry_reason,
                               'retry_attempts': len(retries), 'retry_results': retries,
                               'telemetry_devices': len(events),
                               'publish_requests': sum(item['publish_requests'] for item in telemetry),

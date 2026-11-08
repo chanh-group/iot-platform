@@ -22,6 +22,7 @@ Lỗi kết nối cố ý không tiết lộ device không tồn tại, đã dis
 | --- | --- |
 | CONNACK `0x04` | Sai username/password; cũng dùng cho device không tồn tại, đã disable hoặc đã revoke, và cho `client_id != username` |
 | CONNACK `0x05` | MQTT 3.1 (protocol level 3) không được hỗ trợ |
+| CONNACK `0x03` | Broker/session tạm thời unavailable; retry với exponential backoff + jitter có giới hạn, chỉ một CONNECT đang chạy cho mỗi `client_id` |
 | CONNACK `0x87` | MQTT 5 (protocol level 5) không được hỗ trợ |
 | Connection bị từ chối | Đã đạt connection cap của server, hoặc listener không khả dụng |
 

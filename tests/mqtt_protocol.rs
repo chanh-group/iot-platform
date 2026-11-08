@@ -10,8 +10,90 @@ use iot_server::config::schema::MqttConfig;
 use rumqttc::{
     AsyncClient, ConnectReturnCode, Event as MqttEvent, LastWill, Packet, QoS, SubscribeReasonCode,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 const WAIT: Duration = Duration::from_secs(5);
+
+fn push_mqtt_string(body: &mut Vec<u8>, value: &str) {
+    body.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    body.extend_from_slice(value.as_bytes());
+}
+
+fn mqtt_packet(header: u8, body: Vec<u8>) -> Vec<u8> {
+    let mut packet = vec![header];
+    let mut remaining = body.len();
+    loop {
+        let mut byte = (remaining % 128) as u8;
+        remaining /= 128;
+        if remaining > 0 {
+            byte |= 0x80;
+        }
+        packet.push(byte);
+        if remaining == 0 {
+            break;
+        }
+    }
+    packet.extend_from_slice(&body);
+    packet
+}
+
+async fn raw_mqtt_connect(
+    address: std::net::SocketAddr,
+    device_id: &str,
+    token: &str,
+) -> TcpStream {
+    let mut body = Vec::new();
+    push_mqtt_string(&mut body, "MQTT");
+    body.extend_from_slice(&[4, 0xc2]); // MQTT 3.1.1, clean session, username, password
+    body.extend_from_slice(&30u16.to_be_bytes());
+    push_mqtt_string(&mut body, device_id);
+    push_mqtt_string(&mut body, device_id);
+    push_mqtt_string(&mut body, token);
+
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    stream.write_all(&mqtt_packet(0x10, body)).await.unwrap();
+    let mut connack = [0u8; 4];
+    tokio::time::timeout(WAIT, stream.read_exact(&mut connack))
+        .await
+        .expect("broker should answer CONNECT")
+        .unwrap();
+    assert_eq!(connack, [0x20, 0x02, 0x00, 0x00]);
+    stream
+}
+
+#[tokio::test]
+async fn reconnect_succeeds_if_previous_session_drops_a_queued_kick() {
+    let config = MqttConfig {
+        max_subscriptions_per_client: 1_024,
+        ..MqttConfig::default()
+    };
+    let app = TestApp::builder().mqtt_config(config).start().await;
+    let device = app.create_device("protocol-kick-race", true).await;
+
+    for round in 1..=8u16 {
+        let mut old = raw_mqtt_connect(app.mqtt_addr, &device.id, &device.token).await;
+        let mut body = round.to_be_bytes().to_vec();
+        for index in 0..1_024 {
+            push_mqtt_string(
+                &mut body,
+                &format!("devices/{}/data/probe-{index}", device.id),
+            );
+            body.push(1);
+        }
+        old.write_all(&mqtt_packet(0x82, body)).await.unwrap();
+        drop(old);
+
+        let new = raw_mqtt_connect(app.mqtt_addr, &device.id, &device.token).await;
+        drop(new);
+        wait_until(
+            || !app.presence.is_online(&device.id).unwrap_or(true),
+            WAIT,
+            "takeover session disconnect",
+        )
+        .await;
+    }
+}
 
 async fn next_telemetry_ack(
     eventloop: &mut rumqttc::EventLoop,

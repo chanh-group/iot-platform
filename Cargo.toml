@@ -41,3 +41,6 @@ reqwest = { version = "0.13.5", features = ["cookies", "json", "query"] }
 rumqttc = { version = "0.25.1", default-features = false }
 tempfile = "3.27.0"
 tokio-tungstenite = "0.30.0"
+
+[patch.crates-io]
+rmqtt = { path = "vendor/rmqtt" }

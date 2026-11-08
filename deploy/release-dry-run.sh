@@ -110,9 +110,12 @@ step "Sign and verify checksums with an ephemeral key"
 export COSIGN_PASSWORD
 COSIGN_PASSWORD=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
 cosign generate-key-pair --output-key-prefix "$out/cosign" >/dev/null
-cosign sign-blob --yes --key "$out/cosign.key" \
+cosign signing-config create --no-default-fulcio --no-default-oidc \
+    --no-default-rekor --no-default-tsa --out "$out/cosign-signing-config.json"
+cosign sign-blob --yes --signing-config "$out/cosign-signing-config.json" \
+    --key "$out/cosign.key" \
     --bundle "$out/SHA256SUMS.bundle" "$out/SHA256SUMS"
-cosign verify-blob --key "$out/cosign.pub" \
+cosign verify-blob --insecure-ignore-tlog --key "$out/cosign.pub" \
     --bundle "$out/SHA256SUMS.bundle" "$out/SHA256SUMS"
 rm -f "$out/cosign.key"
 

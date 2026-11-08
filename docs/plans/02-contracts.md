@@ -64,6 +64,8 @@ Mọi lỗi JSON có cùng envelope, không có stack trace:
 - `username` = `device_id`; `password` = device token; `client_id` = `device_id`.
 - `client_id` khác `username`: RMQTT trả CONNACK `0x04`; không phân biệt với credential sai ra bên ngoài.
 - Unknown device, device disabled, credential revoked, sai token: CONNACK `0x04` (bad username/password), không phân biệt lý do.
+- Khi takeover `client_id` trùng, broker kick session cũ rồi nhận session mới; nếu session cũ đã kết thúc trong lúc teardown và không thể trả kick acknowledgement, xóa peer cũ và vẫn xử lý takeover, không từ chối chỉ vì ACK nội bộ bị mất.
+- CONNACK `0x03` (`Server unavailable`) là lỗi tạm thời của listener/session, không phải kết quả xác thực. Client có thể retry cùng device ID với exponential backoff và jitter có giới hạn; chỉ chạy tối đa một CONNECT cùng `client_id` tại một thời điểm. Không bỏ telemetry local vì PUBACK hoặc CONNACK; chỉ application ACK `stored`/`duplicate` hoàn tất telemetry đã commit.
 - Token đúng nhưng device vừa bị disable/rotate: từ chối; kết nối đang mở bị kick.
 - `clean_session` 0 và 1 đều được phép. Session offline tối đa `max_session_expiry_ms` (mặc định 1 giờ), sau đó xóa.
 - Không hỗ trợ MQTT over WebSocket, `$share`, topic alias, MQTT 5 properties.

@@ -268,7 +268,10 @@ Trivy, đóng gói artifact, tạo checksum và ký/verify bằng khóa cosign t
 GitHub Release. Script từ chối chạy nếu `OUT_DIR` đã tồn tại; xóa thư mục cũ bằng
 tay nếu muốn chạy lại. Script cũng từ chối tag image đã tồn tại; dùng
 `IOT_RELEASE_IMAGE=iot-server:dry-run-<id>` để chọn tag cục bộ mới, không ghi đè
-image khác. Ghi timestamp + danh sách artifact vào hồ sơ release.
+image khác. Chữ ký local dùng khóa tạm, không tải lên transparency log; verify
+bằng public key với `--insecure-ignore-tlog`. Đây chỉ là kiểm tra chữ ký local,
+không thay chữ ký OIDC/provenance của release thật. Ghi timestamp + danh sách
+artifact vào hồ sơ release.
 
 ## 12. Hồ sơ release
 

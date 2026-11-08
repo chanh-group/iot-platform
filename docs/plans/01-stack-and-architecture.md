@@ -395,3 +395,10 @@ core -> không import axum/rmqtt/sqlx
 - `cargo deny` cho license/duplicate; `cargo audit` cho advisory. Release chỉ chấp nhận vulnerability exception có owner, lý do, mitigation và ngày hết hạn.
 - Release tạo SBOM từ lockfile và image, quét dependency + OS image, rồi ký image và provenance/checksum. Artifact SBOM, kết quả scan và chữ ký/provenance phải lưu cùng release.
 - Không dùng git dependency trong release.
+
+### ADR-008 — Backport session takeover race fix cho RMQTT 0.24.0
+
+- **Bối cảnh:** CI tái hiện MQTT 3.1.1 CONNACK `0x03` khi cùng device reconnect trong lúc session cũ teardown. Log RMQTT ghi `recv kick result is RecvError(())`; đây là trường hợp `LockEntry::kick` không nhận ACK từ session đã kết thúc nhưng lại trả lỗi trước khi xóa peer stale.
+- **Quyết định:** Giữ RMQTT **0.24.0** và feature set hiện tại; không đổi broker/API hoặc lấy Git dependency. Vendor source crate đúng từ crates.io (`sha256 cfcb1b8c14ed8f7111a1a5abdf059b4fd42f11b2c3feceadb386f2aca7b27fc8`) ở `vendor/rmqtt`, áp dụng backport upstream [`ad65cac60ee30f25c65518ae557a4efa4d8e3683`](https://github.com/rmqtt/rmqtt/commit/ad65cac60ee30f25c65518ae557a4efa4d8e3683): dropped kick ACK đi tiếp tới `_remove`, tương tự timeout; không coi đây là auth/kick failure khi session task đã biến mất.
+- **Bằng chứng:** Regression raw MQTT trong `tests/mqtt_protocol.rs::reconnect_succeeds_if_previous_session_drops_a_queued_kick` dựng session cũ đang xử lý SUBSCRIBE lớn, đóng socket, rồi takeover cùng client ID. Test được chạy đối chiếu: RMQTT nguyên bản trả `0x03`; backport pass. A20 fail-closed, kick failure, MQTT auth/ACL/protocol và command reconnect cũng phải pass.
+- **Vận hành nâng cấp:** Giữ patch tối thiểu, ghi nguồn/license trong `vendor/rmqtt/LOCAL_PATCH.md`. Theo dõi upstream; khi bản RMQTT đã phát hành chứa fix, nâng theo lô với A19 và bỏ `[patch.crates-io]`/vendor. Backport không thay thế kiểm thử firmware retry: client vẫn chỉ được có một CONNECT đang chạy cho mỗi client ID.
