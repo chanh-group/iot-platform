@@ -1,6 +1,6 @@
 [package]
 name = "iot-server"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 publish = false
 rust-version = "1.94"
@@ -44,3 +44,4 @@ tokio-tungstenite = "0.30.0"
 
 [patch.crates-io]
 rmqtt = { path = "vendor/rmqtt" }
+sqlx-sqlite = { path = "vendor/sqlx-sqlite" }
