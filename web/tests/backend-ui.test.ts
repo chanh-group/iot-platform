@@ -975,6 +975,7 @@ url = "sqlite://./data/iot.db"
     if (!sessionToken) throw new Error("Could not find the browser's HttpOnly admin session cookie.");
     const sessionHash = createHash("sha256").update(sessionToken).digest();
     const sessionDatabase = new Database(dbPath);
+    sessionDatabase.exec("PRAGMA busy_timeout = 5000");
     const expired = sessionDatabase.query("UPDATE sessions SET expires_at = ? WHERE token_hash = ?").run(Date.now() - 1_000, sessionHash);
     sessionDatabase.close();
     expect(expired.changes).toBe(1);
