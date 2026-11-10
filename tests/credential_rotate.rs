@@ -146,7 +146,7 @@ async fn audit_failure_rolls_back_rotation_and_preserves_old_credential() {
     let app = TestApp::start().await;
     let http = admin_client(&app, "credential-audit").await;
     let device = app.create_device("credential-audit", true).await;
-    let (old_client, mut old_eventloop, _) =
+    let (old_client, _old_eventloop, _) =
         mqtt_connect(app.mqtt_addr, &device.id, &device.id, &device.token, true).await;
     let before: (String, Vec<u8>) = sqlx::query_as(
         "SELECT id, token_hash FROM device_credentials WHERE device_id = ? AND status = 'active'",
@@ -194,16 +194,19 @@ async fn audit_failure_rolls_back_rotation_and_preserves_old_credential() {
         .unwrap(),
         0
     );
+    drop(old_client);
+    let (reconnected, mut eventloop, _) =
+        mqtt_connect(app.mqtt_addr, &device.id, &device.id, &device.token, true).await;
     mqtt_publish(
-        &old_client,
+        &reconnected,
         &format!("devices/{}/data/after-rollback", device.id),
         QoS::AtLeastOnce,
         false,
         b"still-connected",
     )
     .await;
-    mqtt_wait_puback(&mut old_eventloop, Duration::from_secs(2)).await;
-    drop(old_client);
+    mqtt_wait_puback(&mut eventloop, Duration::from_secs(2)).await;
+    drop(reconnected);
 }
 
 #[tokio::test]

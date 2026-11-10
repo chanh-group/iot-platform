@@ -77,7 +77,7 @@ async fn postgres_startup_retries_are_bounded_and_listeners_stay_closed() {
 }
 
 #[tokio::test]
-#[ignore = "requires Docker and an isolated postgres:18.6-bookworm fixture; run tests/postgres_outage.sh"]
+#[ignore = "requires Docker and an isolated postgres:18.6-bookworm fixture; run tests/postgres_recovery.sh"]
 async fn postgres_outage_degrades_readiness_never_fakes_stored_and_recovers() {
     let url = std::env::var("IOT_TEST_POSTGRES_URL").expect("isolated PostgreSQL test URL");
     let container = std::env::var("IOT_TEST_POSTGRES_CONTAINER")

@@ -75,6 +75,8 @@ impl TelemetryRepository for PostgresTelemetryRepository {
                 });
             }
         }
+        #[cfg(debug_assertions)]
+        crate::test_hooks::pause("IOT_TEST_PAUSE_BEFORE_COMMIT").await;
         tx.commit().await?;
         Ok(outcomes)
     }
