@@ -141,7 +141,7 @@ Trạng thái online do kết nối xác thực quyết định; status/LWT ch�
 - `event_id`: node sinh và giữ nguyên khi retry; bắt buộc cho luồng xác nhận bền vững.
 - `ts`: Unix milliseconds UTC; thiếu thì dùng thời gian server nhận.
 - `received_at`: server tự ghi, không cho client ghi đè.
-- `values`: object phẳng, tối đa 128 key; giá trị number hữu hạn, boolean hoặc string tối đa 4 KiB; không nhận object/array/null trong MVP.
+- `values`: object phẳng, tối đa 128 key; giá trị number hữu hạn, boolean hoặc string tối đa 4 KiB không chứa U+0000; không nhận object/array/null trong MVP.
 - ID thiết bị lấy từ principal và topic. Tổng payload giới hạn bởi cấu hình.
 - Timestamp sai kiểu hoặc vượt chính sách cho phép phải bị từ chối; không âm thầm sửa.
 - Retained publish vào topic telemetry/command không được xử lý thành telemetry/lệnh; trả lỗi ứng dụng cho telemetry có event ID hợp lệ.
@@ -227,6 +227,7 @@ Unique `(device_id, event_id)`; index telemetry `(device_id, ts, internal_id)`, 
 - SQLite là mặc định, dùng WAL và thiết kế một đường ghi batch để hạn chế cạnh tranh writer.
 - PostgreSQL/MySQL dùng pool hữu hạn, transaction và prepared/bound parameters.
 - Migration và kiểu lưu JSON do từng backend quyết định; repository giữ semantics chung.
+- Để JSONB round-trip giống SQLite, mọi JSON key/string được persist (telemetry, attributes, device metadata, command params/result/ACK) đều từ chối U+0000 bằng validation chung trước khi enqueue hoặc ghi DB.
 - Đổi URL không tự migrate dữ liệu giữa các engine. Công cụ export/import là hạng mục riêng.
 - Migrate trước khi mở listener; lỗi migration làm khởi động thất bại. Không tự downgrade schema.
 - Retention dựa trên `received_at`, xóa theo batch, không giữ lock dài.

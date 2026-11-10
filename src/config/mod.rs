@@ -4,6 +4,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 pub mod config_error;
+pub mod database;
 pub mod load;
 pub mod paths;
 pub mod redact;

@@ -124,22 +124,29 @@ async fn byte_identical_retry_deduplicates_but_changed_bytes_conflict() {
 async fn invalid_payload_is_not_persisted() {
     let app = TestApp::start().await;
     let device = app.create_device("telemetry-invalid", true).await;
-    let ack = publish(
+    for raw in [
+        &br#"{"event_id":"evt-bad","values":{"x":null}}"#[..],
+        &br#"{"event_id":"evt-nul","values":{"x":"\u0000"}}"#[..],
+    ] {
+        let ack = publish(&app, &device.id, &device.token, raw).await;
+        assert_eq!(ack["status"], "rejected");
+        assert_eq!(ack["code"], "invalid_payload");
+    }
+    let accepted = publish(
         &app,
         &device.id,
         &device.token,
-        br#"{"event_id":"evt-bad","values":{"x":null}}"#,
+        br#"{"event_id":"evt-after-nul","values":{"x":1}}"#,
     )
     .await;
-    assert_eq!(ack["status"], "rejected");
-    assert_eq!(ack["code"], "invalid_payload");
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(accepted["status"], "stored");
+    wait_for_rows(&app, &device.id, 1).await;
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM telemetry_events WHERE device_id = ?")
         .bind(&device.id)
         .fetch_one(&app.pool)
         .await
         .unwrap();
-    assert_eq!(rows, 0);
+    assert_eq!(rows, 1);
 }
 
 #[tokio::test]

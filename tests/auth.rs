@@ -102,7 +102,7 @@ async fn login_me_logout_roundtrip_and_cookie_flags() {
             .unwrap();
     assert_eq!(failed_logins, 0);
 
-    let response = login(&client, &server, "admin", PASSWORD).await;
+    let response = login(&client, &server, "ADMIN", PASSWORD).await;
     assert_eq!(response.status(), StatusCode::OK);
     let cookie = response
         .headers()

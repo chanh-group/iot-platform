@@ -4,7 +4,9 @@ use std::fs;
 use std::path::Path;
 
 use crate::config::schema::Config;
-use crate::config::{ConfigError, DatabaseBackend, LoadedConfig, paths, runtime, validate};
+use crate::config::{
+    ConfigError, DatabaseBackend, LoadedConfig, database, paths, runtime, validate,
+};
 
 /// Reads `conf.toml`, resolves paths and env, applies `runtime.toml`, validates.
 pub fn load(path: &Path) -> Result<LoadedConfig, ConfigError> {
@@ -115,6 +117,10 @@ pub fn load_with_env(
 
     let database_backend = DatabaseBackend::from_url(&database_url)
         .ok_or_else(|| ConfigError::Invalid(vec!["database: unsupported URL scheme".to_owned()]))?;
+    if database_backend == DatabaseBackend::Postgres {
+        database::postgres_connect_options(&database_url)
+            .map_err(|error| ConfigError::Invalid(vec![format!("database.url: {error}")]))?;
+    }
 
     let runtime_config =
         runtime::RuntimeConfigStore::new(runtime_path.clone(), config.clone(), revision, overlay);

@@ -170,7 +170,7 @@ Quy tắc:
 | `ts` | Tùy chọn; Unix ms; thiếu thì dùng `received_at`; không được lệch quá khứ `max_past_skew_ms` hoặc tương lai `max_future_skew_ms` |
 | `values` | Bắt buộc; object phẳng; 1..128 key |
 | key | 1..64 ký tự `[A-Za-z0-9_.:-]`, không bắt đầu bằng `$` |
-| value | number hữu hạn, boolean, hoặc string ≤ 4 096 byte; **không** null/object/array |
+| value | number hữu hạn, boolean, hoặc string ≤ 4 096 byte không chứa U+0000; **không** null/object/array |
 | payload | JSON object, UTF-8, không trailing data; ≤ `max_payload_bytes` |
 
 - `event_id` bắt buộc cho mọi telemetry trong MVP, kể cả QoS 0.
@@ -265,7 +265,7 @@ Device ACK `devices/{id}/commands/ack`, QoS 0/1:
 ```
 
 - `status` chỉ `succeeded` hoặc `failed`.
-- `result` là JSON bất kỳ ≤ 16 384 byte; `error` ≤ 512 ký tự; vượt giới hạn → ACK bị bỏ qua + log.
+- `result` là JSON bất kỳ ≤ 16 384 byte, không có U+0000 trong key/string; `error` ≤ 512 ký tự và không có U+0000; vi phạm → ACK bị bỏ qua + log.
 - Server kiểm tra `device_id` của principal khớp command; ACK lạc device bị bỏ qua + log.
 - ACK trùng không đổi terminal state.
 - ACK sau `expires_at` được lưu vào `late_ack_at`/`late_ack_json` để chẩn đoán; command vẫn `expired`.
@@ -505,9 +505,10 @@ Không có bảng `schema_migrations` riêng, không có bảng projection lates
 - PostgreSQL 18.6 là phiên bản triển khai đầu tiên theo ADR-010; SQLx 0.9.0 dùng driver `postgres` và Rustls. SQLite vẫn là mặc định và không cần server ngoài.
 - Backend được chọn từ URL `database.url`/`database.url_env`: `sqlite://` hoặc `postgres://`/`postgresql://`. Hai trường cấu hình loại trừ nhau; URL env thiếu, URL không hợp lệ hoặc scheme chưa hỗ trợ làm startup fail, không fallback. Secret chỉ được resolve từ environment theo tên đã cấu hình; URL đầy đủ không xuất hiện trong log/API.
 - PostgreSQL dùng pool hữu hạn, connect/acquire timeout và tối đa 5 lần retry startup với backoff 100/200/400/800 ms. Migrate trước listener bằng migration directory riêng và `_sqlx_migrations`; migration failure làm startup fail, không xóa DB, không auto downgrade.
-- Binding dùng signed `BIGINT` cho thời gian và telemetry ID, UUID canonical dạng `TEXT`, hash dạng `BYTEA`, boolean `BOOLEAN`; JSON dùng `JSONB` nhưng phải round-trip theo `serde_json::Value`. Tên device unique/search theo ASCII case-insensitive semantics của SQLite, không phụ thuộc locale; FK, cascade, credential uniqueness và các ràng buộc domain giữ nguyên.
+- PostgreSQL connection URL phải chỉ rõ `sslmode=verify-full`; chỉ chấp nhận `sslmode=disable` khi operator cấu hình rõ cho DB local/cô lập. Không dùng mặc định SQLx `prefer` hoặc `PGSSLMODE` để quyết định chính sách.
+- Binding dùng signed `BIGINT` cho thời gian và telemetry ID, UUID canonical dạng `TEXT`, hash dạng `BYTEA`, boolean `BOOLEAN`; JSON dùng `JSONB`. Mọi key/string trong JSON được persist đều từ chối U+0000 bằng validation chung trước enqueue/ghi, bảo đảm round-trip đồng nhất cả SQLite và PostgreSQL. Tên device unique/search theo ASCII case-insensitive semantics của SQLite, không phụ thuộc locale; FK, cascade, credential uniqueness và các ràng buộc domain giữ nguyên.
 - Transaction mặc định `READ COMMITTED`. Audit atomic với mutation trong cùng repository operation. Telemetry allocator dùng một hàng trong DB được khóa `FOR UPDATE` trong transaction tới commit/rollback; ID allocator update và event insert cùng transaction. Sequence/identity riêng không chứng minh được committed-prefix. Gap do duplicate/conflict được phép nếu không transaction tương lai có thể lấp ID dưới checkpoint.
-- PostgreSQL URL giữ nguyên tham số SQLx (bao gồm `sslmode`); production dùng `verify-full` và CA đúng. Chỉ cho phép `sslmode=disable` khi operator cấu hình rõ cho database local/cô lập.
+- PostgreSQL URL giữ nguyên tham số SQLx sau khi validation chính sách; yêu cầu `sslmode=verify-full` hoặc `sslmode=disable` được cấu hình rõ. `check` parse URL/options nhưng không kết nối DB.
 - Session cleanup production chạy mỗi giờ, theo batch tối đa 5 000 row/lượt với nghỉ 10 ms giữa các batch; lỗi được ghi log/metric, không làm chết process. SQLite và mỗi backend phải kiểm thử cutoff, batch cap, scheduler và cancellation.
 - Đây là mapping PostgreSQL P5-02, không thay thế test/A18 evidence; PostgreSQL chỉ được công bố hỗ trợ sau khi toàn bộ gate backend đạt.
 
@@ -640,7 +641,7 @@ Query: `limit`, `cursor`, `q` (tùy chọn, 2..64 ký tự, tìm trong name/id),
 ```
 
 - `name`: 1..64 ký tự Unicode, trim, không control char; unique case-insensitive (ASCII).
-- `metadata`: object ≤ 8 192 byte, depth ≤ 8; mặc định `{}`.
+- `metadata`: object ≤ 8 192 byte, depth ≤ 8, không chứa U+0000 trong key/string; mặc định `{}`.
 - `enabled`: mặc định true.
 - Token chỉ xuất hiện trong response này; không log.
 - Trùng tên → `409 device_name_conflict`.
@@ -759,7 +760,7 @@ Query: `limit` mặc định 50, từ 1 đến 200; `cursor` tùy chọn. Sort `
 ```
 
 - `name`: 1..64, `^[a-z][a-z0-9_.-]{0,63}$`.
-- `params`: object ≤ 16 384 byte; mặc định `{}`.
+- `params`: object ≤ 16 384 byte, không chứa U+0000 trong key/string; mặc định `{}`.
 - `ttl_ms`: 1 000..`commands.max_ttl_ms`; mặc định `commands.default_ttl_ms`.
 - `idempotency_key`: tùy chọn, 1..128 printable ASCII; unique theo device.
 - 202:

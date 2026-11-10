@@ -29,7 +29,27 @@ async fn postgres_migrations_and_repositories_preserve_storage_contracts() {
             .is_some_and(|url| url.ends_with("/iot_test")),
         "integration test URL must use the dedicated iot_test database"
     );
+    let override_url = format!("{url}&dbname=postgres");
+    let override_pool = sqlx::PgPool::connect(&override_url).await.unwrap();
+    let (override_database, override_schema): (String, String) =
+        sqlx::query_as("SELECT current_database(), current_schema()")
+            .fetch_one(&override_pool)
+            .await
+            .unwrap();
+    assert_eq!(override_database, "postgres");
+    assert!(!is_fixture_target(&override_database, &override_schema));
+    override_pool.close().await;
+
     let reset_pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let (database, schema): (String, String) =
+        sqlx::query_as("SELECT current_database(), current_schema()")
+            .fetch_one(&reset_pool)
+            .await
+            .unwrap();
+    assert!(
+        is_fixture_target(&database, &schema),
+        "refusing to reset a non-fixture target"
+    );
     sqlx::query("DROP SCHEMA public CASCADE")
         .execute(&reset_pool)
         .await
@@ -85,7 +105,7 @@ async fn postgres_migrations_and_repositories_preserve_storage_contracts() {
     assert!(created.success());
     let admin = repositories
         .admin
-        .find_user("admin")
+        .find_user("ADMIN")
         .await
         .unwrap()
         .unwrap();
@@ -649,4 +669,15 @@ async fn postgres_migrations_and_repositories_preserve_storage_contracts() {
     fn auth_now() -> i64 {
         iot_server::core::auth::now_ms()
     }
+}
+
+fn is_fixture_target(database: &str, schema: &str) -> bool {
+    database == "iot_test" && schema == "public"
+}
+
+#[test]
+fn postgres_fixture_guard_rejects_database_overrides() {
+    assert!(is_fixture_target("iot_test", "public"));
+    assert!(!is_fixture_target("production", "public"));
+    assert!(!is_fixture_target("iot_test", "tenant_schema"));
 }

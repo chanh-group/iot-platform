@@ -86,7 +86,8 @@ impl AdminRepository for PostgresAdminRepository {
 
     async fn find_user(&self, username: &str) -> anyhow::Result<Option<AdminUser>> {
         let row = sqlx::query_as::<_, (String, String, String, bool)>(
-            "SELECT id, username, password_hash, enabled FROM users WHERE username = $1",
+            "SELECT id, username, password_hash, enabled FROM users
+             WHERE lower(username COLLATE \"C\") = lower($1 COLLATE \"C\")",
         )
         .bind(username)
         .fetch_optional(&self.pool)

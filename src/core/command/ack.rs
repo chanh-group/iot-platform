@@ -70,12 +70,13 @@ pub fn validate_ack(payload: &[u8]) -> Result<CommandAck, CommandAckError> {
     let ack: CommandAck = serde_json::from_slice(payload).map_err(|_| CommandAckError::Invalid)?;
     if !auth::is_device_id(&ack.command_id)
         || ack.result.as_ref().is_some_and(|result| {
-            serde_json::to_vec(result).map_or(true, |bytes| bytes.len() > MAX_RESULT_BYTES)
+            crate::core::json::contains_nul(result)
+                || serde_json::to_vec(result).map_or(true, |bytes| bytes.len() > MAX_RESULT_BYTES)
         })
         || ack
             .error
             .as_ref()
-            .is_some_and(|error| error.chars().count() > MAX_ERROR_CHARS)
+            .is_some_and(|error| error.chars().count() > MAX_ERROR_CHARS || error.contains('\0'))
     {
         return Err(CommandAckError::Invalid);
     }
@@ -304,7 +305,9 @@ mod tests {
             json!({"command_id":command_id,"status":"pending"}).to_string(),
             json!({"command_id":"not-a-uuid","status":"succeeded"}).to_string(),
             json!({"command_id":command_id,"status":"succeeded","error":"x".repeat(513)}).to_string(),
+            json!({"command_id":command_id,"status":"succeeded","error":"\0"}).to_string(),
             json!({"command_id":command_id,"status":"succeeded","result":"x".repeat(MAX_RESULT_BYTES)}).to_string(),
+            json!({"command_id":command_id,"status":"succeeded","result":{"x":"\0"}}).to_string(),
             json!({"command_id":command_id,"status":"succeeded","extra":true}).to_string(),
         ] {
             assert!(validate_ack(payload.as_bytes()).is_err(), "{payload}");

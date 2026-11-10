@@ -110,7 +110,7 @@ pub(crate) fn valid_values(values: &Map<String, Value>, max_string_bytes: usize)
                         || number.as_u64().is_some()
                         || number.as_f64().is_some_and(f64::is_finite)
                 }
-                Value::String(value) => value.len() <= max_string_bytes,
+                Value::String(value) => value.len() <= max_string_bytes && !value.contains('\0'),
                 Value::Null | Value::Array(_) | Value::Object(_) => false,
             }
     })
@@ -151,6 +151,14 @@ mod tests {
         );
         assert_eq!(
             validate(br#"{"event_id":"x","values":{"x":null}}"#, 1000, limits()),
+            Err(TelemetryError::InvalidPayload)
+        );
+        assert_eq!(
+            validate(
+                br#"{"event_id":"x","values":{"x":"\u0000"}}"#,
+                1000,
+                limits()
+            ),
             Err(TelemetryError::InvalidPayload)
         );
         assert_eq!(

@@ -67,6 +67,23 @@ async fn attributes_are_latest_per_key_and_invalid_or_retained_updates_are_dropp
     .await
     .expect("initial attributes should be stored before timeout");
 
+    let rejected_before = Metrics::global().attribute_rejected_total.get();
+    publish_qos1(
+        &client,
+        &mut eventloop,
+        &topic,
+        false,
+        br#"{"values":{"firmware":"\u0000"}}"#,
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while Metrics::global().attribute_rejected_total.get() == rejected_before {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("NUL attribute should be rejected before persistence");
+
     let device_ts = iot_server::core::auth::now_ms();
     let update = serde_json::json!({"ts": device_ts, "values": {"firmware": "2.0"}}).to_string();
     publish_qos1(&client, &mut eventloop, &topic, false, update.as_bytes()).await;

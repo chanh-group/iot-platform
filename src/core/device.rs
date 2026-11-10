@@ -146,6 +146,12 @@ pub fn validate_metadata(value: &Value) -> Result<String, FieldError> {
             reason: "must be an object".to_owned(),
         });
     }
+    if crate::core::json::contains_nul(value) {
+        return Err(FieldError {
+            field: "metadata".to_owned(),
+            reason: "must not contain U+0000".to_owned(),
+        });
+    }
     if json_depth(value) > MAX_METADATA_DEPTH {
         return Err(FieldError {
             field: "metadata".to_owned(),
@@ -257,6 +263,7 @@ mod tests {
         assert!(validate_metadata(&json!({"x": "x".repeat(8_184)})).is_ok());
         assert!(validate_metadata(&json!({"x": "x".repeat(8_185)})).is_err());
         assert!(validate_metadata(&json!({"x": "x".repeat(MAX_METADATA_BYTES)})).is_err());
+        assert!(validate_metadata(&json!({"nested": ["\0"]})).is_err());
         assert!(
             validate_metadata(&json!({"a":{"b":{"c":{"d":{"e":{"f":{"g":{"h":0}}}}}}}})).is_ok()
         );

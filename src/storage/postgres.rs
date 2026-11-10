@@ -11,10 +11,9 @@ pub mod telemetry;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
-use sqlx::ConnectOptions;
 use sqlx::PgPool;
 use sqlx::migrate::{MigrateError, Migrator};
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::postgres::PgPoolOptions;
 use tokio::time::sleep;
 
 use crate::config::LoadedConfig;
@@ -24,11 +23,8 @@ static MIGRATOR: Migrator = sqlx::migrate!("./migrations/postgres");
 const CONNECT_ATTEMPTS: u8 = 5;
 
 pub async fn connect(loaded: &LoadedConfig) -> anyhow::Result<PgPool> {
-    let options: PgConnectOptions = loaded
-        .database_url
-        .parse()
-        .context("invalid PostgreSQL connection URL")?;
-    let options = options.disable_statement_logging();
+    let options = crate::config::database::postgres_connect_options(&loaded.database_url)
+        .map_err(anyhow::Error::msg)?;
     let max_connections = u32::try_from(loaded.config.database.max_connections)
         .context("database.max_connections is outside the PostgreSQL pool range")?;
     let acquire_timeout = Duration::from_millis(loaded.config.database.connect_timeout_ms);
