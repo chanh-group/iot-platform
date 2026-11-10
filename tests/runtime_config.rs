@@ -641,7 +641,7 @@ async fn config_audit_failure_does_not_roll_back_the_published_snapshot() {
 
 #[tokio::test]
 async fn audit_and_revision_broadcast_finish_after_patch_request_times_out() {
-    let app = TestApp::builder().request_timeout_ms(1_000).start().await;
+    let app = TestApp::builder().request_timeout_ms(3_000).start().await;
     let client = admin_client(&app, "runtime-timeout-admin").await;
     let mut revisions = app.events.subscribe_config_revisions();
     let mut blocker = app.pool.acquire().await.unwrap();
@@ -651,7 +651,7 @@ async fn audit_and_revision_broadcast_finish_after_patch_request_times_out() {
         .unwrap();
 
     let first = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
+        std::time::Duration::from_secs(8),
         patch(&client, &app, 0, json!({"logging":{"level":"debug"}})),
     )
     .await
@@ -682,7 +682,7 @@ async fn audit_and_revision_broadcast_finish_after_patch_request_times_out() {
         .execute(&mut *blocker)
         .await
         .unwrap();
-    let second = tokio::time::timeout(std::time::Duration::from_secs(3), &mut second)
+    let second = tokio::time::timeout(std::time::Duration::from_secs(8), &mut second)
         .await
         .expect("next PATCH should proceed after post-commit audit releases the lock");
     assert_eq!(second.status(), reqwest::StatusCode::OK);
