@@ -641,10 +641,11 @@ async fn stop_mqtt_workers(mqtt: &mut MqttServer, timeout: Duration) -> bool {
     let telemetry_acks_drained = mqtt
         .drain_telemetry_ack_worker(shutdown_remaining(deadline))
         .await;
+    // shortcut: 50 ms is not remote delivery confirmation; add broker ACK tracking if shutdown must guarantee client receipt.
+    tokio::time::sleep(shutdown_remaining(deadline).min(Duration::from_millis(50))).await;
     let sessions_kicked = mqtt
         .kick_connected_sessions(shutdown_remaining(deadline))
         .await;
-    tokio::time::sleep(shutdown_remaining(deadline).min(Duration::from_millis(50))).await;
     mqtt.stop_listener().await;
     let workers_drained = mqtt.drain_workers(shutdown_remaining(deadline)).await;
     telemetry_acks_drained && sessions_kicked && workers_drained
