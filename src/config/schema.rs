@@ -120,7 +120,7 @@ impl Default for MqttConfig {
     }
 }
 
-/// SQLite location, pool size, and timeouts.
+/// Database URL, pool size, and connect/acquire timeouts.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct DatabaseConfig {

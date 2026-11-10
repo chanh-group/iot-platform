@@ -10,10 +10,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rmqtt::hook::{Handler, HookResult, Parameter, ReturnType};
 use rmqtt::types::{AuthResult, ConnectInfo};
-use sqlx::SqlitePool;
 
 use crate::core::auth;
-use crate::storage::sqlite::devices;
+use crate::core::device::DeviceRepository;
 
 use super::presence::ConnectionLimiter;
 
@@ -21,15 +20,21 @@ use super::presence::ConnectionLimiter;
 /// active credential matching the presented token.
 #[derive(Clone)]
 pub struct AuthHooks {
-    pool: SqlitePool,
+    devices: Arc<dyn DeviceRepository>,
     connections: Arc<ConnectionLimiter>,
 }
 
 impl AuthHooks {
-    /// Hooks read credentials through this pool.
+    /// Hooks read credentials through the device repository.
     #[must_use]
-    pub(crate) fn new(pool: SqlitePool, connections: Arc<ConnectionLimiter>) -> Self {
-        Self { pool, connections }
+    pub(crate) fn new(
+        devices: Arc<dyn DeviceRepository>,
+        connections: Arc<ConnectionLimiter>,
+    ) -> Self {
+        Self {
+            devices,
+            connections,
+        }
     }
 
     async fn authenticate(&self, connect: &ConnectInfo) -> AuthResult {
@@ -54,7 +59,7 @@ impl AuthHooks {
             return AuthResult::BadUsernameOrPassword;
         }
 
-        match devices::active_credential(&self.pool, username).await {
+        match self.devices.active_credential(username).await {
             Ok(Some(credential))
                 if credential.device_enabled
                     && auth::token_matches(&credential.token_hash, token) => {}
@@ -72,7 +77,7 @@ impl AuthHooks {
 
         // Reserve before the final read so a concurrent disable either sees this
         // handshake and waits for it to become active, or makes this read fail.
-        match devices::active_credential(&self.pool, username).await {
+        match self.devices.active_credential(username).await {
             Ok(Some(current))
                 if current.device_enabled && auth::token_matches(&current.token_hash, token) =>
             {

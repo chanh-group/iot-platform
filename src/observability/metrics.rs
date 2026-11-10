@@ -183,6 +183,7 @@ pub struct Metrics {
     pub telemetry_commit_buckets: [Counter; 11],
     pub telemetry_commit_errors_total: Counter,
     pub telemetry_retention_errors_total: Counter,
+    pub session_cleanup_errors_total: Counter,
     pub audit_write_errors_total: Counter,
     pub attribute_rejected_total: Counter,
     pub retained_cap_rejected_total: Counter,
@@ -318,6 +319,11 @@ impl Metrics {
             &mut output,
             "iot_telemetry_retention_errors_total",
             self.telemetry_retention_errors_total.get(),
+        );
+        counter(
+            &mut output,
+            "iot_session_cleanup_errors_total",
+            self.session_cleanup_errors_total.get(),
         );
         counter(
             &mut output,

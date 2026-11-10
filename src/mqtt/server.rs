@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use rmqtt::context::ServerContext;
 use rmqtt::hook::Type;
 use rmqtt::server::MqttServer as RmqttServer;
+#[cfg(test)]
 use sqlx::SqlitePool;
 use tokio::sync::mpsc::OwnedPermit;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -16,14 +17,20 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::schema::MqttConfig;
-use crate::core::command::{self, CommandWakeReceiver, PendingCommandAcks};
+use crate::core::attributes::AttributesRepository;
+use crate::core::command::{self, CommandRepository, CommandWakeReceiver, PendingCommandAcks};
+use crate::core::device::DeviceRepository;
 use crate::core::device_channel::DeviceChannel;
 use crate::core::events::EventBus;
 use crate::core::presence::Presence;
 use crate::core::telemetry::{IngestHandle, TelemetryPayload};
 use crate::observability::metrics::Metrics;
-use crate::storage::sqlite::attributes as attribute_storage;
+#[cfg(test)]
+use crate::storage::sqlite::attributes::SqliteAttributesRepository;
+#[cfg(test)]
 use crate::storage::sqlite::commands::SqliteCommandRepository;
+#[cfg(test)]
+use crate::storage::sqlite::devices::SqliteDeviceRepository;
 
 use super::acl::AclHooks;
 use super::auth::AuthHooks;
@@ -59,6 +66,13 @@ pub struct MqttServer {
 #[derive(Clone)]
 pub struct MqttFailure(Arc<ConnectionLimiter>);
 
+#[derive(Clone)]
+pub struct MqttRepositories {
+    pub devices: Arc<dyn DeviceRepository>,
+    pub commands: Arc<dyn CommandRepository>,
+    pub attributes: Arc<dyn AttributesRepository>,
+}
+
 impl MqttFailure {
     /// Marks MQTT unavailable and signals the supervisor to stop the listener.
     pub fn report_failure(&self, error: impl std::fmt::Display) {
@@ -79,6 +93,15 @@ const COMMAND_WAKE_QUEUE_CAPACITY: usize = 4_096;
 const DEVICE_KICK_CONCURRENCY: usize = 8;
 const DEVICE_KICK_ATTEMPTS: usize = 3;
 const DEVICE_KICK_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[cfg(test)]
+fn sqlite_repositories(pool: SqlitePool) -> MqttRepositories {
+    MqttRepositories {
+        devices: Arc::new(SqliteDeviceRepository::new(pool.clone())),
+        commands: Arc::new(SqliteCommandRepository::new(pool.clone())),
+        attributes: Arc::new(SqliteAttributesRepository::new(pool)),
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct DeviceKickQueue {
@@ -153,7 +176,7 @@ impl DeviceKickPermit {
 }
 
 pub(crate) fn spawn_device_kick_worker(
-    pool: SqlitePool,
+    devices: Arc<dyn DeviceRepository>,
     primary: Arc<dyn DeviceChannel>,
     emergency: Arc<dyn DeviceChannel>,
     failure: MqttFailure,
@@ -181,12 +204,12 @@ pub(crate) fn spawn_device_kick_worker(
                 drop(_slot);
                 let device_id = job.device_id.clone();
                 active_devices.insert(device_id.clone());
-                let pool = pool.clone();
+                let devices = Arc::clone(&devices);
                 let primary = Arc::clone(&primary);
                 let emergency = Arc::clone(&emergency);
                 let failure = failure.clone();
                 active.spawn(async move {
-                    process_device_kick_job(pool, primary, emergency, failure, job).await;
+                    process_device_kick_job(devices, primary, emergency, failure, job).await;
                     device_id
                 });
             }
@@ -219,7 +242,7 @@ pub(crate) fn spawn_device_kick_worker(
 }
 
 async fn process_device_kick_job(
-    pool: SqlitePool,
+    devices: Arc<dyn DeviceRepository>,
     primary: Arc<dyn DeviceChannel>,
     emergency: Arc<dyn DeviceChannel>,
     failure: MqttFailure,
@@ -235,16 +258,17 @@ async fn process_device_kick_job(
     let committed = committed.await;
     let mut fatal_failure = false;
     let mut state_unknown = false;
-    let (recovered_kick, enabled) = match recover_device_kick(&pool, &device_id, &recovery).await {
-        Ok(state) => state,
-        Err(error) => {
-            tracing::error!(%error, "cannot determine whether a device mutation committed");
-            let _ = admission.fail_closed(error);
-            fatal_failure = true;
-            state_unknown = true;
-            (true, false)
-        }
-    };
+    let (recovered_kick, enabled) =
+        match recover_device_kick(devices.as_ref(), &device_id, &recovery).await {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::error!(%error, "cannot determine whether a device mutation committed");
+                let _ = admission.fail_closed(error);
+                fatal_failure = true;
+                state_unknown = true;
+                (true, false)
+            }
+        };
     if !state_unknown
         && (!enabled || matches!(recovery, DeviceKickRecovery::Presence))
         && let Err(error) = admission.set_device_enabled(false)
@@ -277,30 +301,21 @@ async fn process_device_kick_job(
 }
 
 async fn recover_device_kick(
-    pool: &SqlitePool,
+    devices: &dyn DeviceRepository,
     device_id: &str,
     recovery: &DeviceKickRecovery,
-) -> Result<(bool, bool), sqlx::Error> {
-    let device = sqlx::query_as::<_, (bool, Option<String>)>(
-        "SELECT d.enabled, c.id
-         FROM devices d
-         LEFT JOIN device_credentials c ON c.device_id = d.id AND c.status = 'active'
-         WHERE d.id = ?",
-    )
-    .bind(device_id)
-    .fetch_optional(pool)
-    .await?;
-    let Some((enabled, active_credential_id)) = device else {
+) -> anyhow::Result<(bool, bool)> {
+    let Some(state) = devices.kick_state(device_id).await? else {
         return Ok((true, false));
     };
     let should_kick = match recovery {
-        DeviceKickRecovery::Disable => !enabled,
+        DeviceKickRecovery::Disable => !state.enabled,
         DeviceKickRecovery::Rotate {
             previous_credential_id,
-        } => active_credential_id.as_deref() != Some(previous_credential_id),
+        } => state.active_credential_id.as_deref() != Some(previous_credential_id),
         DeviceKickRecovery::Presence => true,
     };
-    Ok((should_kick, enabled))
+    Ok((should_kick, state.enabled))
 }
 
 async fn kick_with_retries(channel: &dyn DeviceChannel, device_id: &str) -> bool {
@@ -352,28 +367,26 @@ impl MqttServer {
     pub async fn start(
         config: &MqttConfig,
         readiness: Arc<AtomicBool>,
-        pool: SqlitePool,
+        repositories: MqttRepositories,
         presence: Arc<Presence>,
     ) -> anyhow::Result<Self> {
-        Self::start_inner(config, readiness, pool, presence, None, None, None).await
+        Self::start_inner(config, readiness, repositories, presence, None, None, None).await
     }
 
     /// Starts the broker with bounded telemetry ingestion enabled.
     pub async fn start_with_ingest(
         config: &MqttConfig,
         readiness: Arc<AtomicBool>,
-        pool: SqlitePool,
+        repositories: MqttRepositories,
         presence: Arc<Presence>,
-        ingest: IngestHandle,
-        limits: TelemetryPayload,
-        attribute_queue_capacity: usize,
+        ingest: (IngestHandle, TelemetryPayload, usize),
     ) -> anyhow::Result<Self> {
         Self::start_inner(
             config,
             readiness,
-            pool,
+            repositories,
             presence,
-            Some((ingest, limits, attribute_queue_capacity)),
+            Some(ingest),
             None,
             None,
         )
@@ -384,7 +397,7 @@ impl MqttServer {
     pub(crate) async fn start_with_ingest_and_test_kickers(
         config: &MqttConfig,
         readiness: Arc<AtomicBool>,
-        pool: SqlitePool,
+        repositories: MqttRepositories,
         presence: Arc<Presence>,
         ingest: (IngestHandle, TelemetryPayload, usize),
         primary_kicker: Arc<dyn DeviceChannel>,
@@ -393,7 +406,7 @@ impl MqttServer {
         Self::start_inner(
             config,
             readiness,
-            pool,
+            repositories,
             presence,
             Some(ingest),
             Some(primary_kicker),
@@ -406,18 +419,27 @@ impl MqttServer {
     async fn start_with_test_kicker(
         config: &MqttConfig,
         readiness: Arc<AtomicBool>,
-        pool: SqlitePool,
+        repositories: MqttRepositories,
         presence: Arc<Presence>,
         kicker: Arc<dyn DeviceChannel>,
     ) -> anyhow::Result<Self> {
-        Self::start_inner(config, readiness, pool, presence, None, Some(kicker), None).await
+        Self::start_inner(
+            config,
+            readiness,
+            repositories,
+            presence,
+            None,
+            Some(kicker),
+            None,
+        )
+        .await
     }
 
     #[cfg(test)]
     async fn start_with_test_kickers(
         config: &MqttConfig,
         readiness: Arc<AtomicBool>,
-        pool: SqlitePool,
+        repositories: MqttRepositories,
         presence: Arc<Presence>,
         primary: Arc<dyn DeviceChannel>,
         emergency: Arc<dyn DeviceChannel>,
@@ -425,7 +447,7 @@ impl MqttServer {
         Self::start_inner(
             config,
             readiness,
-            pool,
+            repositories,
             presence,
             None,
             Some(primary),
@@ -437,12 +459,17 @@ impl MqttServer {
     async fn start_inner(
         config: &MqttConfig,
         readiness: Arc<AtomicBool>,
-        pool: SqlitePool,
+        repositories: MqttRepositories,
         presence: Arc<Presence>,
         ingest: Option<(IngestHandle, TelemetryPayload, usize)>,
         test_kicker: Option<Arc<dyn DeviceChannel>>,
         test_emergency_kicker: Option<Arc<dyn DeviceChannel>>,
     ) -> anyhow::Result<Self> {
+        let MqttRepositories {
+            devices: device_repository,
+            commands: command_repository,
+            attributes: attributes_repository,
+        } = repositories;
         let events = ingest
             .as_ref()
             .map(|(handle, _, _)| handle.event_bus())
@@ -476,7 +503,6 @@ impl MqttServer {
             Arc::clone(&presence),
             Arc::clone(&connections),
         );
-        let command_repository = Arc::new(SqliteCommandRepository::new(pool.clone()));
         let command_ack_cancel = CancellationToken::new();
         let (command_ack, command_ack_task) = command::spawn_ack_worker(
             command_repository,
@@ -488,7 +514,7 @@ impl MqttServer {
         let command_wake_overflow = Arc::new(Notify::new());
         let failure = MqttFailure(Arc::clone(&connections));
         let (device_kicks, kick_task) = spawn_device_kick_worker(
-            pool.clone(),
+            Arc::clone(&device_repository),
             test_kicker.unwrap_or_else(|| Arc::new(publisher.clone())),
             test_emergency_kicker.unwrap_or_else(|| Arc::new(publisher.clone())),
             failure,
@@ -499,13 +525,18 @@ impl MqttServer {
             .add_priority(
                 Type::ClientAuthenticate,
                 10,
-                Box::new(AuthHooks::new(pool.clone(), Arc::clone(&connections))),
+                Box::new(AuthHooks::new(
+                    Arc::clone(&device_repository),
+                    Arc::clone(&connections),
+                )),
             )
             .await;
         let (acl_hooks, ack_task, ack_cancel, attributes_task) = match ingest {
             Some((ingest, limits, attribute_queue_capacity)) => {
-                let (attributes, attributes_task) =
-                    attribute_storage::spawn_worker(pool.clone(), attribute_queue_capacity);
+                let (attributes, attributes_task) = crate::core::attributes::spawn_worker(
+                    Arc::clone(&attributes_repository),
+                    attribute_queue_capacity,
+                );
                 let ack_cancel = CancellationToken::new();
                 let (ack, task) = spawn_ack_worker(publisher.clone(), ack_cancel.clone());
                 (
@@ -550,7 +581,7 @@ impl MqttServer {
             )
             .await;
         let presence_hooks = PresenceHooks::new(
-            pool.clone(),
+            device_repository,
             presence,
             Arc::clone(&connections),
             device_kicks.clone(),
@@ -939,7 +970,8 @@ mod tests {
     use crate::core::auth;
     use crate::core::device_channel::DeviceChannelError;
     use crate::core::events::EventBus;
-    use crate::http::{AppState, router};
+    use crate::http::{AppRepositories, AppState, router};
+    use crate::storage::sqlite::telemetry::SqliteTelemetryRepository;
     use rumqttc::{
         AsyncClient, ConnectReturnCode, Event as MqttEvent, EventLoop, MqttOptions, Packet, QoS,
     };
@@ -1008,7 +1040,7 @@ mod tests {
                 MqttServer::start_with_test_kickers(
                     &config,
                     Arc::clone(&readiness),
-                    pool.clone(),
+                    sqlite_repositories(pool.clone()),
                     Arc::clone(&presence),
                     kicker,
                     emergency,
@@ -1019,7 +1051,7 @@ mod tests {
                 MqttServer::start_with_test_kicker(
                     &config,
                     Arc::clone(&readiness),
-                    pool.clone(),
+                    sqlite_repositories(pool.clone()),
                     Arc::clone(&presence),
                     kicker,
                 )
@@ -1030,7 +1062,20 @@ mod tests {
         let mut loaded = crate::config::load(std::path::Path::new("conf.toml")).unwrap();
         loaded.config.http.request_timeout_ms = request_timeout_ms;
         let state = AppState::new(
-            pool.clone(),
+            AppRepositories {
+                commands: Arc::new(
+                    crate::storage::sqlite::commands::SqliteCommandRepository::new(pool.clone()),
+                ),
+                admin: Arc::new(crate::storage::sqlite::admin::SqliteAdminRepository::new(
+                    pool.clone(),
+                )),
+                devices: Arc::new(SqliteDeviceRepository::new(pool.clone())),
+                attributes: Arc::new(SqliteAttributesRepository::new(pool.clone())),
+                telemetry: Arc::new(SqliteTelemetryRepository::new(pool.clone())),
+                storage: Arc::new(crate::storage::sqlite::system::SqliteSystemRepository::new(
+                    pool.clone(),
+                )),
+            },
             Arc::new(loaded),
             crate::http::ServiceReadiness {
                 mqtt: Arc::clone(&readiness),
@@ -2017,7 +2062,7 @@ mod tests {
         let mut mqtt = MqttServer::start(
             &config,
             Arc::clone(&readiness),
-            pool.clone(),
+            sqlite_repositories(pool.clone()),
             Arc::clone(&presence),
         )
         .await
@@ -2025,7 +2070,20 @@ mod tests {
         let address = mqtt.local_addr();
         let loaded = crate::config::load(std::path::Path::new("conf.toml")).unwrap();
         let state = AppState::new(
-            pool,
+            AppRepositories {
+                commands: Arc::new(
+                    crate::storage::sqlite::commands::SqliteCommandRepository::new(pool.clone()),
+                ),
+                admin: Arc::new(crate::storage::sqlite::admin::SqliteAdminRepository::new(
+                    pool.clone(),
+                )),
+                devices: Arc::new(SqliteDeviceRepository::new(pool.clone())),
+                attributes: Arc::new(SqliteAttributesRepository::new(pool.clone())),
+                telemetry: Arc::new(SqliteTelemetryRepository::new(pool.clone())),
+                storage: Arc::new(crate::storage::sqlite::system::SqliteSystemRepository::new(
+                    pool.clone(),
+                )),
+            },
             Arc::new(loaded),
             crate::http::ServiceReadiness {
                 mqtt: Arc::clone(&readiness),
@@ -2144,7 +2202,7 @@ mod tests {
         let mut server = MqttServer::start(
             &config,
             Arc::clone(&readiness),
-            pool,
+            sqlite_repositories(pool),
             Arc::new(Presence::new()),
         )
         .await

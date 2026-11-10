@@ -1,10 +1,11 @@
 //! Read-only telemetry queries used by the HTTP API.
 
-use serde_json::{Map, Value};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 
+use crate::core::telemetry::{LatestTelemetryValue, TelemetryHistoryRange, TelemetryRow};
+
 #[derive(Debug, Clone, sqlx::FromRow)]
-pub struct TelemetryRow {
+struct TelemetryDbRow {
     pub internal_id: i64,
     pub event_id: String,
     pub ts: i64,
@@ -13,19 +14,13 @@ pub struct TelemetryRow {
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
-pub struct LatestValueRow {
+struct LatestValueDbRow {
     pub internal_id: i64,
     pub key: String,
     pub event_id: String,
     pub ts: i64,
     pub received_at: i64,
     pub values_json: String,
-}
-
-pub struct HistoryRange {
-    pub from: i64,
-    pub to: i64,
-    pub commit_order: bool,
 }
 
 pub async fn device_exists(pool: &SqlitePool, device_id: &str) -> Result<bool, sqlx::Error> {
@@ -49,7 +44,7 @@ pub async fn committed_through(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
 pub async fn history(
     pool: &SqlitePool,
     device_id: &str,
-    range: HistoryRange,
+    range: TelemetryHistoryRange,
     after: Option<(i64, i64)>,
     keys: &[String],
     limit: i64,
@@ -110,16 +105,27 @@ pub async fn history(
             ", e.internal_id LIMIT "
         })
         .push_bind(limit)
-        .build_query_as::<TelemetryRow>()
+        .build_query_as::<TelemetryDbRow>()
         .fetch_all(pool)
         .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| TelemetryRow {
+                    internal_id: row.internal_id,
+                    event_id: row.event_id,
+                    ts: row.ts,
+                    received_at: row.received_at,
+                    values_json: row.values_json,
+                })
+                .collect()
+        })
 }
 
 pub async fn latest(
     pool: &SqlitePool,
     device_id: &str,
     keys: &[String],
-) -> Result<Vec<LatestValueRow>, sqlx::Error> {
+) -> Result<Vec<LatestTelemetryValue>, sqlx::Error> {
     let mut query = QueryBuilder::<Sqlite>::new(
         "WITH ranked AS (
              SELECT e.internal_id, v.key, e.event_id, e.ts, e.received_at, e.values_json,
@@ -146,18 +152,19 @@ pub async fn latest(
          ORDER BY key",
     );
     query
-        .build_query_as::<LatestValueRow>()
+        .build_query_as::<LatestValueDbRow>()
         .fetch_all(pool)
         .await
-}
-
-pub fn filtered_values(
-    values_json: &str,
-    keys: &[String],
-) -> Result<Map<String, Value>, serde_json::Error> {
-    let mut values: Map<String, Value> = serde_json::from_str(values_json)?;
-    if !keys.is_empty() {
-        values.retain(|key, _| keys.iter().any(|filter| filter == key));
-    }
-    Ok(values)
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| LatestTelemetryValue {
+                    internal_id: row.internal_id,
+                    key: row.key,
+                    event_id: row.event_id,
+                    ts: row.ts,
+                    received_at: row.received_at,
+                    values_json: row.values_json,
+                })
+                .collect()
+        })
 }

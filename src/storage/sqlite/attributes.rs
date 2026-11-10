@@ -1,60 +1,47 @@
 //! Latest-value attribute upserts and their bounded writer queue.
 
 use sqlx::{SqliteConnection, SqlitePool};
-use tokio::sync::mpsc;
 
-use crate::core::attributes::ValidatedAttributes;
-use crate::observability::metrics::Metrics;
+use crate::core::attributes::{AttributeRow, AttributesRepository, ValidatedAttributes};
 
-struct Work {
-    device_id: String,
-    attributes: ValidatedAttributes,
-}
-
-/// Non-blocking handle for the bounded attribute writer queue.
 #[derive(Clone)]
-pub(crate) struct AttributeHandle(mpsc::Sender<Work>);
-
-/// Why an attribute update could not be queued.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SubmitError {
-    Full,
-    Closed,
+pub struct SqliteAttributesRepository {
+    pool: SqlitePool,
 }
 
-impl AttributeHandle {
-    pub(crate) fn try_submit(
-        &self,
-        device_id: String,
-        attributes: ValidatedAttributes,
-    ) -> Result<(), SubmitError> {
-        self.0
-            .try_send(Work {
-                device_id,
-                attributes,
-            })
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => SubmitError::Full,
-                mpsc::error::TrySendError::Closed(_) => SubmitError::Closed,
-            })
+impl SqliteAttributesRepository {
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
     }
 }
 
-/// Starts the bounded queue and its single SQLite writer.
-pub(crate) fn spawn_worker(
-    pool: SqlitePool,
-    capacity: usize,
-) -> (AttributeHandle, tokio::task::JoinHandle<()>) {
-    let (sender, mut receiver) = mpsc::channel::<Work>(capacity);
-    let task = tokio::spawn(async move {
-        while let Some(work) = receiver.recv().await {
-            if let Err(error) = upsert(&pool, &work.device_id, &work.attributes).await {
-                Metrics::global().attribute_rejected_total.inc();
-                tracing::warn!(%error, device_id = %work.device_id, "attribute update dropped");
-            }
-        }
-    });
-    (AttributeHandle(sender), task)
+#[async_trait::async_trait]
+impl AttributesRepository for SqliteAttributesRepository {
+    async fn upsert(
+        &self,
+        device_id: &str,
+        attributes: &ValidatedAttributes,
+    ) -> anyhow::Result<()> {
+        Ok(upsert(&self.pool, device_id, attributes).await?)
+    }
+
+    async fn latest(
+        &self,
+        device_id: &str,
+        after: Option<&str>,
+        limit: i64,
+    ) -> anyhow::Result<Vec<AttributeRow>> {
+        Ok(latest(&self.pool, device_id, after, limit)
+            .await?
+            .into_iter()
+            .map(|(key, value_json, device_ts, updated_at)| AttributeRow {
+                key,
+                value_json,
+                device_ts,
+                updated_at,
+            })
+            .collect())
+    }
 }
 
 /// Upserts every value in one short transaction, with no attribute history.

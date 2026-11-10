@@ -4,10 +4,13 @@ use serde_json::Value;
 use sqlx::{SqliteConnection, SqlitePool};
 
 use crate::core::telemetry::{
-    TelemetryInsertResult as InsertResult, TelemetryRepository, ValidatedTelemetry,
+    LatestTelemetryValue, TelemetryHistoryRange, TelemetryInsertResult as InsertResult,
+    TelemetryReadRepository, TelemetryRepository, TelemetryRetentionRepository, TelemetryRow,
+    ValidatedTelemetry,
 };
 
 /// SQLite-backed implementation of the telemetry persistence port.
+#[derive(Clone)]
 pub struct SqliteTelemetryRepository {
     pool: SqlitePool,
 }
@@ -25,6 +28,46 @@ impl TelemetryRepository for SqliteTelemetryRepository {
         events: &[(String, ValidatedTelemetry)],
     ) -> anyhow::Result<Vec<InsertResult>> {
         Ok(insert_batch(&self.pool, events).await?)
+    }
+}
+
+#[async_trait::async_trait]
+impl TelemetryReadRepository for SqliteTelemetryRepository {
+    async fn device_exists(&self, device_id: &str) -> anyhow::Result<bool> {
+        Ok(super::telemetry_query::device_exists(&self.pool, device_id).await?)
+    }
+
+    async fn committed_through(&self) -> anyhow::Result<i64> {
+        Ok(super::telemetry_query::committed_through(&self.pool).await?)
+    }
+
+    async fn history(
+        &self,
+        device_id: &str,
+        range: TelemetryHistoryRange,
+        after: Option<(i64, i64)>,
+        keys: &[String],
+        limit: i64,
+    ) -> anyhow::Result<Vec<TelemetryRow>> {
+        Ok(
+            super::telemetry_query::history(&self.pool, device_id, range, after, keys, limit)
+                .await?,
+        )
+    }
+
+    async fn latest(
+        &self,
+        device_id: &str,
+        keys: &[String],
+    ) -> anyhow::Result<Vec<LatestTelemetryValue>> {
+        Ok(super::telemetry_query::latest(&self.pool, device_id, keys).await?)
+    }
+}
+
+#[async_trait::async_trait]
+impl TelemetryRetentionRepository for SqliteTelemetryRepository {
+    async fn delete_before(&self, received_before: i64, limit: i64) -> anyhow::Result<u64> {
+        Ok(delete_before(&self.pool, received_before, limit).await?)
     }
 }
 

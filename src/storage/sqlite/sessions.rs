@@ -5,6 +5,25 @@ use uuid::Uuid;
 
 const LAST_SEEN_INTERVAL_MS: i64 = 5 * 60 * 1000;
 const REVOKED_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+pub const CLEANUP_BATCH_SIZE: u64 = 5_000;
+
+#[derive(Clone)]
+pub struct SqliteSessionCleanupRepository {
+    pool: SqlitePool,
+}
+
+impl SqliteSessionCleanupRepository {
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::core::auth::SessionCleanupRepository for SqliteSessionCleanupRepository {
+    async fn delete_expired_sessions(&self, now: i64) -> anyhow::Result<u64> {
+        Ok(delete_expired(&self.pool, now).await?)
+    }
+}
 
 /// Live session joined with the owning user's username.
 #[derive(Debug, Clone)]
@@ -125,11 +144,15 @@ pub async fn revoke(
 pub async fn delete_expired(pool: &SqlitePool, now: i64) -> Result<u64, sqlx::Error> {
     let cutoff = now.saturating_sub(REVOKED_RETENTION_MS);
     let result = sqlx::query(
-        "DELETE FROM sessions
-         WHERE expires_at <= ? OR (revoked_at IS NOT NULL AND revoked_at <= ?)",
+        "DELETE FROM sessions WHERE id IN (
+             SELECT id FROM sessions
+             WHERE expires_at <= ? OR (revoked_at IS NOT NULL AND revoked_at <= ?)
+             ORDER BY expires_at, id LIMIT ?
+         )",
     )
     .bind(now)
     .bind(cutoff)
+    .bind(i64::try_from(CLEANUP_BATCH_SIZE).unwrap_or(i64::MAX))
     .execute(pool)
     .await?;
     Ok(result.rows_affected())

@@ -59,19 +59,16 @@ pub async fn upgrade(
         ));
     }
     let session_revocations = state.events.subscribe_session_revocations();
-    let session_live: bool = sqlx::query_scalar(
-        "SELECT EXISTS(
-             SELECT 1 FROM sessions
-             WHERE id = ? AND revoked_at IS NULL AND expires_at > ?
-         )",
-    )
-    .bind(&session.id)
-    .bind(crate::core::auth::now_ms())
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|error| {
-        ApiError::from_domain(DomainError::Internal(error.into()), request_id.clone())
-    })?;
+    let session_live = state
+        .admin_repository
+        .session_is_live(&session.id, crate::core::auth::now_ms())
+        .await
+        .map_err(|_| {
+            ApiError::from_domain(
+                DomainError::Unavailable("storage unavailable".to_owned()),
+                request_id.clone(),
+            )
+        })?;
     if !session_live {
         return Err(ApiError::from_domain(DomainError::Unauthorized, request_id));
     }

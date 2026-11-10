@@ -9,4 +9,5 @@ pub mod device_channel;
 pub mod domain_error;
 pub mod events;
 pub mod presence;
+pub mod storage;
 pub mod telemetry;

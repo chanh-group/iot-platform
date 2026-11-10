@@ -489,7 +489,7 @@ Không có bảng `schema_migrations` riêng, không có bảng projection lates
 | Dữ liệu | Chính sách MVP |
 | --- | --- |
 | `telemetry_events` | Xóa theo `received_at < now - retention_days`; batch 5 000; chạy mỗi giờ; nghỉ giữa batch |
-| `sessions` | Xóa session hết hạn hoặc revoked quá 7 ngày; mỗi giờ |
+| `sessions` | Xóa session hết hạn hoặc revoked quá 7 ngày; mỗi giờ, tối đa 5 000 row mỗi batch và nghỉ 10 ms giữa các batch |
 | `commands` | Giữ vô thời hạn (kể cả expired) |
 | `audit_events` | Giữ vô thời hạn |
 | `device_attributes` | Giữ latest vô thời hạn |
@@ -499,6 +499,17 @@ Không có bảng `schema_migrations` riêng, không có bảng projection lates
 - Xóa telemetry không tự `VACUUM`; dung lượng file có thể không giảm. Tài liệu vận hành ghi rõ backup/`VACUUM` offline.
 - Khi disk full/DB lỗi: worker dừng ACK thành công, retry backoff, readiness false.
 - `last_seen_at` chỉ ghi khi connect/disconnect (không ghi mỗi telemetry) để giảm write amplification.
+
+### 3.7. Backend PostgreSQL (P5-02)
+
+- PostgreSQL 18.6 là phiên bản triển khai đầu tiên theo ADR-010; SQLx 0.9.0 dùng driver `postgres` và Rustls. SQLite vẫn là mặc định và không cần server ngoài.
+- Backend được chọn từ URL `database.url`/`database.url_env`: `sqlite://` hoặc `postgres://`/`postgresql://`. Hai trường cấu hình loại trừ nhau; URL env thiếu, URL không hợp lệ hoặc scheme chưa hỗ trợ làm startup fail, không fallback. Secret chỉ được resolve từ environment theo tên đã cấu hình; URL đầy đủ không xuất hiện trong log/API.
+- PostgreSQL dùng pool hữu hạn, connect/acquire timeout và tối đa 5 lần retry startup với backoff 100/200/400/800 ms. Migrate trước listener bằng migration directory riêng và `_sqlx_migrations`; migration failure làm startup fail, không xóa DB, không auto downgrade.
+- Binding dùng signed `BIGINT` cho thời gian và telemetry ID, UUID canonical dạng `TEXT`, hash dạng `BYTEA`, boolean `BOOLEAN`; JSON dùng `JSONB` nhưng phải round-trip theo `serde_json::Value`. Tên device unique/search theo ASCII case-insensitive semantics của SQLite, không phụ thuộc locale; FK, cascade, credential uniqueness và các ràng buộc domain giữ nguyên.
+- Transaction mặc định `READ COMMITTED`. Audit atomic với mutation trong cùng repository operation. Telemetry allocator dùng một hàng trong DB được khóa `FOR UPDATE` trong transaction tới commit/rollback; ID allocator update và event insert cùng transaction. Sequence/identity riêng không chứng minh được committed-prefix. Gap do duplicate/conflict được phép nếu không transaction tương lai có thể lấp ID dưới checkpoint.
+- PostgreSQL URL giữ nguyên tham số SQLx (bao gồm `sslmode`); production dùng `verify-full` và CA đúng. Chỉ cho phép `sslmode=disable` khi operator cấu hình rõ cho database local/cô lập.
+- Session cleanup production chạy mỗi giờ, theo batch tối đa 5 000 row/lượt với nghỉ 10 ms giữa các batch; lỗi được ghi log/metric, không làm chết process. SQLite và mỗi backend phải kiểm thử cutoff, batch cap, scheduler và cancellation.
+- Đây là mapping PostgreSQL P5-02, không thay thế test/A18 evidence; PostgreSQL chỉ được công bố hỗ trợ sau khi toàn bộ gate backend đạt.
 
 ### 3.5. Truy vấn chuẩn
 
@@ -870,7 +881,7 @@ Query: `limit` (mặc định 50, max 200), `cursor`, `status` (một giá trị
 - Mặc định tắt (`[http] metrics = false` → 404).
 - Khi bật, **không** dùng session cookie: bắt buộc `http.metrics_bearer_token_env` trỏ tới environment variable có token ngẫu nhiên tối thiểu 32 byte. Yêu cầu `Authorization: Bearer <token>`; thiếu/sai trả 401. Token không bao giờ xuất hiện trong API, log hay `GET /config`.
 - Production đặt endpoint sau reverse proxy/mTLS hoặc network policy chỉ cho Prometheus. Không bật metrics nếu không có một trong các lớp mạng đó.
-- Tên metric tối thiểu: `iot_mqtt_connections_active`, `iot_mqtt_kick_failures_total`, `iot_ingest_accepted_total`, `iot_ingest_rejected_total{reason}`, `iot_retained_cap_rejected_total`, `iot_telemetry_queue_depth`, `iot_telemetry_commit_seconds` (histogram), `iot_telemetry_commit_errors_total`, `iot_telemetry_retention_errors_total`, `iot_audit_write_errors_total`, `iot_commands_pending`, `iot_commands_expired_total`, `iot_command_ack_dropped_total`, `iot_command_ack_invalid_total`, `iot_command_ack_storage_errors_total`, `iot_command_publish_errors_total`, `iot_command_storage_errors_total`, `iot_command_dispatch_wake_dropped_total`, `iot_ws_clients`, `iot_ws_dropped_total`.
+- Tên metric tối thiểu: `iot_mqtt_connections_active`, `iot_mqtt_kick_failures_total`, `iot_ingest_accepted_total`, `iot_ingest_rejected_total{reason}`, `iot_retained_cap_rejected_total`, `iot_telemetry_queue_depth`, `iot_telemetry_commit_seconds` (histogram), `iot_telemetry_commit_errors_total`, `iot_telemetry_retention_errors_total`, `iot_session_cleanup_errors_total`, `iot_audit_write_errors_total`, `iot_commands_pending`, `iot_commands_expired_total`, `iot_command_ack_dropped_total`, `iot_command_ack_invalid_total`, `iot_command_ack_storage_errors_total`, `iot_command_publish_errors_total`, `iot_command_storage_errors_total`, `iot_command_dispatch_wake_dropped_total`, `iot_ws_clients`, `iot_ws_dropped_total`.
 - `iot_mqtt_presence_hook_inflight` là số hook connect/disconnect presence đang chạy; `iot_mqtt_presence_hook_inflight_max` là giá trị lớn nhất từ khi process khởi động. Không gắn nhãn device.
 - `iot_commands_pending` là gauge số command hiện ở trạng thái `pending` hoặc `dispatched`; `iot_commands_expired_total` là counter process-local cho transition sang `expired`.
 - `iot_audit_write_errors_total` tăng khi insert audit lỗi; audit config runtime cũng đếm lỗi begin/commit transaction, không đếm trùng lỗi insert.

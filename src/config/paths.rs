@@ -58,6 +58,23 @@ pub fn resolve_sqlite_url(raw: &str, base: &Path, data_dir: &Path) -> Result<Str
     Ok(format!("sqlite://{}", path.display()))
 }
 
+/// Resolves SQLite file URLs and preserves validated PostgreSQL connection URLs.
+pub fn resolve_database_url(raw: &str, base: &Path, data_dir: &Path) -> Result<String, String> {
+    if raw.starts_with("sqlite://") {
+        return resolve_sqlite_url(raw, base, data_dir);
+    }
+    if let Some(rest) = raw
+        .strip_prefix("postgres://")
+        .or_else(|| raw.strip_prefix("postgresql://"))
+    {
+        if rest.is_empty() || raw.chars().any(char::is_whitespace) || raw.contains(['#', '\0']) {
+            return Err("database.url: invalid PostgreSQL connection URL".to_owned());
+        }
+        return Ok(raw.to_owned());
+    }
+    Err("database.url: expected sqlite://, postgres://, or postgresql://".to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,5 +96,25 @@ mod tests {
 
         let err = resolve_sqlite_url("sqlite://../iot.db", base, data).unwrap_err();
         assert!(err.contains("outside data_dir"), "{err}");
+    }
+
+    #[test]
+    fn postgres_urls_are_preserved_without_logging_or_path_resolution() {
+        let url = "postgresql://iot:placeholder@postgres:5432/iot?sslmode=verify-full";
+        assert_eq!(
+            resolve_database_url(url, Path::new("/srv/iot"), Path::new("/srv/iot/data")).unwrap(),
+            url
+        );
+        assert!(
+            resolve_database_url("https://db/iot", Path::new("/"), Path::new("/data")).is_err()
+        );
+        assert!(
+            resolve_database_url(
+                "postgres://db/iot#fragment",
+                Path::new("/"),
+                Path::new("/data")
+            )
+            .is_err()
+        );
     }
 }

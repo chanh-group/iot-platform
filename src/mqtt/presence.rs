@@ -8,15 +8,14 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use rmqtt::hook::{Handler, HookResult, Parameter, ReturnType};
-use sqlx::SqlitePool;
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::core::auth;
+use crate::core::device::DeviceRepository;
 use crate::core::events::EventBus;
 use crate::core::presence::{Presence, PresenceError};
 use crate::observability::metrics::Metrics;
-use crate::storage::sqlite::devices;
 
 use super::server::DeviceKickQueue;
 
@@ -434,7 +433,7 @@ impl Drop for DeviceAdmissionGuard {
 /// Keeps online state in RAM and `devices.last_seen_at` at connect/disconnect.
 #[derive(Clone)]
 pub struct PresenceHooks {
-    pool: SqlitePool,
+    devices: Arc<dyn DeviceRepository>,
     presence: Arc<Presence>,
     connections: Arc<ConnectionLimiter>,
     kicks: DeviceKickQueue,
@@ -448,7 +447,7 @@ impl PresenceHooks {
     /// Hooks share the registry used by the rest of the server.
     #[must_use]
     pub(crate) fn new(
-        pool: SqlitePool,
+        devices: Arc<dyn DeviceRepository>,
         presence: Arc<Presence>,
         connections: Arc<ConnectionLimiter>,
         kicks: DeviceKickQueue,
@@ -457,7 +456,7 @@ impl PresenceHooks {
         events: EventBus,
     ) -> Self {
         Self {
-            pool,
+            devices,
             presence,
             connections,
             kicks,
@@ -480,7 +479,7 @@ impl PresenceHooks {
 
     async fn record_last_seen(&self, device_id: &str, last_seen_at: i64) {
         // Last-seen persistence is advisory and must not affect broker readiness.
-        if let Err(error) = devices::update_last_seen(&self.pool, device_id, last_seen_at).await {
+        if let Err(error) = self.devices.update_last_seen(device_id, last_seen_at).await {
             tracing::warn!(%error, %device_id, "cannot update devices.last_seen_at");
         }
     }
@@ -560,7 +559,7 @@ impl Handler for PresenceHooks {
                     self.connections.report_failure(error);
                     return (true, None);
                 }
-                match devices::active_credential(&self.pool, device_id).await {
+                match self.devices.active_credential(device_id).await {
                     Ok(Some(credential)) if credential.device_enabled => {
                         if let Err(error) = self.connections.set_device_enabled(device_id, true) {
                             self.connections.report_failure(error);

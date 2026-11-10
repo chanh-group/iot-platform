@@ -18,16 +18,19 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use sqlx::SqlitePool;
 use tokio::sync::{Mutex, OwnedMutexGuard, Semaphore};
 
 use crate::config::LoadedConfig;
+use crate::core::attributes::AttributesRepository;
+use crate::core::auth::AdminRepository;
 use crate::core::command::CommandRepository;
+use crate::core::device::DeviceRepository;
 use crate::core::events::EventBus;
 use crate::core::presence::Presence;
+use crate::core::storage::StorageRepository;
+use crate::core::telemetry::TelemetryReadRepository;
 use crate::mqtt::presence::DeviceAdmission;
 use crate::mqtt::server::{DeviceKickQueue, MqttControl, MqttFailure};
-use crate::storage::sqlite::commands::SqliteCommandRepository;
 use middleware::LoginRateLimiter;
 
 /// Health signals for long-running services that back the HTTP readiness check.
@@ -40,11 +43,18 @@ pub struct ServiceReadiness {
     pub commands: Arc<AtomicBool>,
 }
 
+pub struct AppRepositories {
+    pub commands: Arc<dyn CommandRepository>,
+    pub admin: Arc<dyn AdminRepository>,
+    pub devices: Arc<dyn DeviceRepository>,
+    pub attributes: Arc<dyn AttributesRepository>,
+    pub telemetry: Arc<dyn TelemetryReadRepository>,
+    pub storage: Arc<dyn StorageRepository>,
+}
+
 /// Shared handler state: database pool, config, login limiter, and task readiness.
 #[derive(Clone)]
 pub struct AppState {
-    /// SQLite connection pool.
-    pub pool: SqlitePool,
     /// Loaded and validated configuration.
     pub config: Arc<LoadedConfig>,
     /// Shared failed-login window.
@@ -65,6 +75,16 @@ pub struct AppState {
     pub(crate) device_kicks: DeviceKickQueue,
     /// Command domain persistence port.
     pub(crate) command_repository: Arc<dyn CommandRepository>,
+    /// Admin account, session, and login/logout audit port.
+    pub(crate) admin_repository: Arc<dyn AdminRepository>,
+    /// Device reads and MQTT credential/presence state port.
+    pub(crate) device_repository: Arc<dyn DeviceRepository>,
+    /// Latest-value attribute persistence and pagination port.
+    pub(crate) attributes_repository: Arc<dyn AttributesRepository>,
+    /// Database health, summary reads, and best-effort config audit.
+    pub(crate) storage_repository: Arc<dyn StorageRepository>,
+    /// Telemetry ingest, query, and retention port.
+    pub(crate) telemetry_repository: Arc<dyn TelemetryReadRepository>,
     /// Per-device locks; expired entries are pruned on each acquisition.
     credential_rotations: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     /// Registry shared with the MQTT listener.
@@ -80,7 +100,7 @@ pub struct AppState {
 impl AppState {
     /// Builds state with a fresh limiter and readiness set to `true`.
     pub fn new(
-        pool: SqlitePool,
+        repositories: AppRepositories,
         config: Arc<LoadedConfig>,
         readiness: ServiceReadiness,
         events: EventBus,
@@ -95,9 +115,7 @@ impl AppState {
             config.config.auth.login_max_attempts,
             Duration::from_millis(config.config.auth.login_window_ms),
         );
-        let command_repository = Arc::new(SqliteCommandRepository::new(pool.clone()));
         Self {
-            pool,
             config,
             login_limiter: Arc::new(limiter),
             ready: Arc::new(AtomicBool::new(true)),
@@ -107,7 +125,12 @@ impl AppState {
             events,
             device_admission: mqtt_control.device_admission,
             device_kicks: mqtt_control.device_kicks,
-            command_repository,
+            command_repository: repositories.commands,
+            admin_repository: repositories.admin,
+            device_repository: repositories.devices,
+            attributes_repository: repositories.attributes,
+            telemetry_repository: repositories.telemetry,
+            storage_repository: repositories.storage,
             credential_rotations: Arc::new(Mutex::new(HashMap::new())),
             presence,
             mqtt_failure: mqtt_control.failure,

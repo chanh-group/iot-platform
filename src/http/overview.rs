@@ -27,18 +27,10 @@ pub async fn get(
     let from = now.saturating_sub(DAY_MS);
     let database_ok = tokio::time::timeout(
         Duration::from_secs(1),
-        sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(&state.pool),
+        state.storage_repository.health_check(),
     )
     .await
     .is_ok_and(|result| result.is_ok());
-
-    let (device_total, device_disabled): (i64, i64) = sqlx::query_as(
-        "SELECT COUNT(*), COALESCE(SUM(CASE WHEN enabled = 0 THEN 1 ELSE 0 END), 0)
-         FROM devices",
-    )
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|error| storage_error(error, &request_id))?;
     let device_online = state.presence.online_count().map_err(|error| {
         state.mqtt_failure.report_failure(error);
         ApiError::new(
@@ -49,52 +41,28 @@ pub async fn get(
         )
     })?;
 
-    let (telemetry_events_24h, last_received_at): (i64, Option<i64>) = sqlx::query_as(
-        "SELECT
-             (SELECT COUNT(*) FROM telemetry_events WHERE received_at >= ? AND received_at < ?),
-             (SELECT MAX(received_at) FROM telemetry_events)",
-    )
-    .bind(from)
-    .bind(now)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|error| storage_error(error, &request_id))?;
-
-    let (pending, dispatched, failed_24h, expired_24h): (i64, i64, i64, i64) =
-        sqlx::query_as(
-            "SELECT
-                 COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0),
-                 COALESCE(SUM(CASE WHEN status = 'dispatched' THEN 1 ELSE 0 END), 0),
-                 COALESCE(SUM(CASE WHEN status = 'failed'
-                                   AND completed_at >= ? AND completed_at < ? THEN 1 ELSE 0 END), 0),
-                 COALESCE(SUM(CASE WHEN status = 'expired'
-                                   AND completed_at >= ? AND completed_at < ? THEN 1 ELSE 0 END), 0)
-             FROM commands",
-        )
-        .bind(from)
-        .bind(now)
-        .bind(from)
-        .bind(now)
-        .fetch_one(&state.pool)
+    let counts = state
+        .storage_repository
+        .overview(from, now)
         .await
         .map_err(|error| storage_error(error, &request_id))?;
 
     let config = &state.config.config;
     Ok(Json(json!({
         "devices": {
-            "total": device_total,
+            "total": counts.devices_total,
             "online": device_online,
-            "disabled": device_disabled,
+            "disabled": counts.devices_disabled,
         },
         "telemetry": {
-            "events_24h": telemetry_events_24h,
-            "last_received_at": last_received_at,
+            "events_24h": counts.telemetry_events_24h,
+            "last_received_at": counts.last_received_at,
         },
         "commands": {
-            "pending": pending,
-            "dispatched": dispatched,
-            "failed_24h": failed_24h,
-            "expired_24h": expired_24h,
+            "pending": counts.commands_pending,
+            "dispatched": counts.commands_dispatched,
+            "failed_24h": counts.commands_failed_24h,
+            "expired_24h": counts.commands_expired_24h,
         },
         "ingest": {
             "queue_depth": Metrics::global().telemetry_queue_depth.get(),
@@ -107,8 +75,8 @@ pub async fn get(
     })))
 }
 
-fn storage_error(error: sqlx::Error, request_id: &str) -> ApiError {
-    tracing::warn!(%error, "overview storage unavailable");
+fn storage_error(_error: impl std::fmt::Display, request_id: &str) -> ApiError {
+    tracing::warn!("overview storage unavailable");
     ApiError::from_domain(
         DomainError::Unavailable("storage unavailable".to_owned()),
         request_id.to_owned(),

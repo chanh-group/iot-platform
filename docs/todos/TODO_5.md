@@ -19,7 +19,7 @@ Thêm PostgreSQL, sau đó MySQL, theo từng đợt độc lập; giữ SQLite 
 
   Baseline tại điểm vào Phase 5, 2026-11-09 trên release commit `59b44fdb22ff94b719bbc56d40aa5f8ca7e78932`: `cargo fmt --all --check`, Clippy, `cargo test --all`, `cargo test --release --locked`, `cargo build --release --locked`, frontend frozen/typecheck/29 tests/194 assertions/build, `cargo deny check`, `cargo audit` và Docker A17 smoke PASS. CI run 42626360028 xanh cả bốn job; `cargo audit` không còn vulnerability (hai cảnh báo unmaintained có exception hiện hành). Test manual load vẫn ignored; artifact `web/dist` build tại chỗ không phải release artifact.
 
-  **Gate release Phase 5 đã mở; P5-01 hoàn tất** (inventory, port boundary, A18 matrix, committed-prefix contract và SQLite interleaving test trong [audit report](../reports/p5-01-storage-audit-2026-11-09.md)). P5-02 chưa bắt đầu; chưa chọn backend/version và chưa có code PostgreSQL/MySQL. Bước kế tiếp là ADR/setup theo thứ tự §2; giữ session-cleanup gap trong gate trước A18.
+  **Gate release Phase 5 đã mở; P5-01 hoàn tất** (inventory, port boundary, A18 matrix, committed-prefix contract và SQLite interleaving test trong [audit report](../reports/p5-01-storage-audit-2026-11-09.md)). P5-02 đang triển khai trên `feat/phas5/storage-audit-ci`: ADR-010 chốt PostgreSQL 18.6 / SQLx 0.9.0, cập nhật contract; domain ports, cleanup scheduler, PostgreSQL code và A18 vẫn chưa được đánh dấu PASS.
 - [ ] Đọc lại contract trước mỗi task; nếu cần bật SQLx feature cho backend, chọn version engine/image hoặc đổi kiến trúc/config/TLS, ghi quyết định và lý do trong `01` trước khi triển khai. Không tự nâng version/dependency.
 - [ ] PostgreSQL hoàn tất và qua gate riêng trước đợt MySQL. SQLite vẫn chạy độc lập, không cần database server ngoài, không regression.
 - [ ] Giữ queue hữu hạn, timeout/pool hữu hạn, transaction rõ ràng, redaction và nguyên tắc ACK sau commit. Không tự chuyển dữ liệu giữa engine khi đổi URL; export/import là hạng mục riêng.
@@ -36,13 +36,16 @@ Thêm PostgreSQL, sau đó MySQL, theo từng đợt độc lập; giữ SQLite 
 
 ## 2. PostgreSQL — P5-02
 
-- [ ] Sau gate §0 và audit §1, chốt cấu hình engine/URL, SQLx feature, migration và hướng dẫn credential theo `01`/`02`; `url` và `url_env` loại trừ nhau, không fallback hoặc lộ URL/secret trong log/API.
-- [ ] Resolve cleanup parity before backend support: `02` §3.4 promises hourly expired/revoked-session cleanup, but the current `sessions::delete_expired` call found is test-only. Add and test the production schedule for SQLite/backend adapters, or explicitly revise the contract before A18 claims.
-- [ ] Hoàn tất/wire các domain ports để bỏ SQLite-specific leaks khỏi HTTP/MQTT/runtime; trước engine-specific PostgreSQL code phải chuyển SQLite qua cùng ports, test SQLite regression và giữ transaction/audit semantics. Đây là phần đã chuyển chính thức từ P5-01 sang P5-02 trong delivery plan §8.
-- [ ] Pool hữu hạn, timeout và retry có giới hạn; migrate trước listener, migration fail thì startup fail. Migration riêng, idempotent theo cơ chế migration; kiểm tra DB mới, chạy lại và nâng cấp từ schema cũ; không downgrade tự động.
-- [ ] Implement các repository/transaction cần thiết theo ma trận §1; query dùng bound parameters; giữ SQLite hoạt động. Kiểm thử DB lỗi/mất kết nối rồi phục hồi, readiness và không ACK thành công giả.
+- [x] Chốt ADR-010 trong `01`: PostgreSQL 18.6, image `postgres:18.6-bookworm`, SQLx 0.9.0 PostgreSQL/TLS feature, URL selection, pool/retry, migration, type/collation/transaction/checkpoint mapping; cập nhật `02` trước code. Đây chỉ là quyết định, không phải A18 PASS.
+- [x] Wire session cleanup vào scheduler hourly backend-neutral; cả hai adapter xóa expired/old-revoked theo batch 5 000. Giữ cancellation/metrics và kiểm tra cleanup adapter PostgreSQL trong test DB riêng.
+- [x] Hoàn tất/wire domain ports để HTTP/MQTT/runtime/CLI chọn adapter theo URL; chuyển SQLite qua cùng ports trước PostgreSQL và giữ transaction/audit semantics. SQLite regression chạy trong gate bên dưới.
+- [x] Pool hữu hạn, timeout/retry tối đa 5 lần; runtime migrate trước listener và fail closed; CLI migrate chọn đúng backend. PostgreSQL migration chạy trên DB mới và chạy lại idempotent.
+- [x] Implement repository/transaction PostgreSQL theo ma trận §1 với bind parameters; giữ SQLite hoạt động. Chưa coi adapter smoke test là evidence đủ cho mất kết nối/readiness.
+- [ ] Kiểm thử PostgreSQL mất kết nối rồi phục hồi, readiness và không ACK thành công giả.
 - [ ] Chạy chung A18: bootstrap/auth/ACL, telemetry commit→application ACK/dedup/conflict, REST/WS cursor và reconnect, command/idempotency/ACK/expiry, audit/credential, retention, shutdown, migration và recovery. Assert transaction/audit rollback đúng contract; không trả ACK lưu thành công hay HTTP success trước commit bền vững. Bao phủ race/rollback, DB failure/readiness và A08/A09 tương đương, gồm kill trước commit, sau commit trước ACK và sau ACK.
 - [ ] Hoàn tất Compose/backup/restore §4 và baseline §5 cho PostgreSQL. Ghi lệnh, phiên bản, timestamp, test pass/fail/ignored, artifact và giới hạn; chỉ đánh dấu PostgreSQL hỗ trợ sau khi tất cả gate backend pass.
+
+**Evidence P5-02 hiện tại (2026-11-10):** `tests/postgres_storage.rs` chạy riêng với `postgres:18.6-bookworm` qua `IOT_TEST_POSTGRES_URL` tới DB test riêng tên `iot_test`. Test chạy CLI migrate/admin-create, fresh + rerun migration, admin/session, device/credential/audit, attributes, command/idempotency/dispatch/ACK/expiry, telemetry dedup/conflict/rollback, allocator writer interleaving, overview, retention và cleanup. Đây là adapter smoke/interleaving evidence, **không phải A18 PASS**; test cố ý `ignored` trong `cargo test --all` và được chạy thủ công riêng.
 
 **Gate PostgreSQL trước MySQL:** chỉ bắt đầu §3 khi mọi mục PostgreSQL ở §2, §4 và §5 đã pass; ma trận A18 đầy đủ và SQLite regression pass; test ignored thuộc gate đã chạy riêng; evidence/version/artifact và giới hạn đã được ghi. PostgreSQL chỉ được công bố hỗ trợ độc lập sau gate này; không lấy kết quả compile, connect hoặc migrate thay A18.
 

@@ -41,18 +41,17 @@ pub async fn export(
         ));
     }
 
-    let pending: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM commands WHERE status IN ('pending', 'dispatched')",
-    )
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|error| {
-        tracing::warn!(%error, "command metrics storage unavailable");
-        ApiError::from_domain(
-            DomainError::Unavailable("storage unavailable".to_owned()),
-            request_id.clone(),
-        )
-    })?;
+    let pending = state
+        .storage_repository
+        .pending_commands()
+        .await
+        .map_err(|_| {
+            tracing::warn!("command metrics storage unavailable");
+            ApiError::from_domain(
+                DomainError::Unavailable("storage unavailable".to_owned()),
+                request_id.clone(),
+            )
+        })?;
     Metrics::global()
         .commands_pending
         .set(u64::try_from(pending).unwrap_or(0));

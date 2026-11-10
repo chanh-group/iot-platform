@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::config::schema::Config;
-use crate::config::{ConfigError, LoadedConfig, paths, runtime, validate};
+use crate::config::{ConfigError, DatabaseBackend, LoadedConfig, paths, runtime, validate};
 
 /// Reads `conf.toml`, resolves paths and env, applies `runtime.toml`, validates.
 pub fn load(path: &Path) -> Result<LoadedConfig, ConfigError> {
@@ -48,7 +48,7 @@ pub fn load_with_env(
     }
 
     let database_url = match (&config.database.url, &config.database.url_env) {
-        (Some(url), None) => match paths::resolve_sqlite_url(url, &base, &data_dir) {
+        (Some(url), None) => match paths::resolve_database_url(url, &base, &data_dir) {
             Ok(url) => Some(url),
             Err(error) => {
                 errors.push(error);
@@ -56,7 +56,7 @@ pub fn load_with_env(
             }
         },
         (None, Some(name)) => match env(name) {
-            Some(url) => match paths::resolve_sqlite_url(&url, &base, &data_dir) {
+            Some(url) => match paths::resolve_database_url(&url, &base, &data_dir) {
                 Ok(url) => Some(url),
                 Err(error) => {
                     errors.push(error);
@@ -113,12 +113,16 @@ pub fn load_with_env(
         ConfigError::Invalid(vec!["database: url could not be resolved".to_owned()])
     })?;
 
+    let database_backend = DatabaseBackend::from_url(&database_url)
+        .ok_or_else(|| ConfigError::Invalid(vec!["database: unsupported URL scheme".to_owned()]))?;
+
     let runtime_config =
         runtime::RuntimeConfigStore::new(runtime_path.clone(), config.clone(), revision, overlay);
     Ok(LoadedConfig {
         config,
         data_dir,
         database_url,
+        database_backend,
         runtime_settings_path: runtime_path,
         metrics_token,
         revision,

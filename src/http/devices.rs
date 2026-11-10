@@ -13,11 +13,11 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::core::auth;
-use crate::core::device;
+use crate::core::device::{
+    self, DeviceAudit, DeviceCredentialRotation, DeviceRepositoryError, DeviceRow, NewDevice,
+};
 use crate::core::domain_error::{DomainError, FieldError};
 use crate::observability::request_id::RequestId;
-use crate::storage::sqlite::audit::{self, AuditEvent};
-use crate::storage::sqlite::devices::{self, DeviceRow};
 
 use super::AppState;
 use super::api_error::ApiError;
@@ -93,55 +93,26 @@ pub async fn create(
     let token_hash = auth::hash_token(&token);
     let now = auth::now_ms();
     let remote_ip = peer.ip().to_string();
-    let mut tx = state
-        .pool
-        .begin()
+    state
+        .device_repository
+        .create(
+            &NewDevice {
+                id: &id,
+                name: &name,
+                metadata_json: &metadata_json,
+                enabled: payload.enabled,
+                created_at: now,
+                credential_id: &credential_id,
+                token_hash: &token_hash,
+            },
+            &DeviceAudit {
+                actor_id: &session.user_id,
+                request_id: &request_id,
+                remote_ip: &remote_ip,
+            },
+        )
         .await
-        .map_err(|error| storage_error(error, &request_id))?;
-    if let Err(db_error) = devices::insert_with_credential(
-        &mut tx,
-        &devices::NewDevice {
-            id: &id,
-            name: &name,
-            metadata_json: &metadata_json,
-            enabled: payload.enabled,
-            created_at: now,
-            credential_id: &credential_id,
-            token_hash: &token_hash,
-        },
-    )
-    .await
-    {
-        if is_device_name_conflict(&db_error) {
-            return Err(error(
-                StatusCode::CONFLICT,
-                "device_name_conflict",
-                "device name already exists",
-                &request_id,
-            ));
-        }
-        return Err(storage_error(db_error, &request_id));
-    }
-    let details = json!({"name": name, "enabled": payload.enabled}).to_string();
-    audit::insert(
-        &mut tx,
-        now,
-        &AuditEvent {
-            actor_type: "admin",
-            actor_id: Some(&session.user_id),
-            action: "device.create",
-            target_type: Some("device"),
-            target_id: Some(&id),
-            request_id: Some(&request_id),
-            remote_ip: Some(&remote_ip),
-            details_json: Some(&details),
-        },
-    )
-    .await
-    .map_err(|error| storage_error(error, &request_id))?;
-    tx.commit()
-        .await
-        .map_err(|error| storage_error(error, &request_id))?;
+        .map_err(|error| device_repository_error(error, &request_id))?;
 
     let metadata = payload.metadata;
     let created = json!({
@@ -176,6 +147,7 @@ pub async fn patch(
 ) -> Result<Json<Value>, ApiError> {
     let patch =
         device::validate_patch(&body).map_err(|errors| validation_error(errors, &request_id))?;
+    let requested_enabled = patch.enabled;
     let kick_reservation = if patch.enabled == Some(false) {
         let permit = state.device_kicks.reserve().await.map_err(|_| {
             state
@@ -212,82 +184,7 @@ pub async fn patch(
     };
     let now = auth::now_ms();
     let remote_ip = peer.ip().to_string();
-    let mut tx = state
-        .pool
-        .begin()
-        .await
-        .map_err(|error| storage_error(error, &request_id))?;
-    let old_device = devices::get_on_connection(&mut tx, &id)
-        .await
-        .map_err(|error| storage_error(error, &request_id))?
-        .ok_or_else(|| {
-            error(
-                StatusCode::NOT_FOUND,
-                "device_not_found",
-                "device not found",
-                &request_id,
-            )
-        })?;
-    if let Err(db_error) = devices::update(
-        &mut tx,
-        &id,
-        patch.name.as_deref(),
-        patch.metadata_json.as_deref(),
-        patch.enabled,
-        now,
-    )
-    .await
-    {
-        if is_device_name_conflict(&db_error) {
-            return Err(error(
-                StatusCode::CONFLICT,
-                "device_name_conflict",
-                "device name already exists",
-                &request_id,
-            ));
-        }
-        return Err(storage_error(db_error, &request_id));
-    }
-    let enabled_change = patch
-        .enabled
-        .filter(|enabled| *enabled != old_device.enabled);
-    let action = match enabled_change {
-        Some(true) => "device.enable",
-        Some(false) => "device.disable",
-        None => "device.update",
-    };
-    let mut details = json!({
-        "name": patch
-            .name
-            .as_deref()
-            .is_some_and(|name| name != old_device.name),
-        "metadata": patch
-            .metadata_json
-            .as_deref()
-            .is_some_and(|metadata| metadata != old_device.metadata_json),
-    });
-    if let Some(enabled) = enabled_change {
-        details["enabled_from"] = json!(old_device.enabled);
-        details["enabled_to"] = json!(enabled);
-    }
-    let details = details.to_string();
-    audit::insert(
-        &mut tx,
-        now,
-        &AuditEvent {
-            actor_type: "admin",
-            actor_id: Some(&session.user_id),
-            action,
-            target_type: Some("device"),
-            target_id: Some(&id),
-            request_id: Some(&request_id),
-            remote_ip: Some(&remote_ip),
-            details_json: Some(&details),
-        },
-    )
-    .await
-    .map_err(|error| storage_error(error, &request_id))?;
-    let (commit_sender, kick_completion) = if let Some((permit, admission)) = kick_reservation {
+    let (kick_completion, commit_sender) = if let Some((permit, admission)) = kick_reservation {
         let (commit_sender, committed) = oneshot::channel();
         let completion = permit.enqueue(
             id.clone(),
@@ -295,30 +192,53 @@ pub async fn patch(
             committed,
             crate::mqtt::server::DeviceKickRecovery::Disable,
         );
-        (Some(commit_sender), Some(completion))
+        (Some(completion), Some(commit_sender))
     } else {
         (None, None)
     };
-    if let Err(error) = tx.commit().await {
-        drop(commit_sender);
-        return Err(storage_error(error, &request_id));
-    }
-    if let Some(commit_sender) = commit_sender {
-        let _ = commit_sender.send(true);
-    }
-    if patch.enabled == Some(true) {
-        state
-            .device_admission
-            .set_device_enabled(&id, true)
-            .map_err(|failure| {
-                state.mqtt_failure.report_failure(failure);
-                error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "service_unavailable",
-                    "device admission unavailable",
-                    &request_id,
-                )
-            })?;
+    let admission = state.device_admission.clone();
+    let mqtt_failure = state.mqtt_failure.clone();
+    let device_id = id.clone();
+    let (transition_sender, transition_result) = oneshot::channel();
+    let after_commit: Box<dyn FnOnce() + Send> = Box::new(move || {
+        if let Some(commit_sender) = commit_sender {
+            let _ = commit_sender.send(true);
+        }
+        let success = if requested_enabled == Some(true) {
+            match admission.set_device_enabled(&device_id, true) {
+                Ok(()) => true,
+                Err(error) => {
+                    mqtt_failure.report_failure(error);
+                    false
+                }
+            }
+        } else {
+            true
+        };
+        let _ = transition_sender.send(success);
+    });
+    let row = state
+        .device_repository
+        .patch(
+            &id,
+            patch,
+            now,
+            &DeviceAudit {
+                actor_id: &session.user_id,
+                request_id: &request_id,
+                remote_ip: &remote_ip,
+            },
+            after_commit,
+        )
+        .await
+        .map_err(|error| device_repository_error(error, &request_id))?;
+    if !transition_result.await.unwrap_or(false) {
+        return Err(error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service_unavailable",
+            "device admission unavailable",
+            &request_id,
+        ));
     }
     if let Some(kick_completion) = kick_completion {
         match kick_completion.await {
@@ -333,10 +253,6 @@ pub async fn patch(
             }
         }
     }
-    let row = devices::get(&state.pool, &id)
-        .await
-        .map_err(|error| storage_error(error, &request_id))?
-        .ok_or_else(|| internal_error("device disappeared after update", &request_id))?;
     Ok(Json(render(&state, row, &request_id)?))
 }
 
@@ -389,63 +305,15 @@ pub async fn rotate(
     let token_hash = auth::hash_token(&token);
     let now = auth::now_ms();
     let remote_ip = peer.ip().to_string();
-    let mut tx = state
-        .pool
-        .begin_with("BEGIN IMMEDIATE")
+    let device = state
+        .device_repository
+        .get(&id)
         .await
-        .map_err(|error| storage_error(error, &request_id))?;
-    let device = devices::get_on_connection(&mut tx, &id)
-        .await
-        .map_err(|error| storage_error(error, &request_id))?
-        .ok_or_else(|| {
-            error(
-                StatusCode::NOT_FOUND,
-                "device_not_found",
-                "device not found",
-                &request_id,
-            )
-        })?;
+        .map_err(|error| device_repository_error(error, &request_id))?
+        .ok_or_else(|| device_repository_error(DeviceRepositoryError::NotFound, &request_id))?;
     let old_credential_id = device
         .credential_id
-        .as_deref()
         .ok_or_else(|| internal_error("device has no active credential", &request_id))?;
-    if !devices::rotate_credential(
-        &mut tx,
-        &id,
-        old_credential_id,
-        &credential_id,
-        &token_hash,
-        now,
-    )
-    .await
-    .map_err(|error| storage_error(error, &request_id))?
-    {
-        return Err(internal_error(
-            "active credential changed during rotation",
-            &request_id,
-        ));
-    }
-    let details = json!({
-        "old_credential_id": old_credential_id,
-        "new_credential_id": credential_id,
-    })
-    .to_string();
-    audit::insert(
-        &mut tx,
-        now,
-        &AuditEvent {
-            actor_type: "admin",
-            actor_id: Some(&session.user_id),
-            action: "credential.rotate",
-            target_type: Some("device"),
-            target_id: Some(&id),
-            request_id: Some(&request_id),
-            remote_ip: Some(&remote_ip),
-            details_json: Some(&details),
-        },
-    )
-    .await
-    .map_err(|error| storage_error(error, &request_id))?;
 
     let (commit_sender, committed) = oneshot::channel();
     let kick_completion = permit.enqueue(
@@ -453,14 +321,30 @@ pub async fn rotate(
         admission,
         committed,
         crate::mqtt::server::DeviceKickRecovery::Rotate {
-            previous_credential_id: old_credential_id.to_owned(),
+            previous_credential_id: old_credential_id.clone(),
         },
     );
-    if let Err(error) = tx.commit().await {
-        drop(commit_sender);
-        return Err(storage_error(error, &request_id));
-    }
-    let _ = commit_sender.send(true);
+    state
+        .device_repository
+        .rotate_credential(
+            DeviceCredentialRotation {
+                device_id: &id,
+                expected_credential_id: &old_credential_id,
+                new_credential_id: &credential_id,
+                token_hash: &token_hash,
+                now,
+                audit: DeviceAudit {
+                    actor_id: &session.user_id,
+                    request_id: &request_id,
+                    remote_ip: &remote_ip,
+                },
+            },
+            Box::new(move || {
+                let _ = commit_sender.send(true);
+            }),
+        )
+        .await
+        .map_err(|error| device_repository_error(error, &request_id))?;
     match kick_completion.await {
         Ok(Ok(())) => {}
         Ok(Err(())) | Err(_) => {
@@ -535,15 +419,16 @@ pub async fn list(
             Ok(cursor)
         })
         .transpose()?;
-    let mut rows = devices::list(
-        &state.pool,
-        query.q.as_deref(),
-        query.enabled,
-        after.as_ref().map(|c| (c.created_at, c.id.as_str())),
-        limit + 1,
-    )
-    .await
-    .map_err(|e| storage_error(e, &request_id))?;
+    let mut rows = state
+        .device_repository
+        .list(
+            query.q.as_deref(),
+            query.enabled,
+            after.as_ref().map(|c| (c.created_at, c.id.as_str())),
+            limit + 1,
+        )
+        .await
+        .map_err(|e| storage_error(e, &request_id))?;
     let more = rows.len() > limit as usize;
     rows.truncate(limit as usize);
     let next_cursor = if more {
@@ -579,7 +464,9 @@ pub async fn get(
     RequestId(request_id): RequestId,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let row = devices::get(&state.pool, &id)
+    let row = state
+        .device_repository
+        .get(&id)
         .await
         .map_err(|e| storage_error(e, &request_id))?
         .ok_or_else(|| {
@@ -621,7 +508,28 @@ fn render(state: &AppState, row: DeviceRow, request_id: &str) -> Result<Value, A
     )
 }
 
-fn storage_error(error: sqlx::Error, request_id: &str) -> ApiError {
+fn device_repository_error(failure: DeviceRepositoryError, request_id: &str) -> ApiError {
+    match failure {
+        DeviceRepositoryError::NotFound => error(
+            StatusCode::NOT_FOUND,
+            "device_not_found",
+            "device not found",
+            request_id,
+        ),
+        DeviceRepositoryError::NameConflict => error(
+            StatusCode::CONFLICT,
+            "device_name_conflict",
+            "device name already exists",
+            request_id,
+        ),
+        DeviceRepositoryError::CredentialChanged => {
+            internal_error("active credential changed during rotation", request_id)
+        }
+        DeviceRepositoryError::Storage(error) => storage_error(error, request_id),
+    }
+}
+
+fn storage_error(error: impl std::fmt::Display, request_id: &str) -> ApiError {
     tracing::warn!(%error, "device storage unavailable");
     ApiError::from_domain(
         DomainError::Unavailable("storage unavailable".to_owned()),
@@ -648,10 +556,4 @@ fn internal_error(error: impl std::fmt::Display, request_id: &str) -> ApiError {
         DomainError::Internal(anyhow::anyhow!("{error}")),
         request_id.to_owned(),
     )
-}
-
-fn is_device_name_conflict(error: &sqlx::Error) -> bool {
-    error
-        .as_database_error()
-        .is_some_and(|error| error.message().contains("devices.name"))
 }
