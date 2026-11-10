@@ -40,3 +40,5 @@ docker exec "$name" createdb -U postgres iot_a18_test >/dev/null
 crash_url="postgresql://postgres:${password}@127.0.0.1:${port}/iot_a18_test?sslmode=disable"
 IOT_TEST_POSTGRES_URL="$crash_url" \
     cargo test --manifest-path "$repo_root/Cargo.toml" --test crash_recovery -- --test-threads=1
+IOT_TEST_POSTGRES_URL="$crash_url" \
+    cargo test --manifest-path "$repo_root/Cargo.toml" --test backend_a18 -- --ignored --nocapture
