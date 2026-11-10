@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: ['**']
   pull_request:
     branches: [master]
 
@@ -26,10 +26,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - uses: oven-sh/setup-bun@v2
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         with:
           bun-version: 1.4.2
 
       - name: Build frontend assets for rust-embed
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         working-directory: web
         run: |
           bun install --frozen-lockfile
@@ -42,9 +44,13 @@ jobs:
           cargo fmt --all --check
           cargo clippy --all-targets --all-features -- -D warnings
           cargo test --all
+          git diff --check
+
+      - name: Release tests and build
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        run: |
           cargo test --release --locked
           cargo build --release --locked
-          git diff --check
 
   frontend:
     runs-on: ubuntu-24.04
@@ -60,10 +66,21 @@ jobs:
         run: |
           bun install --frozen-lockfile
           bun run --bun typecheck
+
+      - name: Frontend tests without backend build
+        if: github.event_name != 'push' || github.ref != 'refs/heads/master'
+        working-directory: web
+        run: bun test $(ls tests/*.test.ts | grep -v '/backend-ui.test.ts$')
+
+      - name: Full frontend tests and build
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        working-directory: web
+        run: |
           bun run --bun test
           bun run --bun build
 
   docker:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4

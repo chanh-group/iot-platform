@@ -258,9 +258,9 @@ Giữ nguyên phạm vi trên; các mục này không phải việc cần triể
 - [x] Các task Phase 4 đã được commit theo nhóm (`0c30af0` đến `4d6c8ae`); build/test của commit hiện tại có evidence ở §13–14. Chưa chạy lại build/test độc lập trên từng commit cũ.
 - [x] Message trong lịch sử mô tả nhóm task; các message liệt kê ban đầu chỉ là gợi ý, không bắt buộc tạo commit release trước khi phát hành.
 - [x] `git ls-files` không liệt kê file trong `target/`, `data/`, `web/dist/`, `web/node_modules/`, hoặc file `*.log`, `*.key`, `*.pem`, `.env`, `.env.*`. Đây là kiểm tra đường dẫn, không chứng minh toàn bộ nội dung hay lịch sử Git không có secret; tiếp tục review secret trước mỗi commit.
-- [x] Hồ sơ bàn giao Phase 4 cục bộ được ghi bên dưới, kèm timestamp, test, image ID và SBOM dry-run, load và restore. Bằng chứng release registry vẫn mở riêng, không thay bằng image ID cục bộ.
+- [x] Hồ sơ bàn giao Phase 4 gồm dry-run cục bộ, load/restore và release thật `v0.1.1`; GHCR/OIDC/digest được xác minh tại [release report](../reports/release-v0.1.1-2026-11-09.md).
 
-### Hồ sơ hiện có — chưa phải release
+### Hồ sơ pre-release — snapshot 2026-11-08
 
 - Commit code/test được kiểm tra gần nhất: `4d6c8ae10bde076df6fe2cd72ab08e5e0ef59c14`; hồ sơ này là thay đổi tài liệu sau commit đó. Các nhóm task trước đã được commit riêng; chưa xác minh lại từng commit độc lập. Chưa tạo tag hoặc publish trong lượt này.
 - Test và gate: lần chạy 2026-11-07 khoảng 13:13 +07:00 ở §14 có 280 test pass, 2 ignored; gate A01–A17/A19/A20 và lần chạy release/frontend trước đó được ghi ở §13. Docker smoke và load test ignored có evidence riêng ở §8, §10 và §12.
@@ -268,8 +268,18 @@ Giữ nguyên phạm vi trên; các mục này không phải việc cần triể
 - Artifact cục bộ, không được commit và có thể bị dọn: `target/release-dry-run/sbom-source.spdx.json`, `sbom-image.spdx.json`, `trivy-image.json`, `iot-server-v0.1.0-linux-x86_64.tar.gz`, `SHA256SUMS`, `SHA256SUMS.bundle` và `cosign.pub`. `sha256sum -c SHA256SUMS` PASS lúc kiểm tra khoảng 13:08; chữ ký dùng khóa tạm của dry-run, không phải OIDC release. Dry-run không được upload transparency-log entry.
 - Load: [baseline 2026-11-07](../reports/load-baseline-2026-11-07.md), 59.999 publish request trong 60 giây, application ACK 51,201% và 29.279 ACK drop; không phải cam kết throughput, chưa đo retry. Restore: [drill 2026-11-07](../reports/restore-drill-2026-11-07.md) PASS ở mức artifact tự động với fake Docker adapter; smoke Docker thật được ghi riêng ở §8–9.
 - Exception: image scan hiện không có exception; hai cảnh báo dependency unmaintained và hạn review ghi trong [release checklist](../release-checklist.md#exception-đang-áp-dụng).
-- **Còn mở trước bàn giao release:** chạy checklist trên đúng commit sẽ tag; ghi timestamp, commit/tag, digest GHCR, kết quả verify OIDC, SBOM/scan/checksum và đường dẫn artifact release; xác nhận workflow GHCR thực tế và kiểm tra lại dữ liệu nhạy cảm trước commit. Không thay các bằng chứng này bằng dry-run cục bộ.
+- **Còn mở tại thời điểm snapshot:** chạy checklist trên đúng commit sẽ tag; ghi timestamp, commit/tag, digest GHCR, kết quả verify OIDC, SBOM/scan/checksum và đường dẫn artifact release; xác nhận workflow GHCR thực tế và kiểm tra lại dữ liệu nhạy cảm trước commit. Không thay các bằng chứng này bằng dry-run cục bộ.
+
+### Release thật `v0.1.1` — đã xác minh
+
+- Commit/tag: `59b44fdb22ff94b719bbc56d40aa5f8ca7e78932` / `v0.1.1`. Candidate tag `v0.1.0` fail trước GHCR push, không có GitHub Release; tag cũ được giữ nguyên.
+- CI [run 42626360028](https://github.com/chanh-group/iot-platform/actions/runs/42626360028) và release [run 42628361802](https://github.com/chanh-group/iot-platform/actions/runs/42628361802) đều PASS.
+- GitHub Release: [v0.1.1](https://github.com/chanh-group/iot-platform/releases/tag/v0.1.1). Release assets gồm binary Linux x86_64, source/image SBOM, Trivy report, `SHA256SUMS` và bundle; download + `sha256sum -c` PASS.
+- GHCR digest đã ký: `sha256:e5c0b199fab5df3cf6535fcbea7bd08fdd18a376fe557eea5509b4fd260836eb`. Workflow xác minh image signature OIDC với identity `https://github.com/chanh-group/iot-platform/.github/workflows/release.yml@refs/tags/v0.1.1` và issuer `https://token.actions.githubusercontent.com`; `cosign verify-blob` checksums PASS.
+- Source SBOM 859 packages, image SBOM 110; Trivy 0 HIGH/CRITICAL, 0 exception. `cargo audit` không còn vulnerability sau khi nâng SQLite bundled; hai advisory unmaintained có exception hiện hành.
+- GHCR package private theo chủ đích cho nhóm; thành viên cần `read:packages`, anonymous 401 là expected. Dry-run cùng commit ở `target/release-dry-run-59b44fd-20261109/`, local image ID `sha256:fa36752e8b3d7a49962d930f9c842555192bca4986ac1b35898f32a9ad64c0b2` (không phải GHCR digest).
+- **Phase 4 PASS. Phase 5 được mở** theo delivery plan §8; firmware client và đánh giá lại load/capacity vẫn là rủi ro vận hành.
 
 ---
 
-> **Phase 4 PASS** khi tất cả gate ở §13 tick, không còn placeholder doc, release checklist dry-run pass, và không còn item nào trong `src/` có tag TODO/P0/P1.
+> **Phase 4 PASS** khi tất cả gate ở §13 tick, không còn placeholder doc, dry-run và release thật GHCR/OIDC/artifact đã xác minh, và không còn item nào trong `src/` có tag TODO/P0/P1.

@@ -184,12 +184,14 @@ Không bắt đầu trước khi Phase 4 release. Mỗi backend là một đợt
 
 | ID | Việc | Điều kiện |
 | --- | --- | --- |
-| P5-01 | Audit `Repository` trait; bỏ SQLite-specific leak | Phase 4 xong |
-| P5-02 | PostgreSQL migrations + repository + pool; A18 | A18 pass |
+| P5-01 | Audit storage/contract; inventory SQLite leaks, chốt port boundaries và A18 matrix | Phase 4 release |
+| P5-02 | Wire domain ports, bỏ SQLite-specific leak; sau đó PostgreSQL migrations + repository + pool; A18 | P5-01 audit pass + ADR backend/version; SQLite regression |
 | P5-03 | MySQL migrations + repository + pool; A18 | A18 pass |
 | P5-04 | Compose PostgreSQL/MySQL + healthcheck + backup/restore docs | từng backend |
 | P5-05 | Load test lại trên từng backend; công bố giới hạn | có số đo |
 | P5-06 | Cân nhắc TLS MQTT tích hợp, MQTT 5, cross-device ACL | backlog §2.2 |
+
+P5-01 chỉ là audit/contract, chưa refactor production. P5-02 phải wire các port vào HTTP/MQTT/runtime và giữ SQLite chạy qua cùng ports trước hoặc cùng lúc thêm PostgreSQL; không mở rộng engine-specific repository trước khi các SQLite leak và contract gaps trong P5-01 report được xử lý/test. MySQL vẫn chờ gate PostgreSQL riêng.
 
 Quy tắc A18: cùng bộ integration test, migration, backup/restore, crash recovery như SQLite; không công bố hỗ trợ khi chưa pass.
 
@@ -261,7 +263,7 @@ GitHub Actions (hoặc CI tương đương), các job song song khi có thể:
 - Không cần service Postgres/MySQL ở MVP.
 - Build order: frontend trước `cargo build --release` vì `rust-embed`.
 - Artifact: binary Linux x86_64 + image; không commit `web/dist`.
-- CI phải chạy trên PR và nhánh mặc định (hiện là `master`); tag chỉ sau khi nhánh mặc định xanh.
+- CI chạy trên mọi nhánh khi push và trên PR vào `master`: fmt, Clippy, Rust test, frontend typecheck/test và audit. Chỉ push `master` chạy build frontend/release/Docker, release test và browser test tích hợp backend (test này tự gọi `cargo build`); Rust test và Clippy vẫn biên dịch mã. Tag chỉ sau khi nhánh mặc định xanh.
 
 ## 11. Docker và vận hành
 

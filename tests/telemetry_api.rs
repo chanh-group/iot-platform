@@ -489,6 +489,296 @@ async fn commit_checkpoint_does_not_advance_past_an_uncommitted_batch() {
 }
 
 #[tokio::test]
+async fn ignored_duplicate_and_conflict_advance_checkpoint_without_backfill_rows() {
+    let app = TestApp::start().await;
+    let client = logged_in_client(&app).await;
+    let device = app
+        .create_device("telemetry-api-ignored-inserts", true)
+        .await;
+    let endpoint = format!("{}/api/v1/devices/{}/telemetry", app.base, device.id);
+    let ts = auth::now_ms();
+    let limits = TelemetryPayload::try_from(&app.config.config.telemetry).unwrap();
+    let original_raw = json!({
+        "event_id": "ignored-insert",
+        "ts": ts,
+        "values": {"x": 1},
+    })
+    .to_string()
+    .into_bytes();
+    let original = telemetry::validate(&original_raw, ts, limits).unwrap();
+    assert_eq!(
+        telemetry_storage::insert_batch(&app.pool, &[(device.id.clone(), original)])
+            .await
+            .unwrap(),
+        [iot_server::core::telemetry::TelemetryInsertResult::Stored]
+    );
+
+    let initial: Value = client
+        .get(&endpoint)
+        .query(&[("after_id", "0"), ("limit", "1")])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let initial_checkpoint = initial["through_id"].as_i64().unwrap();
+
+    let duplicate = telemetry::validate(&original_raw, ts, limits).unwrap();
+    assert_eq!(
+        telemetry_storage::insert_batch(&app.pool, &[(device.id.clone(), duplicate)])
+            .await
+            .unwrap(),
+        [iot_server::core::telemetry::TelemetryInsertResult::Duplicate]
+    );
+    let after_duplicate: Value = client
+        .get(&endpoint)
+        .query(&[("after_id", initial_checkpoint.to_string())])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let duplicate_checkpoint = after_duplicate["through_id"].as_i64().unwrap();
+    assert!(duplicate_checkpoint > initial_checkpoint);
+    assert!(after_duplicate["items"].as_array().unwrap().is_empty());
+
+    let conflict_raw = json!({
+        "event_id": "ignored-insert",
+        "ts": ts,
+        "values": {"x": 2},
+    })
+    .to_string()
+    .into_bytes();
+    let conflict = telemetry::validate(&conflict_raw, ts, limits).unwrap();
+    assert_eq!(
+        telemetry_storage::insert_batch(&app.pool, &[(device.id.clone(), conflict)])
+            .await
+            .unwrap(),
+        [iot_server::core::telemetry::TelemetryInsertResult::Conflict]
+    );
+    let after_conflict: Value = client
+        .get(&endpoint)
+        .query(&[("after_id", initial_checkpoint.to_string())])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let safe_checkpoint = after_conflict["through_id"].as_i64().unwrap();
+    assert!(safe_checkpoint > duplicate_checkpoint);
+    assert!(after_conflict["items"].as_array().unwrap().is_empty());
+
+    insert_event(
+        &app,
+        &device.id,
+        "stored-after-ignored-inserts",
+        auth::now_ms(),
+        auth::now_ms(),
+        json!({"x": 3}),
+    )
+    .await;
+    let recovered: Value = client
+        .get(&endpoint)
+        .query(&[("after_id", safe_checkpoint.to_string())])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(recovered["items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        recovered["items"][0]["event_id"],
+        "stored-after-ignored-inserts"
+    );
+}
+
+#[tokio::test]
+async fn sqlite_commit_checkpoint_serializes_competing_writers_and_backfills_both() {
+    let app = TestApp::start().await;
+    let client = logged_in_client(&app).await;
+    let device = app.create_device("telemetry-api-writer-order", true).await;
+    let endpoint = format!("{}/api/v1/devices/{}/telemetry", app.base, device.id);
+
+    let mut first = app.pool.acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *first)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO telemetry_events
+         (device_id, event_id, ts, received_at, values_json, payload_sha256)
+         VALUES (?, 'writer-one', ?, ?, '{\"x\":1}', ?)",
+    )
+    .bind(&device.id)
+    .bind(auth::now_ms())
+    .bind(auth::now_ms())
+    .bind([1_u8; 32].as_slice())
+    .execute(&mut *first)
+    .await
+    .unwrap();
+
+    let mut second = app.pool.acquire().await.unwrap();
+    sqlx::query("PRAGMA busy_timeout = 25")
+        .execute(&mut *second)
+        .await
+        .unwrap();
+    let lock_error = sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *second)
+        .await
+        .unwrap_err();
+    assert!(
+        lock_error.to_string().contains("locked"),
+        "expected competing writer to be locked: {lock_error}"
+    );
+
+    let while_first_is_open: Value = client
+        .get(&endpoint)
+        .query(&[("after_id", "0"), ("limit", "1")])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(while_first_is_open["through_id"], 0);
+    assert!(while_first_is_open["items"].as_array().unwrap().is_empty());
+
+    sqlx::query("COMMIT").execute(&mut *first).await.unwrap();
+    insert_event(
+        &app,
+        &device.id,
+        "writer-two",
+        auth::now_ms(),
+        auth::now_ms(),
+        json!({"x": 2}),
+    )
+    .await;
+
+    let first_page: Value = client
+        .get(&endpoint)
+        .query(&[("after_id", "0"), ("limit", "1")])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(first_page["items"][0]["event_id"], "writer-one");
+    let first_id = first_page["items"][0]["internal_id"].as_i64().unwrap();
+    let through_id = first_page["through_id"].as_i64().unwrap();
+    assert!(through_id > first_id);
+
+    let second_page: Value = client
+        .get(&endpoint)
+        .query(&[
+            ("after_id", "0"),
+            ("limit", "1"),
+            ("cursor", first_page["next_cursor"].as_str().unwrap()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(second_page["items"][0]["event_id"], "writer-two");
+    let second_id = second_page["items"][0]["internal_id"].as_i64().unwrap();
+    assert!(second_id > first_id && second_id <= through_id);
+    assert_eq!(second_page["through_id"], through_id);
+    assert!(second_page["next_cursor"].is_null());
+
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *first)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO telemetry_events
+         (device_id, event_id, ts, received_at, values_json, payload_sha256)
+         VALUES (?, 'writer-rolled-back', ?, ?, '{\"x\":3}', ?)",
+    )
+    .bind(&device.id)
+    .bind(auth::now_ms())
+    .bind(auth::now_ms())
+    .bind([3_u8; 32].as_slice())
+    .execute(&mut *first)
+    .await
+    .unwrap();
+    let lock_error = sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *second)
+        .await
+        .unwrap_err();
+    assert!(
+        lock_error.to_string().contains("locked"),
+        "expected competing writer to be locked: {lock_error}"
+    );
+
+    let while_rollback_is_open: Value = client
+        .get(&endpoint)
+        .query(&[("after_id", through_id.to_string())])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(while_rollback_is_open["through_id"], through_id);
+    assert!(
+        while_rollback_is_open["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    sqlx::query("ROLLBACK").execute(&mut *first).await.unwrap();
+    insert_event(
+        &app,
+        &device.id,
+        "writer-after-rollback",
+        auth::now_ms(),
+        auth::now_ms(),
+        json!({"x": 4}),
+    )
+    .await;
+
+    let after_rollback: Value = client
+        .get(&endpoint)
+        .query(&[("after_id", through_id.to_string())])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after_rollback["items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        after_rollback["items"][0]["event_id"],
+        "writer-after-rollback"
+    );
+}
+
+#[tokio::test]
 async fn latest_uses_received_time_then_internal_id_as_tie_breakers() {
     let app = TestApp::start().await;
     let client = logged_in_client(&app).await;

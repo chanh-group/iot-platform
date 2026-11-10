@@ -245,9 +245,13 @@ phải bản phát hành và có thể được dọn định kỳ.
 
 Kiểm tra thủ công sau workflow:
 
+GHCR package của nhóm được giữ **private** theo chủ đích. Trước `docker pull`,
+đăng nhập bằng account/token có quyền `read:packages`; anonymous pull trả 401 là
+hành vi mong đợi. GitHub Release assets vẫn tải được công khai.
+
 ```sh
-docker pull ghcr.io/chanh-group/iot-platform:v$VERSION
-docker run --rm ghcr.io/chanh-group/iot-platform:v$VERSION --version
+docker pull "ghcr.io/chanh-group/iot-platform:$VERSION" # VERSION không có tiền tố v
+docker run --rm "ghcr.io/chanh-group/iot-platform:$VERSION" --version
 sha256sum -c SHA256SUMS
 ```
 
