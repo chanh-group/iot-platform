@@ -1626,9 +1626,24 @@ async fn assert_retained_rejections_do_not_use_broker_storage(fixture: &Fixture,
     let storage = iot_server::storage::runtime::StorageRuntime::connect(&loaded)
         .await
         .unwrap();
+    let telemetry = &loaded.config.telemetry;
+    let telemetry_cancel = tokio_util::sync::CancellationToken::new();
+    let telemetry_ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (ingest, telemetry_task) = iot_server::core::telemetry::spawn_worker(
+        storage.repositories.telemetry.clone(),
+        iot_server::core::events::EventBus::new(),
+        telemetry.queue_capacity as usize,
+        telemetry.max_batch_bytes as usize,
+        loaded.runtime_config.clone(),
+        iot_server::core::telemetry::IngestWorkerControl {
+            cancellation: telemetry_cancel.clone(),
+            readiness: Arc::clone(&telemetry_ready),
+        },
+    );
+    let limits = iot_server::core::telemetry::TelemetryPayload::try_from(telemetry).unwrap();
     let mut config = loaded.config.mqtt.clone();
     config.listen = "127.0.0.1:0".parse().unwrap();
-    let mqtt = iot_server::mqtt::server::MqttServer::start(
+    let mqtt = iot_server::mqtt::server::MqttServer::start_with_ingest(
         &config,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         iot_server::mqtt::server::MqttRepositories {
@@ -1637,6 +1652,7 @@ async fn assert_retained_rejections_do_not_use_broker_storage(fixture: &Fixture,
             attributes: storage.repositories.attributes.clone(),
         },
         Arc::new(iot_server::core::presence::Presence::new()),
+        (ingest, limits, telemetry.queue_capacity as usize),
     )
     .await
     .unwrap();
@@ -1649,6 +1665,29 @@ async fn assert_retained_rejections_do_not_use_broker_storage(fixture: &Fixture,
         true,
     )
     .await;
+    let telemetry_ack_topic = format!("devices/{}/telemetry/ack", device.id);
+    assert!(matches!(
+        mqtt_subscribe(
+            &client,
+            &mut eventloop,
+            &telemetry_ack_topic,
+            QoS::AtLeastOnce,
+        )
+        .await,
+        SubscribeReasonCode::Success(_)
+    ));
+
+    mqtt_publish(
+        &client,
+        &format!("devices/{}/status", device.id),
+        QoS::AtLeastOnce,
+        true,
+        br#"{"status":"online"}"#,
+    )
+    .await;
+    mqtt_wait_puback(&mut eventloop, Duration::from_secs(5)).await;
+    let retained_after_allowed_status = mqtt.retained_count().await;
+    assert_eq!(retained_after_allowed_status, retained_before + 1);
 
     mqtt_publish(
         &client,
@@ -1658,8 +1697,11 @@ async fn assert_retained_rejections_do_not_use_broker_storage(fixture: &Fixture,
         &telemetry_payload("retained-count-probe", 1.0),
     )
     .await;
-    mqtt_wait_puback(&mut eventloop, Duration::from_secs(5)).await;
-    assert_eq!(mqtt.retained_count().await, retained_before);
+    let retained_ack =
+        mqtt_wait_telemetry_ack(&mut eventloop, &telemetry_ack_topic, Duration::from_secs(5)).await;
+    assert_eq!(retained_ack["status"], "rejected");
+    assert_eq!(retained_ack["code"], "retained_not_allowed");
+    assert_eq!(mqtt.retained_count().await, retained_after_allowed_status);
 
     mqtt_publish(
         &client,
@@ -1670,11 +1712,13 @@ async fn assert_retained_rejections_do_not_use_broker_storage(fixture: &Fixture,
     )
     .await;
     mqtt_wait_closed(&mut eventloop, Duration::from_secs(3)).await;
-    assert_eq!(mqtt.retained_count().await, retained_before);
+    assert_eq!(mqtt.retained_count().await, retained_after_allowed_status);
 
     drop(client);
     mqtt.abort();
     drop(mqtt);
+    telemetry_cancel.cancel();
+    telemetry_task.await.unwrap();
     storage.close().await;
 }
 
