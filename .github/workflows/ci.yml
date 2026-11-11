@@ -52,6 +52,20 @@ jobs:
           cargo test --release --locked
           cargo build --release --locked
 
+  postgres:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.98.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: PostgreSQL integration and recovery
+        run: |
+          sh tests/postgres_recovery.sh
+          sh tests/postgres_migration_failure.sh
+
   frontend:
     runs-on: ubuntu-24.04
     steps:

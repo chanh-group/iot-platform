@@ -1,6 +1,7 @@
 mod common;
 
 use std::{
+    net::IpAddr,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::Arc,
@@ -12,6 +13,8 @@ use common::{
     mqtt_wait_puback, mqtt_wait_publish, mqtt_wait_telemetry_ack, raw_publish_denied,
 };
 use futures_util::{SinkExt, StreamExt};
+use iot_server::core::command::{AckApplyOutcome, CommandAck, CommandAckStatus, CommandRepository};
+use iot_server::storage::sqlite::commands::SqliteCommandRepository;
 use reqwest::StatusCode;
 use rumqttc::{ConnectReturnCode, Event, Packet, QoS, SubscribeReasonCode};
 use serde_json::{Value, json};
@@ -40,6 +43,9 @@ async fn shared_a18_contracts_pass_on_sqlite() {
 #[ignore = "requires an isolated PostgreSQL 18.6 database; run tests/postgres_recovery.sh"]
 async fn shared_a18_contracts_pass_on_postgres() {
     let url = std::env::var("IOT_TEST_POSTGRES_URL").expect("isolated PostgreSQL test URL");
+    let container = std::env::var("IOT_TEST_POSTGRES_CONTAINER")
+        .expect("fixture container name from tests/postgres_recovery.sh");
+    assert_postgres_fixture(&url, &container).await;
     run_a18_contracts(Some(url)).await;
 }
 
@@ -531,6 +537,151 @@ impl Fixture {
         .unwrap()
     }
 
+    async fn command_ack_result(&self, command_id: &str) -> (String, Option<i64>, Option<Value>) {
+        match &self.db {
+            TestDb::Sqlite(pool) => {
+                let (status, completed_at, result): (String, Option<i64>, Option<String>) =
+                    sqlx::query_as(
+                        "SELECT status, completed_at, result_json FROM commands WHERE id = ?",
+                    )
+                    .bind(command_id)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+                (
+                    status,
+                    completed_at,
+                    result.map(|value| serde_json::from_str(&value).unwrap()),
+                )
+            }
+            TestDb::Postgres(pool) => {
+                let (status, completed_at, result): (String, Option<i64>, Option<Value>) =
+                    sqlx::query_as(
+                        "SELECT status, completed_at, result_json FROM commands WHERE id = $1",
+                    )
+                    .bind(command_id)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+                (status, completed_at, result)
+            }
+        }
+    }
+
+    async fn insert_ack_command(&self, device_id: &str, id: &str, expires_at: i64) {
+        let created_at = expires_at - 60_000;
+        match &self.db {
+            TestDb::Sqlite(pool) => {
+                sqlx::query(
+                    "INSERT INTO commands
+                     (id, device_id, name, params_json, status, created_at, expires_at, next_attempt_at)
+                     VALUES (?, ?, 'a18-ack', '{}', 'dispatched', ?, ?, ?)",
+                )
+                .bind(id)
+                .bind(device_id)
+                .bind(created_at)
+                .bind(expires_at)
+                .bind(expires_at)
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+            TestDb::Postgres(pool) => {
+                sqlx::query(
+                    "INSERT INTO commands
+                     (id, device_id, name, params_json, status, created_at, expires_at, next_attempt_at)
+                     VALUES ($1, $2, 'a18-ack', '{}', 'dispatched', $3, $4, $4)",
+                )
+                .bind(id)
+                .bind(device_id)
+                .bind(created_at)
+                .bind(expires_at)
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+        }
+    }
+
+    async fn apply_command_ack(
+        &self,
+        device_id: &str,
+        ack: &CommandAck,
+        received_at: i64,
+    ) -> Result<AckApplyOutcome, iot_server::core::command::CommandRepositoryError> {
+        match &self.db {
+            TestDb::Sqlite(pool) => {
+                SqliteCommandRepository::new(pool.clone())
+                    .apply_ack(device_id, ack, received_at)
+                    .await
+            }
+            TestDb::Postgres(pool) => {
+                iot_server::storage::postgres::commands::PostgresCommandRepository::new(
+                    pool.clone(),
+                )
+                .apply_ack(device_id, ack, received_at)
+                .await
+            }
+        }
+    }
+
+    async fn install_ack_storage_failure(&self) {
+        match &self.db {
+            TestDb::Sqlite(pool) => {
+                sqlx::query(
+                    "CREATE TRIGGER fail_command_ack BEFORE UPDATE OF status ON commands
+                     WHEN NEW.status IN ('succeeded', 'failed')
+                     BEGIN SELECT RAISE(FAIL, 'injected ACK storage failure'); END",
+                )
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+            TestDb::Postgres(pool) => {
+                sqlx::query(
+                    "CREATE FUNCTION iot_test_fail_command_ack() RETURNS trigger
+                     LANGUAGE plpgsql AS $$ BEGIN
+                         IF NEW.status IN ('succeeded', 'failed') THEN
+                             RAISE EXCEPTION 'injected ACK storage failure';
+                         END IF;
+                         RETURN NEW;
+                     END $$",
+                )
+                .execute(pool)
+                .await
+                .unwrap();
+                sqlx::query(
+                    "CREATE TRIGGER fail_command_ack BEFORE UPDATE OF status ON commands
+                     FOR EACH ROW EXECUTE FUNCTION iot_test_fail_command_ack()",
+                )
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+        }
+    }
+
+    async fn remove_ack_storage_failure(&self) {
+        match &self.db {
+            TestDb::Sqlite(pool) => {
+                sqlx::query("DROP TRIGGER fail_command_ack")
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            }
+            TestDb::Postgres(pool) => {
+                sqlx::query("DROP TRIGGER fail_command_ack ON commands")
+                    .execute(pool)
+                    .await
+                    .unwrap();
+                sqlx::query("DROP FUNCTION iot_test_fail_command_ack()")
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
     async fn make_command_due(&self, command_id: &str, now: i64) {
         match &self.db {
             TestDb::Sqlite(pool) => {
@@ -574,6 +725,59 @@ impl Fixture {
             }
         }
         .unwrap()
+    }
+
+    async fn install_telemetry_storage_failure(&self) {
+        match &self.db {
+            TestDb::Sqlite(pool) => {
+                sqlx::query(
+                    "CREATE TRIGGER fail_telemetry_insert BEFORE INSERT ON telemetry_events
+                     BEGIN SELECT RAISE(FAIL, 'injected telemetry storage failure'); END",
+                )
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+            TestDb::Postgres(pool) => {
+                sqlx::query(
+                    "CREATE FUNCTION iot_test_fail_telemetry_insert() RETURNS trigger
+                     LANGUAGE plpgsql AS $$ BEGIN
+                         RAISE EXCEPTION 'injected telemetry storage failure';
+                     END $$",
+                )
+                .execute(pool)
+                .await
+                .unwrap();
+                sqlx::query(
+                    "CREATE TRIGGER fail_telemetry_insert BEFORE INSERT ON telemetry_events
+                     FOR EACH ROW EXECUTE FUNCTION iot_test_fail_telemetry_insert()",
+                )
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+        }
+    }
+
+    async fn remove_telemetry_storage_failure(&self) {
+        match &self.db {
+            TestDb::Sqlite(pool) => {
+                sqlx::query("DROP TRIGGER fail_telemetry_insert")
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            }
+            TestDb::Postgres(pool) => {
+                sqlx::query("DROP TRIGGER fail_telemetry_insert ON telemetry_events")
+                    .execute(pool)
+                    .await
+                    .unwrap();
+                sqlx::query("DROP FUNCTION iot_test_fail_telemetry_insert()")
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            }
+        }
     }
 
     async fn attribute_count(&self, device_id: &str) -> i64 {
@@ -738,6 +942,182 @@ impl Fixture {
         .unwrap()
     }
 
+    async fn device_state(&self, device_id: &str) -> Option<(String, String, bool)> {
+        match &self.db {
+            TestDb::Sqlite(pool) => {
+                sqlx::query_as("SELECT name, metadata_json, enabled FROM devices WHERE id = ?")
+                    .bind(device_id)
+                    .fetch_optional(pool)
+                    .await
+            }
+            TestDb::Postgres(pool) => {
+                sqlx::query_as(
+                    "SELECT name, metadata_json::text, enabled FROM devices WHERE id = $1",
+                )
+                .bind(device_id)
+                .fetch_optional(pool)
+                .await
+            }
+        }
+        .unwrap()
+    }
+
+    async fn device_count_named(&self, name: &str) -> i64 {
+        match &self.db {
+            TestDb::Sqlite(pool) => {
+                sqlx::query_scalar("SELECT COUNT(*) FROM devices WHERE name = ?")
+                    .bind(name)
+                    .fetch_one(pool)
+                    .await
+            }
+            TestDb::Postgres(pool) => {
+                sqlx::query_scalar("SELECT COUNT(*) FROM devices WHERE name = $1")
+                    .bind(name)
+                    .fetch_one(pool)
+                    .await
+            }
+        }
+        .unwrap()
+    }
+
+    async fn first_user_id(&self) -> String {
+        match &self.db {
+            TestDb::Sqlite(pool) => {
+                sqlx::query_scalar("SELECT id FROM users LIMIT 1")
+                    .fetch_one(pool)
+                    .await
+            }
+            TestDb::Postgres(pool) => {
+                sqlx::query_scalar("SELECT id FROM users LIMIT 1")
+                    .fetch_one(pool)
+                    .await
+            }
+        }
+        .unwrap()
+    }
+
+    async fn credential_rows(
+        &self,
+        device_id: &str,
+    ) -> Vec<(String, Vec<u8>, String, Option<i64>, Option<String>)> {
+        match &self.db {
+            TestDb::Sqlite(pool) => {
+                sqlx::query_as(
+                    "SELECT id, token_hash, status, revoked_at, rotated_from
+                     FROM device_credentials WHERE device_id = ? ORDER BY id",
+                )
+                .bind(device_id)
+                .fetch_all(pool)
+                .await
+            }
+            TestDb::Postgres(pool) => {
+                sqlx::query_as(
+                    "SELECT id, token_hash, status, revoked_at, rotated_from
+                     FROM device_credentials WHERE device_id = $1 ORDER BY id",
+                )
+                .bind(device_id)
+                .fetch_all(pool)
+                .await
+            }
+        }
+        .unwrap()
+    }
+
+    async fn audit_event(
+        &self,
+        request_id: &str,
+    ) -> Option<(
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> {
+        match &self.db {
+            TestDb::Sqlite(pool) => {
+                sqlx::query_as(
+                    "SELECT actor_type, actor_id, action, target_type, target_id,
+                            request_id, remote_ip, details_json
+                     FROM audit_events WHERE request_id = ?",
+                )
+                .bind(request_id)
+                .fetch_optional(pool)
+                .await
+            }
+            TestDb::Postgres(pool) => {
+                sqlx::query_as(
+                    "SELECT actor_type, actor_id, action, target_type, target_id,
+                            request_id, remote_ip, details_json::text
+                     FROM audit_events WHERE request_id = $1",
+                )
+                .bind(request_id)
+                .fetch_optional(pool)
+                .await
+            }
+        }
+        .unwrap()
+    }
+
+    async fn install_device_audit_failure(&self) {
+        match &self.db {
+            TestDb::Sqlite(pool) => {
+                sqlx::query(
+                    "CREATE TRIGGER fail_device_audit BEFORE INSERT ON audit_events
+                     WHEN NEW.action IN ('device.create', 'device.update', 'device.disable', 'credential.rotate')
+                     BEGIN SELECT RAISE(FAIL, 'injected device audit failure'); END",
+                )
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+            TestDb::Postgres(pool) => {
+                sqlx::query(
+                    "CREATE FUNCTION iot_test_fail_device_audit() RETURNS trigger
+                     LANGUAGE plpgsql AS $$ BEGIN
+                         IF NEW.action IN ('device.create', 'device.update', 'device.disable', 'credential.rotate') THEN
+                             RAISE EXCEPTION 'injected device audit failure';
+                         END IF;
+                         RETURN NEW;
+                     END $$",
+                )
+                .execute(pool)
+                .await
+                .unwrap();
+                sqlx::query(
+                    "CREATE TRIGGER fail_device_audit BEFORE INSERT ON audit_events
+                     FOR EACH ROW EXECUTE FUNCTION iot_test_fail_device_audit()",
+                )
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+        }
+    }
+
+    async fn remove_device_audit_failure(&self) {
+        match &self.db {
+            TestDb::Sqlite(pool) => {
+                sqlx::query("DROP TRIGGER fail_device_audit")
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            }
+            TestDb::Postgres(pool) => {
+                sqlx::query("DROP TRIGGER fail_device_audit ON audit_events")
+                    .execute(pool)
+                    .await
+                    .unwrap();
+                sqlx::query("DROP FUNCTION iot_test_fail_device_audit()")
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
     async fn age_telemetry(&self, device_id: &str, event_id: &str) {
         match &self.db {
             TestDb::Sqlite(pool) => {
@@ -837,6 +1217,259 @@ async fn run_a18_contracts(postgres_url: Option<String>) {
             .status(),
         StatusCode::OK
     );
+
+    let actor_id = fixture.first_user_id().await;
+    let create_request_id = "a18-device-create-audit";
+    let created = http
+        .post(format!("{}/api/v1/devices", fixture.base))
+        .header("X-IoT-CSRF", "1")
+        .header("X-Request-ID", create_request_id)
+        .json(&json!({"name":"a18-audit-probe","metadata":{"private":"create-secret"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created: Value = created.json().await.unwrap();
+    let audit_device_id = created["device"]["id"].as_str().unwrap().to_owned();
+    let audit_token = created["credential"]["token"].as_str().unwrap().to_owned();
+    let audit_credentials = fixture.credential_rows(&audit_device_id).await;
+    assert_eq!(audit_credentials.len(), 1);
+    assert_eq!(
+        audit_credentials[0].0,
+        created["credential"]["id"].as_str().unwrap()
+    );
+    assert_eq!(
+        audit_credentials[0].1,
+        iot_server::core::auth::hash_token(&audit_token)
+    );
+    assert_eq!(audit_credentials[0].2, "active");
+    assert_eq!(audit_credentials[0].3, None);
+    assert_eq!(audit_credentials[0].4, None);
+    let create_audit = fixture.audit_event(create_request_id).await.unwrap();
+    assert_eq!(create_audit.0, "admin");
+    assert_eq!(create_audit.1.as_deref(), Some(actor_id.as_str()));
+    assert_eq!(create_audit.2, "device.create");
+    assert_eq!(create_audit.3.as_deref(), Some("device"));
+    assert_eq!(create_audit.4.as_deref(), Some(audit_device_id.as_str()));
+    assert_eq!(create_audit.5.as_deref(), Some(create_request_id));
+    assert_eq!(create_audit.6.as_deref(), Some("127.0.0.1"));
+    assert_eq!(
+        serde_json::from_str::<Value>(create_audit.7.as_deref().unwrap()).unwrap(),
+        json!({"name":"a18-audit-probe","enabled":true})
+    );
+
+    let update_request_id = "a18-device-update-audit";
+    let updated = http
+        .patch(format!("{}/api/v1/devices/{audit_device_id}", fixture.base))
+        .header("X-IoT-CSRF", "1")
+        .header("X-Request-ID", update_request_id)
+        .json(&json!({"name":"a18-audit-renamed","metadata":{"private":"update-secret"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), StatusCode::OK);
+    let update_audit = fixture.audit_event(update_request_id).await.unwrap();
+    assert_eq!(update_audit.0, "admin");
+    assert_eq!(update_audit.1.as_deref(), Some(actor_id.as_str()));
+    assert_eq!(update_audit.2, "device.update");
+    assert_eq!(update_audit.3.as_deref(), Some("device"));
+    assert_eq!(update_audit.4.as_deref(), Some(audit_device_id.as_str()));
+    assert_eq!(update_audit.5.as_deref(), Some(update_request_id));
+    assert_eq!(update_audit.6.as_deref(), Some("127.0.0.1"));
+    assert_eq!(
+        serde_json::from_str::<Value>(update_audit.7.as_deref().unwrap()).unwrap(),
+        json!({"name":true,"metadata":true})
+    );
+
+    fixture.install_device_audit_failure().await;
+    let failed_create_request_id = "a18-device-create-failed";
+    let failed_create = http
+        .post(format!("{}/api/v1/devices", fixture.base))
+        .header("X-IoT-CSRF", "1")
+        .header("X-Request-ID", failed_create_request_id)
+        .json(&json!({"name":"a18-audit-create-rollback","metadata":{}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed_create.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        fixture
+            .device_count_named("a18-audit-create-rollback")
+            .await,
+        0,
+        "device insert rolls back when its audit insert fails"
+    );
+    assert!(
+        fixture
+            .audit_event(failed_create_request_id)
+            .await
+            .is_none()
+    );
+
+    let before_failed_update = fixture.device_state(&audit_device_id).await.unwrap();
+    let failed_update_request_id = "a18-device-update-failed";
+    let failed_update = http
+        .patch(format!("{}/api/v1/devices/{audit_device_id}", fixture.base))
+        .header("X-IoT-CSRF", "1")
+        .header("X-Request-ID", failed_update_request_id)
+        .json(&json!({
+            "name":"a18-audit-update-rollback",
+            "metadata":{"private":"rollback-secret"}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed_update.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let after_failed_update = fixture.device_state(&audit_device_id).await.unwrap();
+    assert_eq!(after_failed_update.0, before_failed_update.0);
+    assert_eq!(
+        serde_json::from_str::<Value>(&after_failed_update.1).unwrap(),
+        serde_json::from_str::<Value>(&before_failed_update.1).unwrap()
+    );
+    assert_eq!(after_failed_update.2, before_failed_update.2);
+    assert!(
+        fixture
+            .audit_event(failed_update_request_id)
+            .await
+            .is_none()
+    );
+
+    let failed_disable_request_id = "a18-device-disable-failed";
+    let failed_disable = http
+        .patch(format!("{}/api/v1/devices/{audit_device_id}", fixture.base))
+        .header("X-IoT-CSRF", "1")
+        .header("X-Request-ID", failed_disable_request_id)
+        .json(&json!({"enabled":false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed_disable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        fixture.device_state(&audit_device_id).await.unwrap(),
+        before_failed_update,
+        "device disable rolls back when its audit insert fails"
+    );
+    assert!(
+        fixture
+            .audit_event(failed_disable_request_id)
+            .await
+            .is_none()
+    );
+
+    let before_failed_rotation = fixture.credential_rows(&audit_device_id).await;
+    let failed_rotation_request_id = "a18-credential-rotate-failed";
+    let failed_rotation = http
+        .post(format!(
+            "{}/api/v1/devices/{audit_device_id}/credentials/rotate",
+            fixture.base
+        ))
+        .header("X-IoT-CSRF", "1")
+        .header("X-Request-ID", failed_rotation_request_id)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed_rotation.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        fixture.credential_rows(&audit_device_id).await,
+        before_failed_rotation,
+        "credential revoke/insert rolls back when rotation audit fails"
+    );
+    assert!(
+        fixture
+            .audit_event(failed_rotation_request_id)
+            .await
+            .is_none()
+    );
+    let (old_token_client, old_token_eventloop, _) = mqtt_connect(
+        fixture.mqtt_addr,
+        &audit_device_id,
+        &audit_device_id,
+        &audit_token,
+        true,
+    )
+    .await;
+    fixture.remove_device_audit_failure().await;
+    drop(old_token_client);
+    drop(old_token_eventloop);
+
+    let old_credential_id = before_failed_rotation[0].0.clone();
+    let successful_rotation_request_id = "a18-credential-rotate-success";
+    let successful_rotation = http
+        .post(format!(
+            "{}/api/v1/devices/{audit_device_id}/credentials/rotate",
+            fixture.base
+        ))
+        .header("X-IoT-CSRF", "1")
+        .header("X-Request-ID", successful_rotation_request_id)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(successful_rotation.status(), StatusCode::OK);
+    let successful_rotation: Value = successful_rotation.json().await.unwrap();
+    let new_token = successful_rotation["credential"]["token"].as_str().unwrap();
+    let new_credential_id = successful_rotation["credential"]["id"].as_str().unwrap();
+    let rotated_credentials = fixture.credential_rows(&audit_device_id).await;
+    assert_eq!(rotated_credentials.len(), 2);
+    let old_credential = rotated_credentials
+        .iter()
+        .find(|credential| credential.0 == old_credential_id)
+        .unwrap();
+    assert_eq!(old_credential.2, "revoked");
+    assert!(old_credential.3.is_some());
+    let new_credential = rotated_credentials
+        .iter()
+        .find(|credential| credential.0 == new_credential_id)
+        .unwrap();
+    assert_eq!(new_credential.2, "active");
+    assert_eq!(
+        new_credential.1,
+        iot_server::core::auth::hash_token(new_token)
+    );
+    assert_eq!(
+        new_credential.4.as_deref(),
+        Some(old_credential_id.as_str())
+    );
+    let rotation_audit = fixture
+        .audit_event(successful_rotation_request_id)
+        .await
+        .unwrap();
+    assert_eq!(rotation_audit.0, "admin");
+    assert_eq!(rotation_audit.1.as_deref(), Some(actor_id.as_str()));
+    assert_eq!(rotation_audit.2, "credential.rotate");
+    assert_eq!(rotation_audit.3.as_deref(), Some("device"));
+    assert_eq!(rotation_audit.4.as_deref(), Some(audit_device_id.as_str()));
+    assert_eq!(
+        rotation_audit.5.as_deref(),
+        Some(successful_rotation_request_id)
+    );
+    assert_eq!(rotation_audit.6.as_deref(), Some("127.0.0.1"));
+    assert_eq!(
+        serde_json::from_str::<Value>(rotation_audit.7.as_deref().unwrap()).unwrap(),
+        json!({
+            "old_credential_id":old_credential_id,
+            "new_credential_id":new_credential_id
+        })
+    );
+    assert_eq!(
+        mqtt_connect_refused(
+            fixture.mqtt_addr,
+            &audit_device_id,
+            &audit_device_id,
+            &audit_token,
+        )
+        .await,
+        ConnectReturnCode::BadUserNamePassword
+    );
+    let (_new_token_client, _new_token_eventloop, _) = mqtt_connect(
+        fixture.mqtt_addr,
+        &audit_device_id,
+        &audit_device_id,
+        new_token,
+        true,
+    )
+    .await;
 
     let device_a = create_device(&http, &fixture.base, "a18-device-a").await;
     let device_b = create_device(&http, &fixture.base, "a18-device-b").await;
@@ -1119,6 +1752,74 @@ async fn run_a18_contracts(postgres_url: Option<String>) {
         SubscribeReasonCode::Success(_)
     ));
 
+    let (failure_client, mut failure_eventloop, _) = mqtt_connect(
+        fixture.mqtt_addr,
+        &device_e.id,
+        &device_e.id,
+        &device_e.token,
+        true,
+    )
+    .await;
+    let failure_ack_topic = format!("devices/{}/telemetry/ack", device_e.id);
+    let failure_telemetry_topic = format!("devices/{}/telemetry", device_e.id);
+    assert!(matches!(
+        mqtt_subscribe(
+            &failure_client,
+            &mut failure_eventloop,
+            &failure_ack_topic,
+            QoS::AtLeastOnce
+        )
+        .await,
+        SubscribeReasonCode::Success(_)
+    ));
+    let failed_id = format!("a18-storage-failure-{}", Uuid::now_v7());
+    let retry_payload = telemetry_payload(&failed_id, 10.0);
+    fixture.install_telemetry_storage_failure().await;
+    mqtt_publish(
+        &failure_client,
+        &failure_telemetry_topic,
+        QoS::AtLeastOnce,
+        false,
+        &retry_payload,
+    )
+    .await;
+    mqtt_wait_puback(&mut failure_eventloop, Duration::from_secs(5)).await;
+    let failed_ack = mqtt_wait_telemetry_ack(
+        &mut failure_eventloop,
+        &failure_ack_topic,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(failed_ack["event_id"], failed_id);
+    assert_eq!(failed_ack["status"], "retryable");
+    assert_eq!(failed_ack["code"], "storage_unavailable");
+    assert_eq!(fixture.telemetry_count(&device_e.id, &failed_id).await, 0);
+
+    fixture.remove_telemetry_storage_failure().await;
+    mqtt_publish(
+        &failure_client,
+        &failure_telemetry_topic,
+        QoS::AtLeastOnce,
+        false,
+        &retry_payload,
+    )
+    .await;
+    mqtt_wait_puback(&mut failure_eventloop, Duration::from_secs(5)).await;
+    let recovered_ack = mqtt_wait_telemetry_ack(
+        &mut failure_eventloop,
+        &failure_ack_topic,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(recovered_ack["event_id"], failed_id);
+    // The worker may commit its own retry before processing the client's byte-identical retry.
+    assert!(matches!(
+        recovered_ack["status"].as_str(),
+        Some("stored" | "duplicate")
+    ));
+    assert_eq!(fixture.telemetry_count(&device_e.id, &failed_id).await, 1);
+    drop(failure_client);
+
     let first_id = format!("a18-{}", Uuid::now_v7());
     let first_payload = telemetry_payload(&first_id, 11.0);
     mqtt_publish(
@@ -1167,7 +1868,8 @@ async fn run_a18_contracts(postgres_url: Option<String>) {
 
     socket.close(None).await.unwrap();
     let second_id = format!("a18-{}", Uuid::now_v7());
-    let second_payload = telemetry_payload(&second_id, 22.0);
+    let late_ts = iot_server::core::auth::now_ms() - 300_000;
+    let second_payload = telemetry_payload_at(&second_id, 22.0, late_ts);
     mqtt_publish(
         &a_client,
         &telemetry_topic,
@@ -1205,7 +1907,23 @@ async fn run_a18_contracts(postgres_url: Option<String>) {
         .await
         .unwrap();
     assert_eq!(first_page["items"][0]["event_id"], first_id);
+    let through_id = first_page["through_id"].as_i64().unwrap();
     let next_cursor = first_page["next_cursor"].as_str().unwrap();
+
+    let third_id = format!("a18-{}", Uuid::now_v7());
+    mqtt_publish(
+        &a_client,
+        &telemetry_topic,
+        QoS::AtLeastOnce,
+        false,
+        &telemetry_payload_at(&third_id, 33.0, late_ts - 1),
+    )
+    .await;
+    mqtt_wait_puback(&mut a_eventloop, Duration::from_secs(5)).await;
+    assert_eq!(
+        mqtt_wait_telemetry_ack(&mut a_eventloop, &ack_topic, Duration::from_secs(5)).await["status"],
+        "stored"
+    );
     let second_page: Value = http
         .get(telemetry_url(&fixture.base, &device_a.id))
         .query(&[
@@ -1223,6 +1941,108 @@ async fn run_a18_contracts(postgres_url: Option<String>) {
         .unwrap();
     assert_eq!(second_page["items"][0]["event_id"], second_id);
     assert!(second_page["next_cursor"].is_null());
+    assert_eq!(second_page["through_id"], through_id);
+
+    let next_backfill: Value = http
+        .get(telemetry_url(&fixture.base, &device_a.id))
+        .query(&[("after_id", through_id.to_string())])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(next_backfill["items"][0]["event_id"], third_id);
+
+    let event_time: Value = http
+        .get(telemetry_url(&fixture.base, &device_a.id))
+        .query(&[
+            ("from", late_ts.to_string()),
+            ("to", (late_ts + 1).to_string()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(event_time["items"][0]["event_id"], second_id);
+    assert_eq!(event_time["items"][0]["ts"], late_ts);
+
+    let ack_now = iot_server::core::auth::now_ms();
+    let ack_device = create_device(&http, &fixture.base, "a18-ack-repository").await;
+    let storage_failure_id = Uuid::now_v7().to_string();
+    fixture
+        .insert_ack_command(&ack_device.id, &storage_failure_id, ack_now + 60_000)
+        .await;
+    let storage_failure_before = fixture.command_ack_projection(&storage_failure_id).await;
+    fixture.install_ack_storage_failure().await;
+    let storage_failure_ack = CommandAck {
+        command_id: storage_failure_id.clone(),
+        status: CommandAckStatus::Succeeded,
+        result: Some(json!({"durable":true})),
+        error: None,
+    };
+    assert_eq!(
+        fixture
+            .apply_command_ack(&ack_device.id, &storage_failure_ack, ack_now)
+            .await,
+        Err(iot_server::core::command::CommandRepositoryError::StorageUnavailable)
+    );
+    assert_eq!(
+        fixture.command_ack_projection(&storage_failure_id).await,
+        storage_failure_before,
+        "ACK storage failure rolls back every terminal ACK field"
+    );
+    fixture.remove_ack_storage_failure().await;
+
+    let race_id = Uuid::now_v7().to_string();
+    fixture
+        .insert_ack_command(&ack_device.id, &race_id, ack_now + 60_000)
+        .await;
+    let success_ack = CommandAck {
+        command_id: race_id.clone(),
+        status: CommandAckStatus::Succeeded,
+        result: Some(json!({"winner":"success"})),
+        error: None,
+    };
+    let failure_ack = CommandAck {
+        command_id: race_id.clone(),
+        status: CommandAckStatus::Failed,
+        result: Some(json!({"winner":"failure"})),
+        error: Some("failed".to_owned()),
+    };
+    let (success_result, failure_result) = tokio::join!(
+        fixture.apply_command_ack(&ack_device.id, &success_ack, ack_now),
+        fixture.apply_command_ack(&ack_device.id, &failure_ack, ack_now),
+    );
+    let outcomes = [success_result.unwrap(), failure_result.unwrap()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == AckApplyOutcome::Applied)
+            .count(),
+        1,
+        "only one concurrent terminal ACK can win"
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == AckApplyOutcome::Duplicate)
+            .count(),
+        1
+    );
+    let (race_status, completed_at, race_result) = fixture.command_ack_result(&race_id).await;
+    assert_eq!(completed_at, Some(ack_now));
+    assert!(matches!(race_status.as_str(), "succeeded" | "failed"));
+    assert!(matches!(
+        race_result,
+        Some(value) if value == json!({"winner":"success"}) || value == json!({"winner":"failure"})
+    ));
 
     fixture.install_command_audit_failure().await;
     let failed_key = format!("rollback-{}", Uuid::now_v7());
@@ -1482,8 +2302,9 @@ async fn run_a18_contracts(postgres_url: Option<String>) {
         .json()
         .await
         .unwrap();
-    assert_eq!(persisted["items"].as_array().unwrap().len(), 1);
+    assert_eq!(persisted["items"].as_array().unwrap().len(), 2);
     assert_eq!(persisted["items"][0]["event_id"], second_id);
+    assert_eq!(persisted["items"][1]["event_id"], third_id);
     let command_after_restart: Value = http
         .get(format!("{}{}", fixture.base, location))
         .send()
@@ -1566,16 +2387,133 @@ async fn run_a18_contracts(postgres_url: Option<String>) {
     let dispatch_now = iot_server::core::auth::now_ms();
     dispatcher.run_once(dispatch_now).await.unwrap();
     let after = fixture.command_state(&failed_dispatch_id).await;
-    assert_eq!(
-        after.0, "pending",
-        "failed publish does not complete a command"
-    );
+    assert!(matches!(before.0.as_str(), "pending" | "dispatched"));
+    assert_eq!(after.0, before.0, "failed publish preserves command status");
     assert_eq!(after.1, before.1 + 1, "failed publish records one attempt");
     assert!(after.2 > dispatch_now, "failed publish schedules a retry");
     storage.close().await;
 
     #[cfg(debug_assertions)]
     shutdown_deadline_does_not_ack_uncommitted_postgres_or_sqlite_work(&fixture, &device_b).await;
+}
+
+async fn assert_postgres_fixture(url: &str, container: &str) {
+    let image = docker_output(&["inspect", "--format", "{{.Config.Image}}", container]);
+    assert_eq!(image.trim(), "postgres:18.6-bookworm");
+    let label = docker_output(&[
+        "inspect",
+        "--format",
+        "{{ index .Config.Labels \"io.iot.test-fixture\" }}",
+        container,
+    ]);
+    assert_eq!(label.trim(), "postgres-outage");
+
+    let mapped_ports = docker_output(&[
+        "inspect",
+        "--format",
+        "{{json (index .NetworkSettings.Ports \"5432/tcp\")}}",
+        container,
+    ]);
+    let mapped_ports: Value = serde_json::from_str(&mapped_ports).unwrap();
+    let bindings = mapped_ports
+        .as_array()
+        .filter(|bindings| bindings.len() == 1)
+        .expect("fixture must have exactly one PostgreSQL port mapping");
+    let host: IpAddr = bindings[0]["HostIp"]
+        .as_str()
+        .expect("fixture port mapping must have a host IP")
+        .parse()
+        .expect("fixture port mapping host IP must be valid");
+    let port: u16 = bindings[0]["HostPort"]
+        .as_str()
+        .expect("fixture port mapping must have a host port")
+        .parse()
+        .expect("fixture mapped port must be valid");
+    assert!(
+        host.is_loopback(),
+        "fixture PostgreSQL port must bind loopback"
+    );
+    validate_postgres_fixture_url(url, host, port)
+        .expect("test URL must target this fixture mapping and database");
+
+    let pool = PgPool::connect(url).await.unwrap();
+    let (database, schema): (String, String) =
+        sqlx::query_as("SELECT current_database(), current_schema()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(database, A18_DATABASE, "unexpected database fixture");
+    assert_eq!(schema, "public", "unexpected schema fixture");
+    pool.close().await;
+}
+
+fn docker_output(args: &[&str]) -> String {
+    let output = Command::new("docker")
+        .args(args)
+        .output()
+        .expect("run Docker fixture inspection");
+    assert!(
+        output.status.success(),
+        "Docker fixture inspection failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("Docker fixture output is UTF-8")
+}
+
+fn validate_postgres_fixture_url(
+    url: &str,
+    mapped_host: IpAddr,
+    mapped_port: u16,
+) -> Result<(), &'static str> {
+    let (scheme, url) = url.split_once("://").ok_or("invalid PostgreSQL URL")?;
+    if scheme != "postgresql" {
+        return Err("unexpected PostgreSQL URL scheme");
+    }
+    let (endpoint, query) = url.split_once('?').ok_or("missing PostgreSQL URL query")?;
+    if query != "sslmode=disable" {
+        return Err("unexpected PostgreSQL URL query");
+    }
+    let (authority, database) = endpoint.rsplit_once('/').ok_or("missing database name")?;
+    if database != A18_DATABASE {
+        return Err("unexpected database name");
+    }
+    let (_, host_port) = authority
+        .rsplit_once('@')
+        .ok_or("missing URL credentials")?;
+    let (host, port) = host_port
+        .rsplit_once(':')
+        .ok_or("missing PostgreSQL port")?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    let host: IpAddr = host.parse().map_err(|_| "invalid PostgreSQL URL host")?;
+    let port: u16 = port.parse().map_err(|_| "invalid PostgreSQL URL port")?;
+    if !host.is_loopback() || host != mapped_host || port != mapped_port {
+        return Err("PostgreSQL URL does not match the fixture mapping");
+    }
+    Ok(())
+}
+
+#[test]
+fn postgres_fixture_url_guard_rejects_overrides_and_wrong_fixture() {
+    let host = IpAddr::from([127, 0, 0, 1]);
+    let valid = "postgresql://test:secret@127.0.0.1:54321/iot_a18_test?sslmode=disable";
+    assert_eq!(validate_postgres_fixture_url(valid, host, 54321), Ok(()));
+    for invalid in [
+        "postgres://test:secret@127.0.0.1:54321/iot_a18_test?sslmode=disable",
+        "postgresql://test:secret@127.0.0.1:54321/iot_a18_test?sslmode=disable&host=127.0.0.1",
+        "postgresql://test:secret@127.0.0.1:54321/iot_a18_test?sslmode=disable&port=54321",
+        "postgresql://test:secret@127.0.0.1:54321/iot_a18_test?sslmode=disable&dbname=iot_a18_test",
+        "postgresql://test:secret@192.0.2.1:54321/iot_a18_test?sslmode=disable",
+        "postgresql://test:secret@127.0.0.1:54322/iot_a18_test?sslmode=disable",
+        "postgresql://test:secret@127.0.0.1:54321/iot_test?sslmode=disable",
+    ] {
+        assert!(
+            validate_postgres_fixture_url(invalid, host, 54321).is_err(),
+            "accepted unsafe fixture URL: {invalid}"
+        );
+    }
 }
 
 async fn create_device(client: &reqwest::Client, base: &str, name: &str) -> Device {
@@ -1615,9 +2553,13 @@ async fn post_command(
 }
 
 fn telemetry_payload(event_id: &str, temperature: f64) -> Vec<u8> {
+    telemetry_payload_at(event_id, temperature, iot_server::core::auth::now_ms())
+}
+
+fn telemetry_payload_at(event_id: &str, temperature: f64, ts: i64) -> Vec<u8> {
     serde_json::to_vec(&json!({
         "event_id":event_id,
-        "ts":iot_server::core::auth::now_ms(),
+        "ts":ts,
         "values":{"temperature":temperature}
     }))
     .unwrap()

@@ -256,6 +256,7 @@ Tạo secret hex ngẫu nhiên và đặt tên DB. File password phải được
 ```sh
 cd deploy
 mkdir -p secrets
+chmod 0700 secrets
 umask 077
 openssl rand -hex 32 > secrets/postgres_password
 chmod 0600 secrets/postgres_password
@@ -268,16 +269,18 @@ Bootstrap và start:
 ```sh
 ./compose-postgres.sh run --rm iot-server migrate --config /app/conf.toml
 openssl rand -base64 32 > secrets/admin_password
-chmod 0600 secrets/admin_password
+chmod 0644 secrets/admin_password
 ./compose-postgres.sh run --rm \
-  --volume "$PWD/secrets/admin_password:/run/secrets/admin_password:ro" \
+  --volume "$PWD/secrets/admin_password:/run/secrets/admin_password:ro,z" \
   iot-server admin create --username admin --config /app/conf.toml \
   --password-file /run/secrets/admin_password
 ./compose-postgres.sh up -d
 curl -fsS http://127.0.0.1:8080/readyz
 ```
 
-`compose-postgres.sh` chỉ dành cho local/isolated Compose, đọc password từ file và tạo URL với `sslmode=disable` tường minh theo contract. Nó không ghi URL vào file, nhưng Docker lưu environment của app trong metadata; người có quyền Docker daemon/root vẫn có thể đọc biến môi trường. Dùng quyền daemon hạn chế và không dùng helper này cho production. DB remote phải cấu hình `sslmode=verify-full` với CA phù hợp; inject URL từ secret manager qua `IOT_DATABASE_URL`, không dùng URL mẫu local. Đổi `IOT_DATABASE_NAME` chỉ đổi database app sẽ kết nối; không copy hoặc chuyển dữ liệu giữa database tự động.
+Admin file phải đọc được bởi UID container `10001`: chỉ dùng `0644` trong thư mục `0700` trên host tin cậy và xóa file sau bootstrap. Bind mount `:z` thay SELinux label của file; không dùng file chia sẻ nếu việc đổi label ảnh hưởng ứng dụng khác.
+
+`compose-postgres.sh` chỉ dành cho local/isolated Compose, đọc password từ file và tạo URL với `sslmode=disable` tường minh theo contract. Nó không ghi URL vào file, nhưng Docker lưu environment của app trong metadata; người có quyền Docker daemon/root vẫn có thể đọc biến môi trường. Dùng quyền daemon hạn chế và không dùng helper này cho production. DB remote phải cấu hình `sslmode=verify-full` với CA phù hợp; inject URL từ secret manager qua `IOT_DATABASE_URL`, không dùng URL mẫu local. Khi tạo volume mới, `IOT_POSTGRES_DATABASE` mặc định theo `IOT_DATABASE_NAME`; với volume đã tồn tại, đổi tên không tạo database hay chuyển dữ liệu tự động.
 
 ### PostgreSQL backup
 

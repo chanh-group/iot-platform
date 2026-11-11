@@ -89,6 +89,20 @@ P5-03 đã bỏ theo ADR-011; giữ số mục và ID còn lại để các tham
 
 **Compose rerun (2026-11-11):** `sh tests/postgres_compose.sh` PASS trên Docker Engine 29.9.2, SELinux enforcing và `postgres:18.6-bookworm`: migrate/bootstrap, seed MQTT/REST 1 passed, backup checksum, từ chối restore vào DB hiện hữu, restore DB mới, recreate cả hai container với volume và verify 1 passed. Đã sửa SELinux bind labels và lỗi nội suy psql ở restore. Đây chưa chứng minh toàn bộ failure/permission/version cases của §4; các checkbox vẫn mở. `sh tests/postgres_recovery.sh` PASS lại cả outage, 3 crash cases và shared PostgreSQL A18, gồm kiểm tra trùng tên device mới.
 
+**Backup negative drill (2026-11-11T22:59+07:00):** `sh tests/postgres_compose.sh` PASS: backup directory `0700`, từng artifact `0600`; từ chối destination đã tồn tại, dump sai checksum, backup version 17 và restore vào DB có sẵn; xác minh không tạo DB cho hai backup lỗi, sau đó restore hợp lệ và verify lại API/MQTT. Không mô phỏng disk-full hoặc mất nguồn khi restore.
+
+Sau review độc lập, fixture Compose dùng project UUID và kiểm tra tài nguyên trùng trước cleanup; tên DB khởi tạo mặc định theo tên app khi tạo volume mới. Smoke đã chạy lại thành công. `cargo deny check` PASS; `cargo audit` PASS với hai allowed unmaintained warnings hiện hành (`atomic-polyfill`, `instant`).
+
+`sh tests/postgres_migration_failure.sh` PASS: URL guard 1 passed, migration checksum conflict 1 passed trên container PostgreSQL fixture riêng; app exit 4, hai port khả dụng sau exit và probe không thấy listener trong lúc chạy. Giới hạn: polling có thể bỏ sót listener mở rất ngắn giữa hai lần probe.
+
+`sh tests/postgres_recovery.sh` chạy lại PASS sau khi siết fixture guard: outage default 1 passed/1 ignored, outage riêng 1 passed, A08 crash 3 passed và shared PostgreSQL A18 1 passed. Shared suite bổ sung device create/update/disable và credential rotation audit context/details, redaction/hash cùng audit-write rollback. Guard yêu cầu container fixture cụ thể và URL loopback/mapped-port với query cố định, không cho host/port/dbname override; matrix API còn chưa đầy đủ.
+
+Shared A18 bổ sung late-event history, checkpoint `through_id` cố định qua nhiều trang khi có commit xen giữa, và backfill tiếp theo sau reconnect; SQLite focused test và `sh tests/postgres_recovery.sh` đều PASS. Đây vẫn là một phần history/WS matrix, không thay thế toàn bộ suite.
+
+Shared A18 cũng kiểm tra trực tiếp repository ACK: lỗi storage rollback terminal fields và hai ACK success/failure được khởi chạy đồng thời chỉ có một `Applied`, một `Duplicate` với kết quả thắng được lưu. SQLite focused test và PostgreSQL qua `sh tests/postgres_recovery.sh` PASS. `tokio::join!` không ép interleaving ở bước đọc/ghi, nên đây chưa chứng minh race cụ thể và chưa thay thế MQTT command/failure-race matrix.
+
+Shared A18 inject lỗi ghi telemetry bằng trigger DB: ACK đầu tiên `retryable/storage_unavailable`, không có row; sau khi gỡ trigger, retry cùng bytes/event ID nhận `stored` hoặc `duplicate` và có đúng một row. SQLite focused và PostgreSQL recovery runner PASS. Test quan sát ACK đầu tiên, không giám sát liên tục mọi ACK trong suốt khoảng lỗi. Assertion failed-publish cũng giữ đúng status trước đó (`pending` hoặc đã `dispatched`) thay vì giả định luôn `pending`.
+
 Sau khi thêm harness Compose: `cargo fmt --all --check`, Clippy `-D warnings`, `cargo test --all` PASS (292 passed, 0 failed, 6 ignored; PostgreSQL/Compose ignored tests chỉ compile). Đây không thay thế `sh tests/postgres_compose.sh` và không đóng gate.
 
 ## 5. Đo tải và giới hạn PostgreSQL — P5-05
@@ -97,7 +111,9 @@ Sau khi thêm harness Compose: `cargo fmt --all --check`, Clippy `-D warnings`, 
 - [ ] Ghi cấu hình retry và kết quả/giới hạn đo; so sánh SQLite chỉ khi điều kiện tương đương. Không suy tốc độ commit từ tốc độ tạo request; không công bố throughput/SLO khi chưa có evidence phù hợp. Phase 4 baseline SQLite có application ACK drop cao, không dùng làm sizing production.
 - [ ] Ghi báo cáo và giới hạn vận hành/backend; nếu cần tối ưu, đo trước, giữ correctness và bounded resources, thêm test tương ứng.
 
-PostgreSQL load harness/report chưa có; không suy throughput từ SQLite baseline. Không đánh dấu P5-05 PASS.
+Đã có harness và một phép đo PostgreSQL MQTT trong [báo cáo baseline](../reports/p5-postgres-load-2026-11-11.md). Không suy throughput từ SQLite baseline; cgroup limits/peak chưa đo được, không có so sánh cùng điều kiện. Không đánh dấu P5-05 PASS.
+
+**Lượt thăm dò MQTT PostgreSQL (2026-11-11T23:25+07:00):** harness end-to-end mới báo 60.000 publish/PUBACK, 60.000 rows, 25.618 application ACK và 34.382 ACK drop trong cửa sổ 60 s + drain 10 s. Output chỉ được stream và không còn artifact, cgroup limits không đọc được; chưa dùng làm evidence gate hoặc sizing. Cần review harness, chạy lại cô lập, lưu output và ghi đầy đủ cấu hình/giới hạn trước khi đánh giá P5-05.
 
 **Khảo sát load P5-05 (2026-11-11):** `tests/load/run.sh` chỉ chạy `tests/load_baseline.rs`; harness dùng `tests/common::TestApp`, SQLite pool, SQLite config/data directory và đọc `sqlite_growth_bytes`. Nó không nhận PostgreSQL URL, không dựng PostgreSQL fixture, và không thể chứng minh backend PostgreSQL đang được đo. `docker ps` không có container nào đang chạy; vì vậy không chạy phép đo giả định/không an toàn và không ghi số throughput PostgreSQL. Cần harness riêng hoặc mở rộng fixture để chọn backend, tạo DB riêng có xác nhận danh tính trước ghi, đọc commit count/growth của PostgreSQL, cùng đo cgroup/hardware, retries và toàn bộ ACK/drain như contract. Mục này vẫn unchecked; chưa có kết quả tải thực tế.
 
@@ -105,6 +121,8 @@ PostgreSQL load harness/report chưa có; không suy throughput từ SQLite base
 
 - [ ] Ghi quyết định riêng về TLS MQTT tích hợp, MQTT 5 và cross-device ACL: nhu cầu, threat model, contract, ADR, test/gate và owner; **không mặc định triển khai** trong việc hỗ trợ SQL backend. Những mục sau MVP khác trong SPEC §2.2 cũng không tự vào scope.
 - [ ] Cho tới khi có listener TLS được chốt và kiểm thử, giữ cảnh báo MQTT plaintext và dùng TLS proxy khi truy cập qua mạng công khai.
+
+Đánh giá hiện tại: chưa đưa ba tính năng vào P5-02. ADR-004 vẫn yêu cầu TLS proxy; MQTT 5 vẫn bị từ chối theo ADR-001/contract §2.1; cross-device vẫn bị deny theo ADR-005/contract §2.4. Trước khi mở lại cần xác nhận nhu cầu và owner: TLS cần threat model, chính sách certificate/reload và test listener/A19; MQTT 5 cần subset/property, giới hạn và conformance/A19; cross-device cần mô hình grant/revoke, threat model và test ACL/race. Chưa có owner hoặc nhu cầu cụ thể được chỉ định nên chưa đánh dấu quyết định hoàn tất.
 
 ## 7. Gate cuối và hồ sơ
 

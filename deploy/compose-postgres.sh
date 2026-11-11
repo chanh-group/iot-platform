@@ -34,7 +34,7 @@ IOT_POSTGRES_PASSWORD_FILE=$(realpath -e -- "$password_file")
 export IOT_POSTGRES_PASSWORD_FILE
 export IOT_DATABASE_URL="postgresql://iot:${password}@postgres:5432/${database}?sslmode=disable"
 export IOT_DATABASE_NAME="$database"
-export IOT_POSTGRES_DATABASE=${IOT_POSTGRES_DATABASE:-iot}
+export IOT_POSTGRES_DATABASE=${IOT_POSTGRES_DATABASE:-$database}
 export IOT_SERVER_IMAGE=${IOT_SERVER_IMAGE:-iot-server:local}
 export COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME:-thingsboardrust-postgres}
 exec docker compose --project-name "$COMPOSE_PROJECT_NAME" --file "$script_dir/compose.postgres.yml" "$@"

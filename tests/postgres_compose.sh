@@ -3,8 +3,8 @@ set -eu
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 tmp_root=$(mktemp -d "${TMPDIR:-/tmp/opencode}/iot-pg-compose.XXXXXX")
-project="iot-p5-compose-$$"
-image="iot-server:pg-compose-smoke-$$"
+project="iot-p5-compose-$(cat /proc/sys/kernel/random/uuid)"
+image="iot-server:$project"
 image_built=0
 export COMPOSE_PROJECT_NAME="$project"
 export IOT_SERVER_IMAGE="$image"
@@ -34,6 +34,15 @@ IOT_TEST_POSTGRES_PORT=$(free_port)
 export IOT_TEST_POSTGRES_URL="postgresql://iot:$(cat "$IOT_POSTGRES_PASSWORD_FILE")@127.0.0.1:${IOT_TEST_POSTGRES_PORT}/iot?sslmode=disable"
 export IOT_EXPECTED_DATABASE=iot
 
+if [ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$project")" ] || \
+   [ -n "$(docker volume ls -q --filter "label=com.docker.compose.project=$project")" ] || \
+   [ -n "$(docker network ls -q --filter "label=com.docker.compose.project=$project")" ]; then
+    echo "refusing to use an existing Compose project: $project" >&2
+    rm -f "$IOT_POSTGRES_PASSWORD_FILE" "$IOT_TEST_ADMIN_PASSWORD_FILE"
+    rmdir "$tmp_root"
+    exit 1
+fi
+
 compose() {
     "$repo_root/deploy/compose-postgres.sh" \
         --file "$repo_root/tests/compose.postgres.test.yml" "$@"
@@ -44,6 +53,17 @@ cleanup() {
     rm -rf -- "$tmp_root"
 }
 trap cleanup EXIT HUP INT TERM
+
+(
+    unset IOT_POSTGRES_DATABASE
+    export IOT_DATABASE_NAME=iot_custom_test
+    compose config --format json | python3 -c '
+import json, sys
+services = json.load(sys.stdin)["services"]
+assert services["postgres"]["environment"]["POSTGRES_DB"] == "iot_custom_test"
+assert "/iot_custom_test?" in services["iot-server"]["environment"]["IOT_DATABASE_URL"]
+'
+)
 
 docker build -f deploy/Dockerfile -t "$image" "$repo_root"
 image_built=1
@@ -72,6 +92,28 @@ IOT_COMPOSE_TEST_STAGE=seed cargo test --manifest-path "$repo_root/Cargo.toml" \
 backup="$tmp_root/backup"
 "$repo_root/deploy/backup-postgres.sh" "$backup"
 (cd "$backup" && sha256sum -c SHA256SUMS)
+[ "$(stat -c %a "$backup")" = 700 ]
+for file in postgres.dump POSTGRES_VERSION DATABASE SHA256SUMS; do
+    [ "$(stat -c %a "$backup/$file")" = 600 ]
+done
+if "$repo_root/deploy/backup-postgres.sh" "$backup"; then
+    echo "backup unexpectedly overwrote an existing directory" >&2
+    exit 1
+fi
+bad_backup="$tmp_root/bad-backup"
+cp -a "$backup" "$bad_backup"
+printf 'corruption\n' >> "$bad_backup/postgres.dump"
+if "$repo_root/deploy/restore-postgres.sh" "$bad_backup" iot_bad_checksum; then
+    echo "restore unexpectedly accepted a corrupt backup" >&2
+    exit 1
+fi
+cp "$backup/postgres.dump" "$bad_backup/postgres.dump"
+printf '17.0\n' > "$bad_backup/POSTGRES_VERSION"
+(cd "$bad_backup" && sha256sum postgres.dump POSTGRES_VERSION DATABASE > SHA256SUMS)
+if "$repo_root/deploy/restore-postgres.sh" "$bad_backup" iot_bad_version; then
+    echo "restore unexpectedly accepted an unsupported PostgreSQL version" >&2
+    exit 1
+fi
 if "$repo_root/deploy/restore-postgres.sh" "$backup" iot; then
     echo "restore unexpectedly overwrote an existing database" >&2
     exit 1
@@ -99,3 +141,10 @@ original_events=$(docker compose --project-name "$project" \
             --tuples-only --no-align --command="SELECT COUNT(*) FROM telemetry_events"
     ')
 [ "$original_events" -gt 0 ]
+failed_targets=$(docker compose --project-name "$project" \
+    --file "$repo_root/deploy/compose.postgres.yml" exec -T postgres sh -ec '
+        export PGPASSWORD="$(cat /run/secrets/postgres_password)"
+        psql --host=127.0.0.1 --username="$POSTGRES_USER" --dbname=postgres \
+            --tuples-only --no-align --command="SELECT COUNT(*) FROM pg_database WHERE datname IN ('\''iot_bad_checksum'\'', '\''iot_bad_version'\'')"
+    ')
+[ "$failed_targets" -eq 0 ]
