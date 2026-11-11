@@ -1,6 +1,6 @@
 # Vận hành
 
-Đây là hướng dẫn vận hành cho MVP SQLite. Nguồn sự thật kỹ thuật về hành vi là [02 — Contract kỹ thuật](plans/02-contracts.md); tài liệu này bao quát triển khai, cấu hình, log, shutdown, backup/restore, retention, monitoring, alert và troubleshooting.
+SQLite vẫn là backend mặc định. Tài liệu này giữ nguyên quy trình SQLite bên dưới và bổ sung mục triển khai PostgreSQL riêng; nguồn sự thật hành vi là [02 — Contract kỹ thuật](plans/02-contracts.md).
 
 ## Triển khai với Docker Compose (SQLite)
 
@@ -246,3 +246,65 @@ Exit code CLI:
 **Dashboard trả 404.** Kiểm tra `http.dashboard`; khi false, `/` và asset chủ động không khả dụng trong khi API vẫn chạy. Với debug build, thiếu `web/dist` trả trang hướng dẫn build; release build yêu cầu asset nhúng.
 
 Sau shutdown không sạch hoặc nghi lỗi storage, giữ một bản copy của toàn bộ data directory trước khi sửa, rồi dùng SQLite integrity check trên bản copy đã dừng (ví dụ `sqlite3 iot.db 'PRAGMA integrity_check;'`). Database khỏe trả `ok`.
+
+## PostgreSQL 18.6 với Docker Compose (local/single host)
+
+Biến thể `deploy/compose.postgres.yml` chạy app và `postgres:18.6-bookworm` với hai named volume độc lập. Chỉ HTTP/MQTT publish lên loopback host; port 5432 không publish. PostgreSQL healthcheck gating là một tiện ích khởi động, không thay thế retry bounded trong app. Image PostgreSQL 18 dùng volume mount `/var/lib/postgresql` (không dùng mount cũ `/var/lib/postgresql/data`).
+
+Tạo secret hex ngẫu nhiên và đặt tên DB. File password phải được giữ ngoài Git và chỉ operator đọc được:
+
+```sh
+cd deploy
+mkdir -p secrets
+umask 077
+openssl rand -hex 32 > secrets/postgres_password
+chmod 0600 secrets/postgres_password
+export IOT_POSTGRES_PASSWORD_FILE="$PWD/secrets/postgres_password"
+export IOT_DATABASE_NAME=iot
+```
+
+Bootstrap và start:
+
+```sh
+./compose-postgres.sh run --rm iot-server migrate --config /app/conf.toml
+openssl rand -base64 32 > secrets/admin_password
+chmod 0600 secrets/admin_password
+./compose-postgres.sh run --rm \
+  --volume "$PWD/secrets/admin_password:/run/secrets/admin_password:ro" \
+  iot-server admin create --username admin --config /app/conf.toml \
+  --password-file /run/secrets/admin_password
+./compose-postgres.sh up -d
+curl -fsS http://127.0.0.1:8080/readyz
+```
+
+`compose-postgres.sh` chỉ dành cho local/isolated Compose, đọc password từ file và tạo URL với `sslmode=disable` tường minh theo contract. Nó không ghi URL vào file, nhưng Docker lưu environment của app trong metadata; người có quyền Docker daemon/root vẫn có thể đọc biến môi trường. Dùng quyền daemon hạn chế và không dùng helper này cho production. DB remote phải cấu hình `sslmode=verify-full` với CA phù hợp; inject URL từ secret manager qua `IOT_DATABASE_URL`, không dùng URL mẫu local. Đổi `IOT_DATABASE_NAME` chỉ đổi database app sẽ kết nối; không copy hoặc chuyển dữ liệu giữa database tự động.
+
+### PostgreSQL backup
+
+Tạo backup nhất quán khi app đang chạy:
+
+```sh
+./backup-postgres.sh /path/to/backups/iot-postgres-2026-11-10
+```
+
+Script kiểm tra container PostgreSQL thuộc đúng Compose project hiện tại, dùng secret file trong container, tạo custom-format dump bằng `pg_dump`, ghi version/database và SHA-256 manifest vào staging directory mode `0700`, rồi publish atomic. Destination đã tồn tại thì bị từ chối; lỗi dump không publish backup dở. Không truyền URL/password qua argv hoặc log. Giữ dump, manifest và secret theo chính sách lưu trữ/khôi phục của operator; dump chứa toàn bộ dữ liệu nhạy cảm.
+
+### Restore vào database mới
+
+Restore không ghi đè database đang dùng:
+
+```sh
+cd /path/to/backups/iot-postgres-2026-11-10
+sha256sum -c SHA256SUMS
+cd /path/to/ThingsBoardRust/deploy
+export IOT_POSTGRES_PASSWORD_FILE="$PWD/secrets/postgres_password"
+./restore-postgres.sh /path/to/backups/iot-postgres-2026-11-10 iot_restore_20261110
+IOT_DATABASE_NAME=iot_restore_20261110 ./compose-postgres.sh up -d --force-recreate iot-server
+curl -fsS http://127.0.0.1:8080/readyz
+```
+
+Restore script chỉ nhận database mới chưa tồn tại, yêu cầu target PostgreSQL 18 và xác minh checksum trước `pg_restore`; database gốc không bị sửa. Sau khi app reconnect, verify admin login, devices/credentials qua API, telemetry history, command, audit và runtime revision. Giữ nguyên database/backup gốc tới khi drill được xác nhận. Nếu restore dở, không đổi `IOT_DATABASE_NAME` sang DB đó; điều tra/xóa chỉ database mới do drill sở hữu, không `down -v` volume.
+
+`docker compose down` giữ cả named volumes; `docker compose down -v` xóa DB và app runtime data, không dùng trong vận hành thường ngày. Healthcheck DB không tự restart container unhealthy. Runbook outage: kiểm tra `/readyz`, `docker compose ps`/logs, volume còn gắn, secrets và network; sau DB recovery app tự thử lại có backoff. Không giả định application ACK thành công cho transaction chưa commit. `sslmode=disable` chỉ phù hợp mạng Compose local cô lập, không phải cấu hình production.
+
+Local integration/restore drill có lệnh `sh tests/postgres_compose.sh`. Script tạo project, port, credential, secret và image tag riêng; seed qua CLI/API/MQTT, pg_dump vào staging, restore sang DB mới, down/up rồi kiểm tra API/MQTT/runtime. Nó xóa đúng project volumes và image tag do chính lượt chạy tạo. Không chạy trên Compose project/database khác với fixture test.

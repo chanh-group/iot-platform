@@ -1,0 +1,4 @@
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:${IOT_TEST_POSTGRES_PORT:?test port required}:5432"

@@ -71,11 +71,17 @@ Thêm PostgreSQL, sau đó MySQL, theo từng đợt độc lập; giữ SQLite 
 - [ ] Viết quy trình backup/restore theo engine và kiểm tra quyền, tính nhất quán, version, checksum và thất bại; restore vào DB/data dir mới, khởi động app và kiểm tra dữ liệu qua API/MQTT. Không ghi đè dữ liệu đang dùng; ghi artifact, lệnh và timestamp.
 - [ ] Tài liệu hóa cách triển khai, config, secret, health/readiness, backup, restore, rollback, giới hạn và troubleshooting; SQLite/WAL procedure không bị thay thế bằng hướng dẫn engine ngoài.
 
+**Implementation draft, gate chưa chạy (2026-11-11):** thêm `deploy/compose.postgres.yml`, local secret wrapper, config, `backup-postgres.sh`, `restore-postgres.sh`, operations docs và `tests/postgres_compose.sh`/`tests/postgres_compose.rs`. Kiểm tra tĩnh: `sh -n deploy/compose-postgres.sh deploy/backup-postgres.sh deploy/restore-postgres.sh tests/postgres_compose.sh tests/postgres_recovery.sh` PASS; `IOT_POSTGRES_PASSWORD_FILE=<temporary hex fixture> IOT_TEST_POSTGRES_PORT=54329 deploy/compose-postgres.sh --file tests/compose.postgres.test.yml config --quiet` PASS; `cargo test --test postgres_compose` 0 pass, 0 fail, 1 ignored (fixture test compiled, not executed). Compose image-build/recreate/pg_dump/restore smoke **chưa chạy tới kết quả**; thao tác thử dài bị hủy theo yêu cầu người dùng, không có container fixture còn lại. Vì chưa có dynamic evidence, các gate §4 vẫn unchecked.
+
+Sau khi thêm harness Compose: `cargo fmt --all --check`, Clippy `-D warnings`, `cargo test --all` PASS (292 passed, 0 failed, 6 ignored; PostgreSQL/Compose ignored tests chỉ compile). Đây không thay thế `sh tests/postgres_compose.sh` và không đóng gate.
+
 ## 5. Đo tải và giới hạn — P5-05, lặp cho từng backend
 
 - [ ] Chạy baseline riêng cho mỗi backend, ghi hardware/cgroup, version engine, cấu hình pool/DB, message size, QoS, số client, thời gian, publish request, PUBACK, application ACK/drop, commit, p95, RSS và disk growth; ghi rõ cửa sổ đo và drain.
 - [ ] Ghi cấu hình retry và kết quả/giới hạn đo; so sánh SQLite chỉ khi điều kiện tương đương. Không suy tốc độ commit từ tốc độ tạo request; không công bố throughput/SLO khi chưa có evidence phù hợp. Phase 4 baseline SQLite có application ACK drop cao, không dùng làm sizing production.
 - [ ] Ghi báo cáo và giới hạn vận hành/backend; nếu cần tối ưu, đo trước, giữ correctness và bounded resources, thêm test tương ứng.
+
+PostgreSQL load harness/report chưa có; không suy throughput từ SQLite baseline. Không đánh dấu P5-05 PASS.
 
 ## 6. Cân nhắc hạng mục sau MVP — P5-06
 

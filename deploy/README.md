@@ -15,3 +15,37 @@ Cả hai cổng được publish chỉ bind vào `127.0.0.1`. MQTT không mã h�
 Để dừng dịch vụ an toàn, chạy `docker compose -f deploy/compose.sqlite.yml down`.
 
 Quy trình backup/restore SQLite, kiểm tra checksum, WAL và dung lượng đĩa: [`docs/operations.md`](../docs/operations.md).
+
+## PostgreSQL 18.6 trên máy cục bộ
+
+Biến thể riêng dùng image `postgres:18.6-bookworm`, volume riêng cho PostgreSQL và volume app cho `runtime.toml`. Compose chờ healthcheck DB; app vẫn có retry bounded khi khởi động. Chỉ HTTP/MQTT publish lên loopback host, không publish port PostgreSQL.
+
+Tạo password hex ngẫu nhiên trong file riêng, không commit:
+
+```sh
+cd deploy
+mkdir -p secrets
+umask 077
+openssl rand -hex 32 > secrets/postgres_password
+chmod 0600 secrets/postgres_password
+export IOT_POSTGRES_PASSWORD_FILE="$PWD/secrets/postgres_password"
+export IOT_DATABASE_NAME=iot
+```
+
+Bootstrap và start:
+
+```sh
+./compose-postgres.sh run --rm iot-server migrate --config /app/conf.toml
+openssl rand -base64 32 > secrets/admin_password
+chmod 0600 secrets/admin_password
+./compose-postgres.sh run --rm \
+  --volume "$PWD/secrets/admin_password:/run/secrets/admin_password:ro" \
+  iot-server admin create --username admin --config /app/conf.toml \
+  --password-file /run/secrets/admin_password
+./compose-postgres.sh up -d
+curl -fsS http://127.0.0.1:8080/readyz
+```
+
+`compose-postgres.sh` đọc password từ file và tạo `IOT_DATABASE_URL` với `sslmode=disable` tường minh cho network local/isolated Compose. URL không lưu trong Compose hoặc image, nhưng Docker metadata của app vẫn chứa environment; chỉ operator được tin cậy mới được quyền Docker. Đây **không** phải production helper: DB remote phải dùng `sslmode=verify-full`, CA phù hợp và secret manager. `IOT_DATABASE_NAME` chọn DB app sẽ dùng; `IOT_POSTGRES_DATABASE` chọn DB ban đầu khi volume mới được tạo.
+
+`./compose-postgres.sh down` giữ named volumes. Không thêm `-v` trong vận hành thường ngày. PostgreSQL backup/restore: [`docs/operations.md`](../docs/operations.md#postgresql-186-với-docker-compose-local-single-host).
