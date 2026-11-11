@@ -400,15 +400,18 @@ impl Fixture {
         let now = iot_server::core::auth::now_ms();
         match &self.db {
             TestDb::Sqlite(pool) => {
-                sqlx::query("UPDATE sessions SET expires_at = ? WHERE token_hash = ?")
-                    .bind(now - 1)
-                    .bind(token_hash)
-                    .execute(pool)
-                    .await
-                    .unwrap();
+                sqlx::query(
+                    "UPDATE sessions SET created_at = ? - 1, expires_at = ? WHERE token_hash = ?",
+                )
+                .bind(now - 1)
+                .bind(now - 1)
+                .bind(token_hash)
+                .execute(pool)
+                .await
+                .unwrap();
             }
             TestDb::Postgres(pool) => {
-                sqlx::query("UPDATE sessions SET expires_at = $1 WHERE token_hash = $2")
+                sqlx::query("UPDATE sessions SET created_at = $1::bigint - 1, expires_at = $1 WHERE token_hash = $2")
                     .bind(now - 1)
                     .bind(token_hash)
                     .execute(pool)
