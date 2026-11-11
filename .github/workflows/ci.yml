@@ -41,9 +41,10 @@ jobs:
         env:
           RUST_BACKTRACE: "1"
         run: |
-          cargo fmt --all --check
-          cargo clippy --all-targets --all-features -- -D warnings
           cargo test --all
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo fmt --all --check
+          python3 tests/load/test_cgroup.py
           git diff --check
 
       - name: Release tests and build
@@ -65,6 +66,7 @@ jobs:
         run: |
           sh tests/postgres_recovery.sh
           sh tests/postgres_migration_failure.sh
+          sh tests/acl_postgres.sh
 
   frontend:
     runs-on: ubuntu-24.04

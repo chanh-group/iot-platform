@@ -90,6 +90,15 @@ IOT_COMPOSE_TEST_STAGE=seed cargo test --manifest-path "$repo_root/Cargo.toml" \
     --test postgres_compose -- --ignored --nocapture
 
 backup="$tmp_root/backup"
+if IOT_DATABASE_NAME=iot_missing "$repo_root/deploy/backup-postgres.sh" "$tmp_root/failed-backup"; then
+    echo "backup unexpectedly succeeded for a missing database" >&2
+    exit 1
+fi
+[ ! -e "$tmp_root/failed-backup" ]
+if find "$tmp_root" -maxdepth 1 -name 'failed-backup.tmp.*' -print -quit | grep -q .; then
+    echo "failed backup left a staging directory" >&2
+    exit 1
+fi
 "$repo_root/deploy/backup-postgres.sh" "$backup"
 (cd "$backup" && sha256sum -c SHA256SUMS)
 [ "$(stat -c %a "$backup")" = 700 ]
