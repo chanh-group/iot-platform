@@ -1087,6 +1087,7 @@ async fn run_a18_contracts(postgres_url: Option<String>) {
         .wait_for_log("retained attributes publish rejected")
         .await;
     assert_eq!(fixture.attribute_count(&device_e.id).await, 0);
+    assert_retained_rejections_do_not_use_broker_storage(&fixture, &device_e).await;
 
     let (a_client, mut a_eventloop, _) = mqtt_connect(
         fixture.mqtt_addr,
@@ -1618,6 +1619,63 @@ async fn assert_publish_denied(
     mqtt_publish(&client, topic, QoS::AtLeastOnce, retain, b"{}").await;
     mqtt_wait_closed(&mut eventloop, Duration::from_secs(3)).await;
     drop(client);
+}
+
+async fn assert_retained_rejections_do_not_use_broker_storage(fixture: &Fixture, device: &Device) {
+    let loaded = iot_server::config::load(&fixture.config).unwrap();
+    let storage = iot_server::storage::runtime::StorageRuntime::connect(&loaded)
+        .await
+        .unwrap();
+    let mut config = loaded.config.mqtt.clone();
+    config.listen = "127.0.0.1:0".parse().unwrap();
+    let mqtt = iot_server::mqtt::server::MqttServer::start(
+        &config,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        iot_server::mqtt::server::MqttRepositories {
+            devices: storage.repositories.devices.clone(),
+            commands: storage.repositories.commands.clone(),
+            attributes: storage.repositories.attributes.clone(),
+        },
+        Arc::new(iot_server::core::presence::Presence::new()),
+    )
+    .await
+    .unwrap();
+    let retained_before = mqtt.retained_count().await;
+    let (client, mut eventloop, _) = mqtt_connect(
+        mqtt.local_addr(),
+        &device.id,
+        &device.id,
+        &device.token,
+        true,
+    )
+    .await;
+
+    mqtt_publish(
+        &client,
+        &format!("devices/{}/telemetry", device.id),
+        QoS::AtLeastOnce,
+        true,
+        &telemetry_payload("retained-count-probe", 1.0),
+    )
+    .await;
+    mqtt_wait_puback(&mut eventloop, Duration::from_secs(5)).await;
+    assert_eq!(mqtt.retained_count().await, retained_before);
+
+    mqtt_publish(
+        &client,
+        &format!("devices/{}/attributes", device.id),
+        QoS::AtLeastOnce,
+        true,
+        br#"{"values":{"firmware":"retained-count-probe"}}"#,
+    )
+    .await;
+    mqtt_wait_closed(&mut eventloop, Duration::from_secs(3)).await;
+    assert_eq!(mqtt.retained_count().await, retained_before);
+
+    drop(client);
+    mqtt.abort();
+    drop(mqtt);
+    storage.close().await;
 }
 
 #[cfg(debug_assertions)]
