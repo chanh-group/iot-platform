@@ -72,6 +72,8 @@ Chạy lại `cargo test --test backend_a18 shared_a18_contracts_pass_on_sqlite 
 
 **Gate PostgreSQL:** mọi mục PostgreSQL ở §2, §4 và §5 phải pass; ma trận A18 đầy đủ và SQLite regression pass; test ignored thuộc gate đã chạy riêng; evidence/version/artifact và giới hạn đã được ghi. PostgreSQL chỉ được công bố hỗ trợ sau gate này; không lấy kết quả compile, connect hoặc migrate thay A18.
 
+**Rerun (2026-11-11T22:42+07:00):** `sh tests/postgres_recovery.sh` PASS: startup 1 passed/1 ignored, outage 1 passed, crash recovery 3 passed và shared PostgreSQL A18 1 passed; bao gồm fixture session expiry đã sửa. `cargo fmt --all --check`, Clippy `-D warnings` và `cargo test --all` PASS (các test ignored vẫn cần chạy riêng). `sh tests/postgres_compose.sh` FAIL: image build thành công, nhưng script thoát sau khi start PostgreSQL và trước migration; fixture đã cleanup, chưa xác định nguyên nhân. Không coi đây là evidence Compose/backup/restore PASS; load và phần A18 matrix còn thiếu vẫn mở.
+
 ## 3. Phạm vi đã thu hẹp
 
 P5-03 đã bỏ theo ADR-011; giữ số mục và ID còn lại để các tham chiếu, evidence hiện có không thay đổi.
