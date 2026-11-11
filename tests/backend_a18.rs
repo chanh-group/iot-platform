@@ -3,12 +3,13 @@ mod common;
 use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::Arc,
     time::Duration,
 };
 
 use common::{
     free_port, mqtt_connect, mqtt_connect_refused, mqtt_publish, mqtt_subscribe, mqtt_wait_closed,
-    mqtt_wait_puback, mqtt_wait_publish, mqtt_wait_telemetry_ack,
+    mqtt_wait_puback, mqtt_wait_publish, mqtt_wait_telemetry_ack, raw_publish_denied,
 };
 use futures_util::{SinkExt, StreamExt};
 use reqwest::StatusCode;
@@ -16,7 +17,11 @@ use rumqttc::{ConnectReturnCode, Event, Packet, QoS, SubscribeReasonCode};
 use serde_json::{Value, json};
 use sqlx::{PgPool, SqlitePool};
 use tempfile::TempDir;
-use tokio::{net::TcpStream, time::timeout};
+use tokio::{
+    net::TcpStream,
+    sync::{Notify, mpsc},
+    time::timeout,
+};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
     tungstenite::{Message, client::IntoClientRequest},
@@ -66,6 +71,20 @@ impl AppProcess {
         ))
     }
 
+    #[cfg(debug_assertions)]
+    fn spawn_paused(config: &Path, gate: &Path) -> Self {
+        Self(Some(
+            Command::new(env!("CARGO_BIN_EXE_iot-server"))
+                .args(["run", "--config"])
+                .arg(config)
+                .env("IOT_TEST_PAUSE_BEFORE_COMMIT", gate)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn paused server"),
+        ))
+    }
+
     fn try_wait(&mut self) -> Option<std::process::ExitStatus> {
         self.0.as_mut().unwrap().try_wait().unwrap()
     }
@@ -80,6 +99,22 @@ impl AppProcess {
         .unwrap();
         assert!(signal.success(), "send SIGTERM");
         tokio::task::spawn_blocking(move || child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[cfg(debug_assertions)]
+    async fn terminate_with_output(&mut self) -> std::process::Output {
+        let child = self.0.take().expect("server is running");
+        let pid = child.id().to_string();
+        let signal = tokio::task::spawn_blocking(move || {
+            Command::new("kill").args(["-TERM", &pid]).status().unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(signal.success(), "send SIGTERM");
+        tokio::task::spawn_blocking(move || child.wait_with_output())
             .await
             .unwrap()
             .unwrap()
@@ -115,7 +150,7 @@ impl Fixture {
             &config,
             format!(
                 "config_version = 1\n\
-                 [server]\ndata_dir = './data'\nshutdown_timeout_ms = 5000\n\
+                 [server]\ndata_dir = './data'\nshutdown_timeout_ms = 1000\n\
                  [http]\nlisten = '127.0.0.1:{http_port}'\n\
                  [mqtt]\nlisten = '127.0.0.1:{mqtt_port}'\n\
                  {database_config}\
@@ -201,6 +236,18 @@ impl Fixture {
 
     async fn start(&self) -> AppProcess {
         let mut server = AppProcess::spawn(&self.config);
+        self.wait_ready(&mut server).await;
+        server
+    }
+
+    #[cfg(debug_assertions)]
+    async fn start_paused(&self, gate: &Path) -> AppProcess {
+        let mut server = AppProcess::spawn_paused(&self.config, gate);
+        self.wait_ready(&mut server).await;
+        server
+    }
+
+    async fn wait_ready(&self, server: &mut AppProcess) {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(1))
             .build()
@@ -224,7 +271,6 @@ impl Fixture {
         })
         .await
         .expect("server reaches readiness");
-        server
     }
 
     async fn user_count(&self) -> i64 {
@@ -238,6 +284,258 @@ impl Fixture {
                 sqlx::query_scalar("SELECT COUNT(*) FROM users")
                     .fetch_one(pool)
                     .await
+            }
+        }
+        .unwrap()
+    }
+
+    async fn seed_cleanup_sessions(&self) -> (String, String, String) {
+        let user_id: String = match &self.db {
+            TestDb::Sqlite(pool) => {
+                sqlx::query_scalar("SELECT id FROM users LIMIT 1")
+                    .fetch_one(pool)
+                    .await
+            }
+            TestDb::Postgres(pool) => {
+                sqlx::query_scalar("SELECT id FROM users LIMIT 1")
+                    .fetch_one(pool)
+                    .await
+            }
+        }
+        .unwrap();
+        let now = iot_server::core::auth::now_ms();
+        let expired = Uuid::now_v7().to_string();
+        let revoked = Uuid::now_v7().to_string();
+        let live = Uuid::now_v7().to_string();
+        let expired_hash = iot_server::core::auth::hash_token(&expired);
+        let revoked_hash = iot_server::core::auth::hash_token(&revoked);
+        let live_hash = iot_server::core::auth::hash_token(&live);
+        match &self.db {
+            TestDb::Sqlite(pool) => {
+                sqlx::query(
+                    "INSERT INTO sessions
+                     (id, user_id, token_hash, created_at, last_seen_at, expires_at, revoked_at)
+                     VALUES (?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, NULL)",
+                )
+                .bind(&expired)
+                .bind(&user_id)
+                .bind(expired_hash.as_slice())
+                .bind(now - 1_000)
+                .bind(now - 1_000)
+                .bind(now - 1)
+                .bind(&revoked)
+                .bind(&user_id)
+                .bind(revoked_hash.as_slice())
+                .bind(now)
+                .bind(now)
+                .bind(now + 86_400_000)
+                .bind(now - 8 * 86_400_000)
+                .bind(&live)
+                .bind(&user_id)
+                .bind(live_hash.as_slice())
+                .bind(now)
+                .bind(now)
+                .bind(now + 86_400_000)
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+            TestDb::Postgres(pool) => {
+                sqlx::query(
+                    "INSERT INTO sessions
+                     (id, user_id, token_hash, created_at, last_seen_at, expires_at, revoked_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, NULL),
+                            ($7, $8, $9, $10, $11, $12, $13),
+                            ($14, $15, $16, $17, $18, $19, NULL)",
+                )
+                .bind(&expired)
+                .bind(&user_id)
+                .bind(expired_hash.as_slice())
+                .bind(now - 1_000)
+                .bind(now - 1_000)
+                .bind(now - 1)
+                .bind(&revoked)
+                .bind(&user_id)
+                .bind(revoked_hash.as_slice())
+                .bind(now)
+                .bind(now)
+                .bind(now + 86_400_000)
+                .bind(now - 8 * 86_400_000)
+                .bind(&live)
+                .bind(&user_id)
+                .bind(live_hash.as_slice())
+                .bind(now)
+                .bind(now)
+                .bind(now + 86_400_000)
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+        }
+        (expired, revoked, live)
+    }
+
+    async fn session_exists(&self, id: &str) -> bool {
+        match &self.db {
+            TestDb::Sqlite(pool) => {
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?)")
+                    .bind(id)
+                    .fetch_one(pool)
+                    .await
+            }
+            TestDb::Postgres(pool) => {
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE id = $1)")
+                    .bind(id)
+                    .fetch_one(pool)
+                    .await
+            }
+        }
+        .unwrap()
+    }
+
+    async fn expire_session_for_token(&self, token_hash: &[u8]) {
+        let now = iot_server::core::auth::now_ms();
+        match &self.db {
+            TestDb::Sqlite(pool) => {
+                sqlx::query("UPDATE sessions SET expires_at = ? WHERE token_hash = ?")
+                    .bind(now - 1)
+                    .bind(token_hash)
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            }
+            TestDb::Postgres(pool) => {
+                sqlx::query("UPDATE sessions SET expires_at = $1 WHERE token_hash = $2")
+                    .bind(now - 1)
+                    .bind(token_hash)
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    async fn wait_for_session_cleanup(&self, expired: &str, revoked: &str, live: &str) {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if !self.session_exists(expired).await
+                    && !self.session_exists(revoked).await
+                    && self.session_exists(live).await
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("scheduled session cleanup removes only expired and old-revoked sessions");
+    }
+
+    async fn set_command_expired(&self, command_id: &str, now: i64) {
+        match &self.db {
+            TestDb::Sqlite(pool) => {
+                sqlx::query("UPDATE commands SET expires_at = ?, next_attempt_at = ? WHERE id = ?")
+                    .bind(now - 1)
+                    .bind(now - 1)
+                    .bind(command_id)
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            }
+            TestDb::Postgres(pool) => {
+                sqlx::query(
+                    "UPDATE commands SET expires_at = $1, next_attempt_at = $2 WHERE id = $3",
+                )
+                .bind(now - 1)
+                .bind(now - 1)
+                .bind(command_id)
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+        }
+    }
+
+    async fn command_state(&self, command_id: &str) -> (String, i64, i64) {
+        match &self.db {
+            TestDb::Sqlite(pool) => {
+                sqlx::query_as(
+                    "SELECT status, attempts, next_attempt_at FROM commands WHERE id = ?",
+                )
+                .bind(command_id)
+                .fetch_one(pool)
+                .await
+            }
+            TestDb::Postgres(pool) => {
+                sqlx::query_as(
+                    "SELECT status, attempts, next_attempt_at FROM commands WHERE id = $1",
+                )
+                .bind(command_id)
+                .fetch_one(pool)
+                .await
+            }
+        }
+        .unwrap()
+    }
+
+    async fn command_late_ack_recorded(&self, command_id: &str) -> bool {
+        match &self.db {
+            TestDb::Sqlite(pool) => {
+                sqlx::query_scalar("SELECT late_ack_at IS NOT NULL FROM commands WHERE id = ?")
+                    .bind(command_id)
+                    .fetch_one(pool)
+                    .await
+            }
+            TestDb::Postgres(pool) => {
+                sqlx::query_scalar("SELECT late_ack_at IS NOT NULL FROM commands WHERE id = $1")
+                    .bind(command_id)
+                    .fetch_one(pool)
+                    .await
+            }
+        }
+        .unwrap()
+    }
+
+    async fn make_command_due(&self, command_id: &str, now: i64) {
+        match &self.db {
+            TestDb::Sqlite(pool) => {
+                sqlx::query("UPDATE commands SET next_attempt_at = ? WHERE id = ?")
+                    .bind(now - 1)
+                    .bind(command_id)
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            }
+            TestDb::Postgres(pool) => {
+                sqlx::query("UPDATE commands SET next_attempt_at = $1 WHERE id = $2")
+                    .bind(now - 1)
+                    .bind(command_id)
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    async fn telemetry_count(&self, device_id: &str, event_id: &str) -> i64 {
+        match &self.db {
+            TestDb::Sqlite(pool) => {
+                sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM telemetry_events WHERE device_id = ? AND event_id = ?",
+                )
+                .bind(device_id)
+                .bind(event_id)
+                .fetch_one(pool)
+                .await
+            }
+            TestDb::Postgres(pool) => {
+                sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM telemetry_events WHERE device_id = $1 AND event_id = $2",
+                )
+                .bind(device_id)
+                .bind(event_id)
+                .fetch_one(pool)
+                .await
             }
         }
         .unwrap()
@@ -405,9 +703,45 @@ struct Device {
     token: String,
 }
 
+struct FailedPublishChannel;
+
+#[async_trait::async_trait]
+impl iot_server::core::device_channel::DeviceChannel for FailedPublishChannel {
+    async fn publish(
+        &self,
+        _device_id: &str,
+        _topic: &str,
+        _payload: &[u8],
+    ) -> Result<(), iot_server::core::device_channel::DeviceChannelError> {
+        Err(iot_server::core::device_channel::DeviceChannelError::Unavailable)
+    }
+
+    async fn kick(
+        &self,
+        _device_id: &str,
+    ) -> Result<(), iot_server::core::device_channel::DeviceChannelError> {
+        Ok(())
+    }
+
+    async fn is_online(
+        &self,
+        _device_id: &str,
+    ) -> Result<bool, iot_server::core::device_channel::DeviceChannelError> {
+        Ok(true)
+    }
+}
+
 async fn run_a18_contracts(postgres_url: Option<String>) {
     let fixture = Fixture::new(postgres_url.as_deref()).await;
+    let cleanup_sessions = fixture.seed_cleanup_sessions().await;
     let mut server = fixture.start().await;
+    fixture
+        .wait_for_session_cleanup(
+            &cleanup_sessions.0,
+            &cleanup_sessions.1,
+            &cleanup_sessions.2,
+        )
+        .await;
     let http = reqwest::Client::builder()
         .cookie_store(true)
         .build()
@@ -439,6 +773,19 @@ async fn run_a18_contracts(postgres_url: Option<String>) {
     let device_a = create_device(&http, &fixture.base, "a18-device-a").await;
     let device_b = create_device(&http, &fixture.base, "a18-device-b").await;
     let device_c = create_device(&http, &fixture.base, "a18-device-c").await;
+    let device_e = create_device(&http, &fixture.base, "a18-device-e").await;
+    let disabled_device = create_device(&http, &fixture.base, "a18-disabled-device").await;
+    let disabled = http
+        .patch(format!(
+            "{}/api/v1/devices/{}",
+            fixture.base, disabled_device.id
+        ))
+        .header("X-IoT-CSRF", "1")
+        .json(&json!({"enabled":false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(disabled.status(), StatusCode::OK);
     let baseline: Value = http
         .get(telemetry_url(&fixture.base, &device_a.id))
         .query(&[("after_id", "0"), ("limit", "1")])
@@ -465,6 +812,17 @@ async fn run_a18_contracts(postgres_url: Option<String>) {
         )
         .await,
         ConnectReturnCode::BadUserNamePassword
+    );
+    assert_eq!(
+        mqtt_connect_refused(
+            fixture.mqtt_addr,
+            &disabled_device.id,
+            &disabled_device.id,
+            &disabled_device.token,
+        )
+        .await,
+        ConnectReturnCode::BadUserNamePassword,
+        "disabled-device credentials have the same refusal result"
     );
     let (b_client, mut b_eventloop, _) = mqtt_connect(
         fixture.mqtt_addr,
@@ -503,16 +861,47 @@ async fn run_a18_contracts(postgres_url: Option<String>) {
         true,
     )
     .await;
-    assert_eq!(
-        mqtt_subscribe(
-            &acl_client,
-            &mut acl_eventloop,
-            &format!("devices/{}/commands", device_b.id),
-            QoS::AtLeastOnce,
-        )
-        .await,
-        SubscribeReasonCode::Failure
-    );
+    for filter in [
+        format!("devices/{}/telemetry/ack", device_a.id),
+        format!("devices/{}/commands", device_a.id),
+        format!("devices/{}/status", device_a.id),
+        format!("devices/{}/data/#", device_a.id),
+        format!("devices/{}/data/sensors/+", device_a.id),
+        format!("devices/{}/commands", device_b.id),
+        format!("devices/{}/data/#", device_b.id),
+        "devices/+/telemetry".to_owned(),
+        "devices/#".to_owned(),
+        device_a.id.clone(),
+        format!("devices/{}/#", device_a.id),
+        format!("devices/{}/telemetry", device_a.id),
+        format!("devices/{}/attributes", device_a.id),
+        "$SYS/#".to_owned(),
+        format!("$share/group/devices/{}/data/#", device_a.id),
+    ] {
+        let expected = if filter == format!("devices/{}/data/#", device_a.id)
+            || filter == format!("devices/{}/data/sensors/+", device_a.id)
+            || filter == format!("devices/{}/commands", device_a.id)
+            || filter == format!("devices/{}/status", device_a.id)
+            || filter == format!("devices/{}/telemetry/ack", device_a.id)
+        {
+            SubscribeReasonCode::Success(QoS::AtLeastOnce)
+        } else {
+            SubscribeReasonCode::Failure
+        };
+        assert_eq!(
+            mqtt_subscribe(&acl_client, &mut acl_eventloop, &filter, QoS::AtLeastOnce).await,
+            expected,
+            "ACL filter {filter}"
+        );
+    }
+    for topic in [
+        format!("devices/{}/attributes", device_a.id),
+        format!("devices/{}/status", device_a.id),
+        format!("devices/{}/data/sensors/room", device_a.id),
+    ] {
+        mqtt_publish(&acl_client, &topic, QoS::AtLeastOnce, false, b"{}").await;
+        mqtt_wait_puback(&mut acl_eventloop, Duration::from_secs(5)).await;
+    }
     mqtt_publish(
         &acl_client,
         &format!("devices/{}/data/attack", device_b.id),
@@ -536,6 +925,38 @@ async fn run_a18_contracts(postgres_url: Option<String>) {
         .is_err()
     );
     drop(acl_client);
+    for topic in [
+        format!("devices/{}/telemetry/ack", device_a.id),
+        format!("devices/{}/commands", device_a.id),
+        "$SYS/brokers".to_owned(),
+        format!("$share/group/devices/{}/data/x", device_a.id),
+    ] {
+        assert_publish_denied(fixture.mqtt_addr, &device_a, &topic, false).await;
+    }
+    for topic in [
+        format!("devices/{}/data/+", device_a.id),
+        format!("devices/{}/telemetry/#", device_a.id),
+    ] {
+        assert!(
+            raw_publish_denied(
+                fixture.mqtt_addr,
+                &device_a.id,
+                &device_a.id,
+                &device_a.token,
+                &topic,
+                false,
+            )
+            .await,
+            "wildcard publish must be rejected: {topic}"
+        );
+    }
+    assert_publish_denied(
+        fixture.mqtt_addr,
+        &device_a,
+        &format!("devices/{}/commands", device_a.id),
+        true,
+    )
+    .await;
 
     let (a_client, mut a_eventloop, _) = mqtt_connect(
         fixture.mqtt_addr,
@@ -686,6 +1107,90 @@ async fn run_a18_contracts(postgres_url: Option<String>) {
             .count(),
         1
     );
+    let race_response = if statuses[0] == StatusCode::ACCEPTED {
+        race_a
+    } else {
+        race_b
+    };
+    let race_command: Value = race_response.json().await.unwrap();
+    let race_command_id = race_command["command_id"].as_str().unwrap().to_owned();
+    mqtt_publish(
+        &b_client,
+        &format!("devices/{}/commands/ack", device_b.id),
+        QoS::AtLeastOnce,
+        false,
+        json!({
+            "command_id": race_command_id.clone(),
+            "status": "succeeded",
+            "result": {"wrong_device": true}
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .await;
+    mqtt_wait_puback(&mut b_eventloop, Duration::from_secs(5)).await;
+    assert_eq!(fixture.command_state(&race_command_id).await.0, "pending");
+
+    fixture
+        .set_command_expired(&race_command_id, iot_server::core::auth::now_ms())
+        .await;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if fixture.command_state(&race_command_id).await.0 == "expired" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("command dispatcher expires a due command");
+    let (c_client, mut c_eventloop, _) = mqtt_connect(
+        fixture.mqtt_addr,
+        &device_c.id,
+        &device_c.id,
+        &device_c.token,
+        true,
+    )
+    .await;
+    mqtt_publish(
+        &c_client,
+        &format!("devices/{}/commands/ack", device_c.id),
+        QoS::AtLeastOnce,
+        false,
+        json!({
+            "command_id": race_command_id,
+            "status": "succeeded",
+            "result": {"late": true}
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .await;
+    mqtt_wait_puback(&mut c_eventloop, Duration::from_secs(5)).await;
+    timeout(Duration::from_secs(5), async {
+        while !fixture.command_late_ack_recorded(&race_command_id).await {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("late ACK is recorded without reopening an expired command");
+    assert_eq!(fixture.command_state(&race_command_id).await.0, "expired");
+    drop(c_client);
+
+    let failed_dispatch = post_command(
+        &http,
+        &fixture.base,
+        &device_e.id,
+        &json!({
+            "name":"dispatcher-retry",
+            "idempotency_key":format!("dispatcher-retry-{}", Uuid::now_v7())
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(failed_dispatch.status(), StatusCode::ACCEPTED);
+    let failed_dispatch: Value = failed_dispatch.json().await.unwrap();
+    let failed_dispatch_id = failed_dispatch["command_id"].as_str().unwrap().to_owned();
     assert_eq!(
         statuses
             .iter()
@@ -836,7 +1341,87 @@ async fn run_a18_contracts(postgres_url: Option<String>) {
         .await
         .unwrap();
     assert_eq!(command_after_restart["status"], "succeeded");
+
+    let expired_client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let expired_login = expired_client
+        .post(format!("{}/api/v1/auth/login", fixture.base))
+        .header("X-IoT-CSRF", "1")
+        .json(&json!({"username":"admin","password":ADMIN_PASSWORD}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(expired_login.status(), StatusCode::OK);
+    let cookie = expired_login.headers()[reqwest::header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap();
+    let token = cookie.split_once('=').unwrap().1;
+    let token_hash = iot_server::core::auth::hash_token(token);
+    fixture.expire_session_for_token(&token_hash).await;
+    assert_eq!(
+        expired_client
+            .get(format!("{}/api/v1/auth/me", fixture.base))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        http.post(format!("{}/api/v1/auth/logout", fixture.base))
+            .header("X-IoT-CSRF", "1")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        http.get(format!("{}/api/v1/auth/me", fixture.base))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
     assert!(restarted.terminate().await.success());
+
+    fixture
+        .make_command_due(&failed_dispatch_id, iot_server::core::auth::now_ms())
+        .await;
+    let loaded = iot_server::config::load(&fixture.config).unwrap();
+    let storage = iot_server::storage::runtime::StorageRuntime::connect(&loaded)
+        .await
+        .unwrap();
+    let (wake_tx, wake_rx) = mpsc::channel(1);
+    drop(wake_tx);
+    let dispatcher = iot_server::core::command::CommandDispatcher::new(
+        storage.repositories.commands.clone(),
+        Arc::new(FailedPublishChannel),
+        loaded.config.commands.clone(),
+        iot_server::core::command::PendingCommandAcks::default(),
+        iot_server::core::command::CommandWakeReceiver::new(wake_rx, Arc::new(Notify::new())),
+    );
+    let before = fixture.command_state(&failed_dispatch_id).await;
+    let dispatch_now = iot_server::core::auth::now_ms();
+    dispatcher.run_once(dispatch_now).await.unwrap();
+    let after = fixture.command_state(&failed_dispatch_id).await;
+    assert_eq!(
+        after.0, "pending",
+        "failed publish does not complete a command"
+    );
+    assert_eq!(after.1, before.1 + 1, "failed publish records one attempt");
+    assert!(after.2 > dispatch_now, "failed publish schedules a retry");
+    storage.close().await;
+
+    #[cfg(debug_assertions)]
+    shutdown_deadline_does_not_ack_uncommitted_postgres_or_sqlite_work(&fixture, &device_b).await;
 }
 
 async fn create_device(client: &reqwest::Client, base: &str, name: &str) -> Device {
@@ -882,6 +1467,99 @@ fn telemetry_payload(event_id: &str, temperature: f64) -> Vec<u8> {
         "values":{"temperature":temperature}
     }))
     .unwrap()
+}
+
+async fn assert_publish_denied(
+    mqtt_addr: std::net::SocketAddr,
+    device: &Device,
+    topic: &str,
+    retain: bool,
+) {
+    let (client, mut eventloop, _) =
+        mqtt_connect(mqtt_addr, &device.id, &device.id, &device.token, true).await;
+    mqtt_publish(&client, topic, QoS::AtLeastOnce, retain, b"{}").await;
+    mqtt_wait_closed(&mut eventloop, Duration::from_secs(3)).await;
+    drop(client);
+}
+
+#[cfg(debug_assertions)]
+fn paused_path(gate: &Path) -> PathBuf {
+    let mut name = gate.as_os_str().to_owned();
+    name.push(".paused");
+    PathBuf::from(name)
+}
+
+#[cfg(debug_assertions)]
+async fn wait_for_pause(gate: &Path) {
+    timeout(Duration::from_secs(5), async {
+        while !paused_path(gate).exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("telemetry writer reaches the pre-commit hook");
+}
+
+#[cfg(debug_assertions)]
+async fn shutdown_deadline_does_not_ack_uncommitted_postgres_or_sqlite_work(
+    fixture: &Fixture,
+    device: &Device,
+) {
+    let gate = fixture._dir.path().join("a18-before-commit-deadline");
+    std::fs::write(&gate, b"hold").unwrap();
+    let mut server = fixture.start_paused(&gate).await;
+    let (client, mut eventloop, _) = mqtt_connect(
+        fixture.mqtt_addr,
+        &device.id,
+        &device.id,
+        &device.token,
+        true,
+    )
+    .await;
+    let ack_topic = format!("devices/{}/telemetry/ack", device.id);
+    assert!(matches!(
+        mqtt_subscribe(&client, &mut eventloop, &ack_topic, QoS::AtLeastOnce).await,
+        SubscribeReasonCode::Success(_)
+    ));
+    let event_id = format!("a18-shutdown-{}", Uuid::now_v7());
+    mqtt_publish(
+        &client,
+        &format!("devices/{}/telemetry", device.id),
+        QoS::AtLeastOnce,
+        false,
+        &telemetry_payload(&event_id, 23.0),
+    )
+    .await;
+    mqtt_wait_puback(&mut eventloop, Duration::from_secs(5)).await;
+    wait_for_pause(&gate).await;
+    assert!(
+        timeout(
+            Duration::from_millis(100),
+            mqtt_wait_telemetry_ack(&mut eventloop, &ack_topic, Duration::from_secs(5)),
+        )
+        .await
+        .is_err(),
+        "uncommitted work must not produce an application ACK"
+    );
+
+    let output = timeout(Duration::from_secs(10), server.terminate_with_output())
+        .await
+        .expect("server exits when the shutdown deadline is exceeded");
+    assert!(
+        !output.status.success(),
+        "shutdown deadline must fail the process"
+    );
+    let logs = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        logs.contains("telemetry worker did not drain before shutdown deadline"),
+        "missing shutdown deadline evidence: {logs}"
+    );
+    assert_eq!(fixture.telemetry_count(&device.id, &event_id).await, 0);
+    drop(client);
 }
 
 type TestWs = WebSocketStream<MaybeTlsStream<TcpStream>>;

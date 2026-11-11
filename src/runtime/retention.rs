@@ -100,8 +100,45 @@ async fn run_session_cleanup_once(
 mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
     use tempfile::TempDir;
+    use tokio::sync::Notify;
 
     use super::*;
+
+    struct BlockingSessionCleanup {
+        started: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionCleanupRepository for BlockingSessionCleanup {
+        async fn delete_expired_sessions(&self, _now: i64) -> anyhow::Result<u64> {
+            self.started.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn session_cleanup_cancellation_interrupts_a_blocked_batch() {
+        let repository = Arc::new(BlockingSessionCleanup {
+            started: Notify::new(),
+        });
+        let cancel = CancellationToken::new();
+        let cleanup = tokio::spawn({
+            let repository = Arc::clone(&repository);
+            let cancel = cancel.clone();
+            async move { run_session_cleanup_once(repository.as_ref(), 0, &cancel).await }
+        });
+
+        repository.started.notified().await;
+        cancel.cancel();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), cleanup)
+                .await
+                .expect("cleanup observes cancellation")
+                .unwrap()
+                .unwrap(),
+            0
+        );
+    }
 
     #[tokio::test]
     async fn next_retention_sweep_uses_the_updated_retention_days() {
