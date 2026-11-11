@@ -1145,7 +1145,7 @@ format = "json"
 - `data_dir`: tạo khi `run`/`migrate`/`admin create`; `check` không tạo.
 - SQLite path: bỏ prefix `sqlite://`, resolve theo base; phải nằm trong `data_dir`; không query string, không `:memory:`. File được tạo nếu thiếu (`create_if_missing`).
 - `runtime.settings_path` phải nằm trong `data_dir` sau resolve; parent được tạo khi `run`/PATCH.
-- `database.url_env` khi resolve vẫn phải là SQLite trong MVP; `postgres`/`mysql` → `unsupported_database` (Phase 5).
+- Trong MVP, `database.url_env` khi resolve phải là SQLite; PostgreSQL được bổ sung ở Phase 5 theo §3.7. Scheme khác không được hỗ trợ.
 - `http.listen != mqtt.listen`.
 - `telemetry.batch_size <= telemetry.queue_capacity`; `default_ttl_ms <= max_ttl_ms`; `retry_initial_ms <= retry_max_ms`; `max_payload_bytes <= max_packet_bytes`.
 - `mqtt.max_client_id_len >= 36`.

@@ -1,8 +1,8 @@
-# TODO — Phase 5: PostgreSQL và MySQL sau MVP
+# TODO — Phase 5: PostgreSQL sau MVP
 
 ## Mục tiêu và nguồn sự thật
 
-Thêm PostgreSQL, sau đó MySQL, theo từng đợt độc lập; giữ SQLite là mặc định. Chỉ công bố hỗ trợ một backend khi backend đó đạt A18: cùng bộ integration test, migration, backup/restore và crash recovery như SQLite. Không coi việc kết nối hoặc migration thành công là A18 PASS.
+Thêm PostgreSQL; giữ SQLite là mặc định. Chỉ công bố hỗ trợ PostgreSQL khi đạt A18: cùng bộ integration test, migration, backup/restore và crash recovery như SQLite. Không coi việc kết nối hoặc migration thành công là A18 PASS. Các backend SQL khác ngoài phạm vi theo ADR-011.
 
 - `docs/SPEC.md` §8, §11, §13 A18 và §14: semantics storage, vận hành và thứ tự backend.
 - `docs/plans/01-stack-and-architecture.md` ADR-003, stack/version và hướng phụ thuộc.
@@ -21,7 +21,7 @@ Thêm PostgreSQL, sau đó MySQL, theo từng đợt độc lập; giữ SQLite 
 
   **Gate release Phase 5 đã mở; P5-01 hoàn tất** (inventory, port boundary, A18 matrix, committed-prefix contract và SQLite interleaving test trong [audit report](../reports/p5-01-storage-audit-2026-11-09.md)). P5-02 đang triển khai trên `feat/phas5/storage-audit-ci`: ADR-010 chốt PostgreSQL 18.6 / SQLx 0.9.0, cập nhật contract; domain ports, cleanup scheduler, PostgreSQL code và A18 vẫn chưa được đánh dấu PASS.
 - [ ] Đọc lại contract trước mỗi task; nếu cần bật SQLx feature cho backend, chọn version engine/image hoặc đổi kiến trúc/config/TLS, ghi quyết định và lý do trong `01` trước khi triển khai. Không tự nâng version/dependency.
-- [ ] PostgreSQL hoàn tất và qua gate riêng trước đợt MySQL. SQLite vẫn chạy độc lập, không cần database server ngoài, không regression.
+- [ ] PostgreSQL hoàn tất và qua gate riêng. SQLite vẫn chạy độc lập, không cần database server ngoài, không regression.
 - [ ] Giữ queue hữu hạn, timeout/pool hữu hạn, transaction rõ ràng, redaction và nguyên tắc ACK sau commit. Không tự chuyển dữ liệu giữa engine khi đổi URL; export/import là hạng mục riêng.
 - [ ] Mỗi task có test hoặc evidence chạy lại được; test dùng DB/data dir riêng, port tự do và cleanup fixture của chính test. Không dùng production DB hoặc secret thật làm fixture.
 
@@ -32,7 +32,7 @@ Thêm PostgreSQL, sau đó MySQL, theo từng đợt độc lập; giữ SQLite 
 - [x] Chốt port/domain boundaries tối thiểu cho audit này; giữ core không import SQLx/adapter, không generic ORM, và đặt audit nguyên tử bên trong operation/repository sở hữu transaction.
 - [x] Sửa `02` để định nghĩa committed-prefix checkpoint độc lập engine và thêm test SQLite cho duplicate/conflict allocator gaps cùng writer interleaving vào `tests/telemetry_api.rs`. Mỗi backend tương lai vẫn phải có interleaving test riêng với T1/T2, rollback và full backfill trước A18; không dùng sequence/identity/auto-increment đơn lẻ làm bằng chứng.
 - [x] Đối chiếu semantics hiện tại về số/UTC ms, JSON, collation, uniqueness/FK, rollback, pagination, isolation và retention. Audit report ghi rõ contract cố định lẫn lựa chọn engine-specific còn mở; các lựa chọn mở là gate trước code P5-02. Không sửa migration SQLite đã áp dụng.
-- [x] Tạo A18 suite matrix chung trong audit report: scenario, fixture/suite, lệnh, SQLite evidence và ô version/result cần điền độc lập cho PostgreSQL/MySQL. Khác biệt setup/fault injection phải được ghi lại, không bỏ scenario.
+- [x] Tạo A18 suite matrix chung trong audit report: scenario, fixture/suite, lệnh, SQLite evidence và ô version/result cho PostgreSQL. Khác biệt setup/fault injection phải được ghi lại, không bỏ scenario.
 
 ## 2. PostgreSQL — P5-02
 
@@ -55,16 +55,13 @@ Thêm PostgreSQL, sau đó MySQL, theo từng đợt độc lập; giữ SQLite 
 
 **Rust/security rerun sau nhóm A18 (2026-11-10T15:50+07:00):** `cargo fmt --all --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all`, `cargo deny check`, `cargo audit` pass. `cargo test --all`: 292 passed, 0 failed, 5 ignored (Docker recreate, manual load, và 3 PostgreSQL tests được chạy riêng); `cargo deny check` có duplicate-version warnings hiện hành; `cargo audit` có 2 allowed unmaintained warnings (`atomic-polyfill`, `instant`), không có vulnerability.
 
-**Gate PostgreSQL trước MySQL:** chỉ bắt đầu §3 khi mọi mục PostgreSQL ở §2, §4 và §5 đã pass; ma trận A18 đầy đủ và SQLite regression pass; test ignored thuộc gate đã chạy riêng; evidence/version/artifact và giới hạn đã được ghi. PostgreSQL chỉ được công bố hỗ trợ độc lập sau gate này; không lấy kết quả compile, connect hoặc migrate thay A18.
+**Gate PostgreSQL:** mọi mục PostgreSQL ở §2, §4 và §5 phải pass; ma trận A18 đầy đủ và SQLite regression pass; test ignored thuộc gate đã chạy riêng; evidence/version/artifact và giới hạn đã được ghi. PostgreSQL chỉ được công bố hỗ trợ sau gate này; không lấy kết quả compile, connect hoặc migrate thay A18.
 
-## 3. MySQL — P5-03
+## 3. Phạm vi đã thu hẹp
 
-- [ ] Chỉ bắt đầu sau **Gate PostgreSQL trước MySQL** ở §2; chốt version/feature/config/migration trong `01`/`02` trước code, không giả định SQL hoặc isolation giống PostgreSQL/SQLite.
-- [ ] Implement pool, migration và repository theo cùng contract; kiểm tra JSON, collation, unique/FK, transaction/isolation, cursor và ACK sau commit bằng test thực tế. Không dùng thay đổi backend này để làm hỏng SQLite/PostgreSQL.
-- [ ] Chạy cùng ma trận A18 §1 và các trường hợp migration, crash/recovery, fault, security, command và telemetry như PostgreSQL; ghi evidence và mọi khác biệt fixture/fault injection.
-- [ ] Hoàn tất Compose/backup/restore §4 và baseline §5 cho MySQL. Chỉ công bố hỗ trợ khi toàn bộ gate riêng pass; kết quả PostgreSQL không thay thế evidence MySQL.
+P5-03 đã bỏ theo ADR-011; giữ số mục và ID còn lại để các tham chiếu, evidence hiện có không thay đổi.
 
-## 4. Compose và backup/restore — P5-04, lặp cho từng backend
+## 4. Compose và backup/restore PostgreSQL — P5-04
 
 - [ ] Thêm biến thể Compose riêng theo backend: database server ngoài có volume, healthcheck, cấu hình/secret phù hợp; app retry kết nối có giới hạn, không chỉ dựa vào thứ tự startup. Không nhúng password cố định trong image/repo hoặc log URL đầy đủ.
 - [ ] Smoke trên môi trường cô lập: migrate, bootstrap admin, MQTT→commit→ACK→REST, recreate app/database với volume và xác nhận device, credential, telemetry, command và runtime revision còn đúng.
@@ -75,7 +72,7 @@ Thêm PostgreSQL, sau đó MySQL, theo từng đợt độc lập; giữ SQLite 
 
 Sau khi thêm harness Compose: `cargo fmt --all --check`, Clippy `-D warnings`, `cargo test --all` PASS (292 passed, 0 failed, 6 ignored; PostgreSQL/Compose ignored tests chỉ compile). Đây không thay thế `sh tests/postgres_compose.sh` và không đóng gate.
 
-## 5. Đo tải và giới hạn — P5-05, lặp cho từng backend
+## 5. Đo tải và giới hạn PostgreSQL — P5-05
 
 - [ ] Chạy baseline riêng cho mỗi backend, ghi hardware/cgroup, version engine, cấu hình pool/DB, message size, QoS, số client, thời gian, publish request, PUBACK, application ACK/drop, commit, p95, RSS và disk growth; ghi rõ cửa sổ đo và drain.
 - [ ] Ghi cấu hình retry và kết quả/giới hạn đo; so sánh SQLite chỉ khi điều kiện tương đương. Không suy tốc độ commit từ tốc độ tạo request; không công bố throughput/SLO khi chưa có evidence phù hợp. Phase 4 baseline SQLite có application ACK drop cao, không dùng làm sizing production.
@@ -90,10 +87,10 @@ PostgreSQL load harness/report chưa có; không suy throughput từ SQLite base
 
 ## 7. Gate cuối và hồ sơ
 
-- [ ] A18 PostgreSQL PASS và A18 MySQL PASS độc lập theo ma trận §1; nếu một backend chưa pass thì không công bố hỗ trợ backend đó. SQLite regression, protocol/security, shutdown và các gate liên quan vẫn pass.
+- [ ] A18 PostgreSQL PASS theo ma trận §1; không công bố hỗ trợ PostgreSQL khi chưa pass. SQLite regression, protocol/security, shutdown và các gate liên quan vẫn pass.
 - [ ] Fmt, Clippy, `cargo test --all`, integration/crash/backup/restore và Docker Compose cho từng backend pass; ghi lệnh, timestamp, phiên bản và số test pass/ignored. Test ignored phải có evidence chạy riêng; không tick từ test chỉ compile.
 - [ ] Mỗi backend có báo cáo load, quy trình vận hành/restore được kiểm thử, migration/rollback note và tài liệu support rõ version/giới hạn. Không đưa credential, DB URL, payload nhạy cảm hoặc artifact tạm vào Git.
 - [ ] Cập nhật checklist release và CI cho backend đã hỗ trợ; lưu SBOM/scan/signature/provenance theo release checklist. Tạo tag/push/publish chỉ khi được yêu cầu và mọi release gate trên đúng commit đã pass.
 - [ ] Ghi hồ sơ: commit, engine/image version, timestamp, kết quả A18 từng backend, danh sách test/artifact, backup/restore, load và các giới hạn/rủi ro còn lại. Commit theo nhóm task, mỗi commit build/test được.
 
-**Phase 5 PASS** khi cả PostgreSQL và MySQL đạt A18 riêng, regression SQLite pass và các gate vận hành/tài liệu/evidence trên hoàn tất. Trạng thái hỗ trợ từng backend được công bố độc lập, không suy từ kết quả backend còn lại.
+**Phase 5 PASS** khi PostgreSQL đạt A18, regression SQLite pass và các gate vận hành/tài liệu/evidence trên hoàn tất.

@@ -22,7 +22,7 @@
 | 2 | MQTT auth/ACL, telemetry, ACK, history | A03, A05–A07, A19 (matrix MVP) |
 | 3 | Device admin, command, runtime config, dashboard | A10–A15 |
 | 4 | Tin cậy, bảo mật, shutdown, Docker, backup | A01, A04, A08, A09, A16, A17 |
-| 5 | PostgreSQL/MySQL (sau MVP) | A18 cho từng backend |
+| 5 | PostgreSQL (sau MVP) | A18 PostgreSQL và SQLite regression |
 
 Thứ tự phụ thuộc:
 
@@ -186,12 +186,11 @@ Không bắt đầu trước khi Phase 4 release. Mỗi backend là một đợt
 | --- | --- | --- |
 | P5-01 | Audit storage/contract; inventory SQLite leaks, chốt port boundaries và A18 matrix | Phase 4 release |
 | P5-02 | Wire domain ports, bỏ SQLite-specific leak; sau đó PostgreSQL migrations + repository + pool; A18 | P5-01 audit pass + ADR backend/version; SQLite regression |
-| P5-03 | MySQL migrations + repository + pool; A18 | A18 pass |
-| P5-04 | Compose PostgreSQL/MySQL + healthcheck + backup/restore docs | từng backend |
-| P5-05 | Load test lại trên từng backend; công bố giới hạn | có số đo |
+| P5-04 | Compose PostgreSQL + healthcheck + backup/restore docs | PostgreSQL |
+| P5-05 | Load test PostgreSQL; công bố giới hạn | có số đo |
 | P5-06 | Cân nhắc TLS MQTT tích hợp, MQTT 5, cross-device ACL | backlog §2.2 |
 
-P5-01 chỉ là audit/contract, chưa refactor production. P5-02 phải wire các port vào HTTP/MQTT/runtime và giữ SQLite chạy qua cùng ports trước hoặc cùng lúc thêm PostgreSQL; không mở rộng engine-specific repository trước khi các SQLite leak và contract gaps trong P5-01 report được xử lý/test. MySQL vẫn chờ gate PostgreSQL riêng.
+P5-01 chỉ là audit/contract, chưa refactor production. P5-02 phải wire các port vào HTTP/MQTT/runtime và giữ SQLite chạy qua cùng ports trước hoặc cùng lúc thêm PostgreSQL; không mở rộng engine-specific repository trước khi các SQLite leak và contract gaps trong P5-01 report được xử lý/test. Theo ADR-011, P5-03 đã bỏ khỏi phạm vi; giữ nguyên các ID còn lại để không làm sai tham chiếu và evidence.
 
 Quy tắc A18: cùng bộ integration test, migration, backup/restore, crash recovery như SQLite; không công bố hỗ trợ khi chưa pass.
 
@@ -260,7 +259,7 @@ GitHub Actions (hoặc CI tương đương), các job song song khi có thể:
 | `release` | Tag: build release; tạo SBOM; ký image + provenance/checksum; publish image và lưu artifact |
 
 - Cache Cargo registry/target và Bun; cache key theo lockfile.
-- Không cần service Postgres/MySQL ở MVP.
+- Không cần service PostgreSQL ở MVP.
 - Build order: frontend trước `cargo build --release` vì `rust-embed`.
 - Artifact: binary Linux x86_64 + image; không commit `web/dist`.
 - CI chạy trên mọi nhánh khi push và trên PR vào `master`: fmt, Clippy, Rust test, frontend typecheck/test và audit. Chỉ push `master` chạy build frontend/release/Docker, release test và browser test tích hợp backend (test này tự gọi `cargo build`); Rust test và Clippy vẫn biên dịch mã. Tag chỉ sau khi nhánh mặc định xanh.
@@ -290,7 +289,7 @@ GitHub Actions (hoặc CI tương đương), các job song song khi có thể:
 - SQLite: dừng app (SIGTERM, chờ exit) rồi copy `iot.db` + `-wal`/`-shm`, hoặc dùng SQLite backup API/`VACUUM INTO` khi app dừng.
 - Không copy riêng `.db` khi đang WAL và coi là đủ.
 - Test restore trước release: restore vào data dir mới, chạy `run`, kiểm tra device/telemetry/runtime revision.
-- PostgreSQL/MySQL: quy trình engine, Phase 5.
+- PostgreSQL: quy trình engine, Phase 5.
 
 ## 12. Definition of Done (MVP)
 

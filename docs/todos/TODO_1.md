@@ -171,7 +171,7 @@ Nếu gate fail: không sang Phase 2; ghi lỗi vào `docs/todos/TODO_1.md` và 
 - Device CRUD, credential rotate, command, runtime PATCH, audit đầy đủ (Phase 3).
 - Svelte dashboard, uPlot, WebSocket (Phase 3).
 - Docker, backup, load test, security suite (Phase 4).
-- PostgreSQL/MySQL (Phase 5).
+- PostgreSQL (Phase 5).
 
 > Đây là kế hoạch Phase 1 ban đầu; framework dashboard hiện tại được đổi theo ADR-007 trong `docs/plans/01-stack-and-architecture.md`.
 

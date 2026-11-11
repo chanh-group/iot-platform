@@ -34,7 +34,7 @@ Nguồn sự thật:
 - [ ] Đọc lại contract liên quan trước mỗi task; cập nhật `02` trước khi đổi hành vi; thêm ADR trong `01` nếu đổi version/image/TLS/backup strategy.
 - [ ] Không thêm dependency ngoài `01` nếu chưa ghi ADR và lý do.
 - [ ] Mọi test crash/kill dùng binary thật + hook `cfg(debug_assertions)` — không bật trong `--release`.
-- [ ] Không làm PostgreSQL/MySQL (Phase 5). Không thêm cluster/HA/multi-tenancy.
+- [ ] Không làm PostgreSQL (Phase 5). Không thêm cluster/HA/multi-tenancy.
 
 ## 1. Rà soát bounded resources — P4-01
 
@@ -243,7 +243,7 @@ Evidence 2026-11-07 khoảng 13:13 +07:00: fmt, Clippy và `cargo test --all` PA
 
 ## 15. Không làm trong Phase 4
 
-- PostgreSQL/MySQL (Phase 5).
+- PostgreSQL (Phase 5).
 - MQTT 5, topic alias, `$share`, MQTT over WebSocket.
 - TLS MQTT listener tích hợp (nếu chưa có ADR; TCP proxy là đủ cho MVP với tài liệu).
 - Rule engine, dynamic plugin, export data, read-only account.

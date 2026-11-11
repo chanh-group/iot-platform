@@ -205,7 +205,7 @@ Section 11 review evidence (current working tree): rà `src/core/device.rs`, `sr
 ## 12. Không làm trong Phase 3
 
 - Crash kill -9/disk-full gate tổng thể, graceful MQTT kick-all/drain/shutdown gate, Docker/Compose/backup/restore/load benchmark, alert/SBOM/scan/signature/release: Phase 4.
-- PostgreSQL/MySQL, MQTT 5, integrated TLS, cross-device ACL, clustering/HA/multi-tenancy, OTA/rule engine: ngoài Phase 3/MVP theo plans.
+- PostgreSQL, MQTT 5, integrated TLS, cross-device ACL, clustering/HA/multi-tenancy, OTA/rule engine: ngoài Phase 3/MVP theo plans.
 - UI framework/router/SSR, dashboard builder, aggregation/downsampling, latest projection/cache, command cancellation/DELETE device/API audit mới: không có trong contract MVP.
 - Không coi broker session/retained hoặc WebSocket là storage bền vững; không quảng bá exactly-once hay throughput chưa benchmark.
 
