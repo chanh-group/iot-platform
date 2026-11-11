@@ -19,7 +19,7 @@ use sqlx::{PgPool, SqlitePool};
 use tempfile::TempDir;
 use tokio::{
     net::TcpStream,
-    sync::{Notify, mpsc},
+    sync::{Notify, mpsc, oneshot},
     time::timeout,
 };
 use tokio_tungstenite::{
@@ -60,12 +60,15 @@ struct AppProcess(Option<Child>);
 
 impl AppProcess {
     fn spawn(config: &Path) -> Self {
+        let stdout = std::fs::File::create(config.with_extension("log"))
+            .expect("create isolated server log");
+        let stderr = stdout.try_clone().expect("clone server log handle");
         Self(Some(
             Command::new(env!("CARGO_BIN_EXE_iot-server"))
                 .args(["run", "--config"])
                 .arg(config)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stdout(Stdio::from(stdout))
+                .stderr(Stdio::from(stderr))
                 .spawn()
                 .expect("spawn server"),
         ))
@@ -496,6 +499,35 @@ impl Fixture {
         .unwrap()
     }
 
+    async fn command_ack_projection(
+        &self,
+        command_id: &str,
+    ) -> (String, Option<i64>, bool, bool, bool, bool) {
+        match &self.db {
+            TestDb::Sqlite(pool) => {
+                sqlx::query_as(
+                    "SELECT status, completed_at, result_json IS NULL, error IS NULL,
+                            late_ack_at IS NULL, late_ack_json IS NULL
+                     FROM commands WHERE id = ?",
+                )
+                .bind(command_id)
+                .fetch_one(pool)
+                .await
+            }
+            TestDb::Postgres(pool) => {
+                sqlx::query_as(
+                    "SELECT status, completed_at, result_json IS NULL, error IS NULL,
+                            late_ack_at IS NULL, late_ack_json IS NULL
+                     FROM commands WHERE id = $1",
+                )
+                .bind(command_id)
+                .fetch_one(pool)
+                .await
+            }
+        }
+        .unwrap()
+    }
+
     async fn make_command_due(&self, command_id: &str, now: i64) {
         match &self.db {
             TestDb::Sqlite(pool) => {
@@ -539,6 +571,39 @@ impl Fixture {
             }
         }
         .unwrap()
+    }
+
+    async fn attribute_count(&self, device_id: &str) -> i64 {
+        match &self.db {
+            TestDb::Sqlite(pool) => {
+                sqlx::query_scalar("SELECT COUNT(*) FROM device_attributes WHERE device_id = ?")
+                    .bind(device_id)
+                    .fetch_one(pool)
+                    .await
+            }
+            TestDb::Postgres(pool) => {
+                sqlx::query_scalar("SELECT COUNT(*) FROM device_attributes WHERE device_id = $1")
+                    .bind(device_id)
+                    .fetch_one(pool)
+                    .await
+            }
+        }
+        .unwrap()
+    }
+
+    async fn wait_for_log(&self, fragment: &str) {
+        let path = self.config.with_extension("log");
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if std::fs::read_to_string(&path).is_ok_and(|contents| contents.contains(fragment))
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("server log confirms the ACK worker processed the message");
     }
 
     async fn install_command_audit_failure(&self) {
@@ -957,6 +1022,71 @@ async fn run_a18_contracts(postgres_url: Option<String>) {
         true,
     )
     .await;
+    let (retained_client, mut retained_eventloop, _) = mqtt_connect(
+        fixture.mqtt_addr,
+        &device_e.id,
+        &device_e.id,
+        &device_e.token,
+        true,
+    )
+    .await;
+    let retained_ack_topic = format!("devices/{}/telemetry/ack", device_e.id);
+    assert!(matches!(
+        mqtt_subscribe(
+            &retained_client,
+            &mut retained_eventloop,
+            &retained_ack_topic,
+            QoS::AtLeastOnce,
+        )
+        .await,
+        SubscribeReasonCode::Success(_)
+    ));
+    let retained_event_id = format!("a18-retained-{}", Uuid::now_v7());
+    mqtt_publish(
+        &retained_client,
+        &format!("devices/{}/telemetry", device_e.id),
+        QoS::AtLeastOnce,
+        true,
+        &telemetry_payload(&retained_event_id, 33.0),
+    )
+    .await;
+    let retained_ack = mqtt_wait_telemetry_ack(
+        &mut retained_eventloop,
+        &retained_ack_topic,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(retained_ack["status"], "rejected");
+    assert_eq!(retained_ack["code"], "retained_not_allowed");
+    assert_eq!(
+        fixture
+            .telemetry_count(&device_e.id, &retained_event_id)
+            .await,
+        0
+    );
+    drop(retained_client);
+    let (retained_attributes_client, mut retained_attributes_eventloop, _) = mqtt_connect(
+        fixture.mqtt_addr,
+        &device_e.id,
+        &device_e.id,
+        &device_e.token,
+        true,
+    )
+    .await;
+    mqtt_publish(
+        &retained_attributes_client,
+        &format!("devices/{}/attributes", device_e.id),
+        QoS::AtLeastOnce,
+        true,
+        br#"{"values":{"firmware":"must-not-store"}}"#,
+    )
+    .await;
+    mqtt_wait_closed(&mut retained_attributes_eventloop, Duration::from_secs(3)).await;
+    drop(retained_attributes_client);
+    fixture
+        .wait_for_log("retained attributes publish rejected")
+        .await;
+    assert_eq!(fixture.attribute_count(&device_e.id).await, 0);
 
     let (a_client, mut a_eventloop, _) = mqtt_connect(
         fixture.mqtt_addr,
@@ -1114,6 +1244,7 @@ async fn run_a18_contracts(postgres_url: Option<String>) {
     };
     let race_command: Value = race_response.json().await.unwrap();
     let race_command_id = race_command["command_id"].as_str().unwrap().to_owned();
+    let wrong_device_state_before = fixture.command_ack_projection(&race_command_id).await;
     mqtt_publish(
         &b_client,
         &format!("devices/{}/commands/ack", device_b.id),
@@ -1129,7 +1260,14 @@ async fn run_a18_contracts(postgres_url: Option<String>) {
     )
     .await;
     mqtt_wait_puback(&mut b_eventloop, Duration::from_secs(5)).await;
-    assert_eq!(fixture.command_state(&race_command_id).await.0, "pending");
+    fixture
+        .wait_for_log("cross-device command ACK ignored")
+        .await;
+    assert_eq!(
+        fixture.command_ack_projection(&race_command_id).await,
+        wrong_device_state_before,
+        "processed wrong-device ACK leaves command and ACK fields unchanged"
+    );
 
     fixture
         .set_command_expired(&race_command_id, iot_server::core::auth::now_ms())
@@ -1542,6 +1680,25 @@ async fn shutdown_deadline_does_not_ack_uncommitted_postgres_or_sqlite_work(
         "uncommitted work must not produce an application ACK"
     );
 
+    let (monitor_started, monitor_ready) = oneshot::channel();
+    let ack_monitor = tokio::spawn(async move {
+        let _ = monitor_started.send(());
+        loop {
+            match eventloop.poll().await {
+                Ok(Event::Incoming(Packet::Publish(publish))) if publish.topic == ack_topic => {
+                    let ack: Value = serde_json::from_slice(&publish.payload)
+                        .expect("parse application ACK while shutting down");
+                    if ack["status"] == "stored" || ack["status"] == "duplicate" {
+                        return Some(ack);
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => return None,
+            }
+        }
+    });
+    monitor_ready.await.unwrap();
+
     let output = timeout(Duration::from_secs(10), server.terminate_with_output())
         .await
         .expect("server exits when the shutdown deadline is exceeded");
@@ -1557,6 +1714,15 @@ async fn shutdown_deadline_does_not_ack_uncommitted_postgres_or_sqlite_work(
     assert!(
         logs.contains("telemetry worker did not drain before shutdown deadline"),
         "missing shutdown deadline evidence: {logs}"
+    );
+    let unexpected_ack = timeout(Duration::from_secs(5), ack_monitor)
+        .await
+        .expect("MQTT event loop closes after the server exits")
+        .unwrap();
+    assert!(
+        unexpected_ack.is_none(),
+        "received a successful application ACK during shutdown: {}",
+        unexpected_ack.unwrap()
     );
     assert_eq!(fixture.telemetry_count(&device.id, &event_id).await, 0);
     drop(client);
