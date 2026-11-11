@@ -113,6 +113,10 @@ Sau khi thêm harness Compose: `cargo fmt --all --check`, Clippy `-D warnings`, 
 
 Đã có harness và một phép đo PostgreSQL MQTT trong [báo cáo baseline](../reports/p5-postgres-load-2026-11-11.md). Không suy throughput từ SQLite baseline; cgroup limits/peak chưa đo được, không có so sánh cùng điều kiện. Không đánh dấu P5-05 PASS.
 
+`IOT_LOAD_DURATION_SECONDS=1 sh tests/load/run.sh` PASS sau khi runner SQLite được giới hạn đúng test SQLite; 1 passed, 3 filtered. Đây chỉ là kiểm tra runner, không phải baseline tải hay phép so sánh PostgreSQL.
+
+`python3 tests/load/test_cgroup.py`: 7 test fixture PASS, gồm v1/v2, hybrid, nested mount và thông tin không đọc được. `--report` trên host hiện tại nhận diện cgroup v2 nhưng báo giới hạn CPU/memory `unavailable`; không suy là không có giới hạn. Chưa chạy lại benchmark với phép đo này và chưa kiểm tra trên host v1/hybrid thật.
+
 **Lượt thăm dò MQTT PostgreSQL (2026-11-11T23:25+07:00):** harness end-to-end mới báo 60.000 publish/PUBACK, 60.000 rows, 25.618 application ACK và 34.382 ACK drop trong cửa sổ 60 s + drain 10 s. Output chỉ được stream và không còn artifact, cgroup limits không đọc được; chưa dùng làm evidence gate hoặc sizing. Cần review harness, chạy lại cô lập, lưu output và ghi đầy đủ cấu hình/giới hạn trước khi đánh giá P5-05.
 
 **Khảo sát load P5-05 (2026-11-11):** `tests/load/run.sh` chỉ chạy `tests/load_baseline.rs`; harness dùng `tests/common::TestApp`, SQLite pool, SQLite config/data directory và đọc `sqlite_growth_bytes`. Nó không nhận PostgreSQL URL, không dựng PostgreSQL fixture, và không thể chứng minh backend PostgreSQL đang được đo. `docker ps` không có container nào đang chạy; vì vậy không chạy phép đo giả định/không an toàn và không ghi số throughput PostgreSQL. Cần harness riêng hoặc mở rộng fixture để chọn backend, tạo DB riêng có xác nhận danh tính trước ghi, đọc commit count/growth của PostgreSQL, cùng đo cgroup/hardware, retries và toàn bộ ACK/drain như contract. Mục này vẫn unchecked; chưa có kết quả tải thực tế.

@@ -4,6 +4,7 @@ set -eu
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 load_root=${IOT_LOAD_TMPDIR:-"$repo/target/load-tmp"}
 duration=${IOT_LOAD_DURATION_SECONDS:-60}
+test_name=one_thousand_qos1_clients_measure_ack_latency_and_resource_growth
 mkdir -p "$load_root"
 load_tmp=$(mktemp -d "$load_root/run.XXXXXX")
 trap 'rm -rf -- "$load_tmp"' EXIT
@@ -26,8 +27,8 @@ if [ "${IOT_LOAD_CGROUP:-0}" = 1 ]; then
         --user "$(id -u):$(id -g)" \
         --volume "$load_tmp:/bench:Z" \
         --env "IOT_LOAD_DURATION_SECONDS=$duration" --env IOT_LOAD_CGROUP=1 --env TMPDIR=/bench/tmp \
-        "$image" --ignored --nocapture
+        "$image" "$test_name" --ignored --exact --nocapture
 else
     TMPDIR="$load_tmp" IOT_LOAD_DURATION_SECONDS="$duration" \
-        cargo test --locked --test load_baseline -- --ignored --nocapture
+        cargo test --locked --test load_baseline "$test_name" -- --ignored --exact --nocapture
 fi

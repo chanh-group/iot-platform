@@ -91,9 +91,8 @@ test "$(docker inspect --format '{{(index (index .NetworkSettings.Ports "5432/tc
 printf 'fixture_image=%s\nfixture_image_id=%s\nstarted_utc=%s\ndocker_engine=%s\nhost=%s\nlogical_cpus=%s\n' \
     "$IMAGE" "$IMAGE_ID" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     "$(docker version --format '{{.Server.Version}}')" "$(uname -a)" "$(nproc)"
-printf 'cgroup_memory_max=%s\ncgroup_cpu_max=%s\n' \
-    "$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo unavailable)" \
-    "$(cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo unavailable)"
+python3 tests/load/test_cgroup.py
+python3 tests/load/test_cgroup.py --report
 
 if ! command -v setsid >/dev/null 2>&1; then
     echo 'setsid is required to isolate load-test process cleanup' >&2

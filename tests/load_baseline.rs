@@ -70,7 +70,7 @@ impl PublishWindow {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
-#[ignore = "manual load baseline; run with cargo test --test load_baseline -- --ignored --nocapture"]
+#[ignore = "manual SQLite load baseline; run tests/load/run.sh"]
 async fn one_thousand_qos1_clients_measure_ack_latency_and_resource_growth() -> anyhow::Result<()> {
     let duration = Duration::from_secs(
         std::env::var("IOT_LOAD_DURATION_SECONDS")
