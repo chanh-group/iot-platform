@@ -87,6 +87,8 @@ P5-03 đã bỏ theo ADR-011; giữ số mục và ID còn lại để các tham
 
 **Implementation draft, gate chưa chạy (2026-11-11):** thêm `deploy/compose.postgres.yml`, local secret wrapper, config, `backup-postgres.sh`, `restore-postgres.sh`, operations docs và `tests/postgres_compose.sh`/`tests/postgres_compose.rs`. Kiểm tra tĩnh: `sh -n deploy/compose-postgres.sh deploy/backup-postgres.sh deploy/restore-postgres.sh tests/postgres_compose.sh tests/postgres_recovery.sh` PASS; `IOT_POSTGRES_PASSWORD_FILE=<temporary hex fixture> IOT_TEST_POSTGRES_PORT=54329 deploy/compose-postgres.sh --file tests/compose.postgres.test.yml config --quiet` PASS; `cargo test --test postgres_compose` 0 pass, 0 fail, 1 ignored (fixture test compiled, not executed). Compose image-build/recreate/pg_dump/restore smoke **chưa chạy tới kết quả**; thao tác thử dài bị hủy theo yêu cầu người dùng, không có container fixture còn lại. Vì chưa có dynamic evidence, các gate §4 vẫn unchecked.
 
+**Compose rerun (2026-11-11):** `sh tests/postgres_compose.sh` PASS trên Docker Engine 29.9.2, SELinux enforcing và `postgres:18.6-bookworm`: migrate/bootstrap, seed MQTT/REST 1 passed, backup checksum, từ chối restore vào DB hiện hữu, restore DB mới, recreate cả hai container với volume và verify 1 passed. Đã sửa SELinux bind labels và lỗi nội suy psql ở restore. Đây chưa chứng minh toàn bộ failure/permission/version cases của §4; các checkbox vẫn mở. `sh tests/postgres_recovery.sh` PASS lại cả outage, 3 crash cases và shared PostgreSQL A18, gồm kiểm tra trùng tên device mới.
+
 Sau khi thêm harness Compose: `cargo fmt --all --check`, Clippy `-D warnings`, `cargo test --all` PASS (292 passed, 0 failed, 6 ignored; PostgreSQL/Compose ignored tests chỉ compile). Đây không thay thế `sh tests/postgres_compose.sh` và không đóng gate.
 
 ## 5. Đo tải và giới hạn PostgreSQL — P5-05
@@ -96,6 +98,8 @@ Sau khi thêm harness Compose: `cargo fmt --all --check`, Clippy `-D warnings`, 
 - [ ] Ghi báo cáo và giới hạn vận hành/backend; nếu cần tối ưu, đo trước, giữ correctness và bounded resources, thêm test tương ứng.
 
 PostgreSQL load harness/report chưa có; không suy throughput từ SQLite baseline. Không đánh dấu P5-05 PASS.
+
+**Khảo sát load P5-05 (2026-11-11):** `tests/load/run.sh` chỉ chạy `tests/load_baseline.rs`; harness dùng `tests/common::TestApp`, SQLite pool, SQLite config/data directory và đọc `sqlite_growth_bytes`. Nó không nhận PostgreSQL URL, không dựng PostgreSQL fixture, và không thể chứng minh backend PostgreSQL đang được đo. `docker ps` không có container nào đang chạy; vì vậy không chạy phép đo giả định/không an toàn và không ghi số throughput PostgreSQL. Cần harness riêng hoặc mở rộng fixture để chọn backend, tạo DB riêng có xác nhận danh tính trước ghi, đọc commit count/growth của PostgreSQL, cùng đo cgroup/hardware, retries và toàn bộ ACK/drain như contract. Mục này vẫn unchecked; chưa có kết quả tải thực tế.
 
 ## 6. Cân nhắc hạng mục sau MVP — P5-06
 

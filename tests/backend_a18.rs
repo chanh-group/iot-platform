@@ -843,6 +843,18 @@ async fn run_a18_contracts(postgres_url: Option<String>) {
     let device_c = create_device(&http, &fixture.base, "a18-device-c").await;
     let device_e = create_device(&http, &fixture.base, "a18-device-e").await;
     let disabled_device = create_device(&http, &fixture.base, "a18-disabled-device").await;
+    let duplicate_device = http
+        .post(format!("{}/api/v1/devices", fixture.base))
+        .header("X-IoT-CSRF", "1")
+        .json(&json!({"name":" A18-DEVICE-A ","metadata":{}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(duplicate_device.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        duplicate_device.json::<Value>().await.unwrap()["code"],
+        "device_name_conflict"
+    );
     let disabled = http
         .patch(format!(
             "{}/api/v1/devices/{}",

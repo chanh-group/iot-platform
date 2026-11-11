@@ -25,6 +25,7 @@ Tạo password hex ngẫu nhiên trong file riêng, không commit:
 ```sh
 cd deploy
 mkdir -p secrets
+chmod 0700 secrets
 umask 077
 openssl rand -hex 32 > secrets/postgres_password
 chmod 0600 secrets/postgres_password
@@ -37,14 +38,16 @@ Bootstrap và start:
 ```sh
 ./compose-postgres.sh run --rm iot-server migrate --config /app/conf.toml
 openssl rand -base64 32 > secrets/admin_password
-chmod 0600 secrets/admin_password
+chmod 0644 secrets/admin_password
 ./compose-postgres.sh run --rm \
-  --volume "$PWD/secrets/admin_password:/run/secrets/admin_password:ro" \
+  --volume "$PWD/secrets/admin_password:/run/secrets/admin_password:ro,z" \
   iot-server admin create --username admin --config /app/conf.toml \
   --password-file /run/secrets/admin_password
 ./compose-postgres.sh up -d
 curl -fsS http://127.0.0.1:8080/readyz
 ```
+
+File admin phải đọc được bởi UID container `10001`; quyền `0644` chỉ an toàn khi thư mục `secrets` là `0700` và host/Docker được tin cậy. Xóa file admin sau bootstrap. Bind mount `:z` gán lại SELinux label cho file được mount; không dùng file chia sẻ với ứng dụng khác nếu thay đổi label gây ảnh hưởng.
 
 `compose-postgres.sh` đọc password từ file và tạo `IOT_DATABASE_URL` với `sslmode=disable` tường minh cho network local/isolated Compose. URL không lưu trong Compose hoặc image, nhưng Docker metadata của app vẫn chứa environment; chỉ operator được tin cậy mới được quyền Docker. Đây **không** phải production helper: DB remote phải dùng `sslmode=verify-full`, CA phù hợp và secret manager. `IOT_DATABASE_NAME` chọn DB app sẽ dùng; `IOT_POSTGRES_DATABASE` chọn DB ban đầu khi volume mới được tạo.
 

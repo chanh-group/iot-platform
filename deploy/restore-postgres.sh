@@ -40,8 +40,9 @@ case "$version:$backup_version" in
 esac
 existing=$(docker exec --user 0:0 "$container" sh -ec '
     export PGPASSWORD="$(cat /run/secrets/postgres_password)"
-    psql --host=127.0.0.1 --username="$POSTGRES_USER" --dbname=postgres --tuples-only --no-align \
-        --set=db="$1" --command="SELECT 1 FROM pg_database WHERE datname = :'\''db'\''"
+    printf "SELECT 1 FROM pg_database WHERE datname = :'\''db'\'';\n" | \
+        psql --host=127.0.0.1 --username="$POSTGRES_USER" --dbname=postgres --tuples-only --no-align \
+        --set=ON_ERROR_STOP=1 --set=db="$1"
 ' sh "$new_database")
 if [ -n "$existing" ]; then
     echo "refusing to overwrite existing database: $new_database" >&2

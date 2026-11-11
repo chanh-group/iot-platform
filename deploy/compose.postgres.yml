@@ -5,10 +5,9 @@ services:
       POSTGRES_DB: ${IOT_POSTGRES_DATABASE:-iot}
       POSTGRES_USER: iot
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
-    secrets:
-      - postgres_password
     volumes:
       - postgres_data:/var/lib/postgresql
+      - "${IOT_POSTGRES_PASSWORD_FILE:?set IOT_POSTGRES_PASSWORD_FILE}:/run/secrets/postgres_password:ro,z"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 5s
@@ -29,7 +28,7 @@ services:
       - "127.0.0.1:${IOT_MQTT_PORT:-1883}:1883"
     volumes:
       - iot_data:/app/data
-      - "./conf.postgres.toml:/app/conf.toml:ro"
+      - "./conf.postgres.toml:/app/conf.toml:ro,z"
     init: true
     stop_grace_period: 20s
     healthcheck:
@@ -38,10 +37,6 @@ services:
       timeout: 3s
       retries: 6
       start_period: 10s
-
-secrets:
-  postgres_password:
-    file: ${IOT_POSTGRES_PASSWORD_FILE:?set IOT_POSTGRES_PASSWORD_FILE}
 
 volumes:
   iot_data:

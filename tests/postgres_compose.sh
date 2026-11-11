@@ -23,7 +23,7 @@ openssl rand -hex 32 > "$IOT_POSTGRES_PASSWORD_FILE"
 chmod 0600 "$IOT_POSTGRES_PASSWORD_FILE"
 IOT_TEST_ADMIN_PASSWORD_FILE="$tmp_root/admin_password"
 printf '%s\n' "$IOT_TEST_ADMIN_PASSWORD" > "$IOT_TEST_ADMIN_PASSWORD_FILE"
-chmod 0600 "$IOT_TEST_ADMIN_PASSWORD_FILE"
+chmod 0644 "$IOT_TEST_ADMIN_PASSWORD_FILE"
 
 free_port() {
     python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
@@ -61,7 +61,7 @@ done
 
 compose run --rm --no-deps iot-server migrate --config /app/conf.toml
 compose run --rm --no-deps \
-    --volume "$IOT_TEST_ADMIN_PASSWORD_FILE:/run/secrets/admin_password:ro" \
+    --volume "$IOT_TEST_ADMIN_PASSWORD_FILE:/run/secrets/admin_password:ro,z" \
     iot-server admin create --username "$IOT_TEST_ADMIN_USER" \
     --config /app/conf.toml --password-file /run/secrets/admin_password
 compose up -d
@@ -72,6 +72,10 @@ IOT_COMPOSE_TEST_STAGE=seed cargo test --manifest-path "$repo_root/Cargo.toml" \
 backup="$tmp_root/backup"
 "$repo_root/deploy/backup-postgres.sh" "$backup"
 (cd "$backup" && sha256sum -c SHA256SUMS)
+if "$repo_root/deploy/restore-postgres.sh" "$backup" iot; then
+    echo "restore unexpectedly overwrote an existing database" >&2
+    exit 1
+fi
 "$repo_root/deploy/restore-postgres.sh" "$backup" iot_restore_test
 
 compose down --remove-orphans
