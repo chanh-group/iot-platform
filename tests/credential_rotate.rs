@@ -3,9 +3,10 @@ mod common;
 use std::time::Duration;
 
 use common::{
-    TestApp, mqtt_connect, mqtt_connect_refused, mqtt_publish, mqtt_wait_closed, mqtt_wait_puback,
+    TestApp, mqtt_connect, mqtt_connect_refused, mqtt_options, mqtt_publish, mqtt_wait_closed,
+    mqtt_wait_puback,
 };
-use rumqttc::{ConnectReturnCode, QoS};
+use rumqttc::{AsyncClient, ConnectReturnCode, ConnectionError, Event, Packet, QoS};
 use serde_json::{Value, json};
 
 async fn admin_client(app: &TestApp, username: &str) -> reqwest::Client {
@@ -195,8 +196,26 @@ async fn audit_failure_rolls_back_rotation_and_preserves_old_credential() {
         0
     );
     drop(old_client);
-    let (reconnected, mut eventloop, _) =
-        mqtt_connect(app.mqtt_addr, &device.id, &device.id, &device.token, true).await;
+    // The kick worker releases the rollback fence asynchronously after the HTTP error.
+    let (reconnected, mut eventloop) = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let options = mqtt_options(app.mqtt_addr, &device.id, &device.id, &device.token, true);
+            let (client, mut eventloop) = AsyncClient::new(options, 32);
+            match eventloop.poll().await {
+                Ok(Event::Incoming(Packet::ConnAck(ack)))
+                    if ack.code == ConnectReturnCode::Success =>
+                {
+                    break (client, eventloop);
+                }
+                Err(ConnectionError::ConnectionRefused(ConnectReturnCode::NotAuthorized)) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                other => panic!("unexpected MQTT connection result: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("old credential should reconnect after the rollback fence clears");
     mqtt_publish(
         &reconnected,
         &format!("devices/{}/data/after-rollback", device.id),
