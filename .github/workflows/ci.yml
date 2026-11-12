@@ -73,6 +73,7 @@ jobs:
           sh tests/attributes_postgres.sh
           sh tests/credential_rotate_postgres.sh
           sh tests/auth_postgres.sh
+          sh tests/overview_postgres.sh
 
   frontend:
     runs-on: ubuntu-24.04
