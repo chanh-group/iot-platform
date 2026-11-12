@@ -583,7 +583,17 @@ async fn kill_after_ack_preserves_telemetry_and_recovers_pending_command() {
     .expect("recover pending command after restart");
     assert_eq!(command["command_id"], command_id);
     assert_eq!(fixture.event_count(&event_id).await, 1);
-    let status = fixture.command_status(&command_id).await;
+    let status = timeout(Duration::from_secs(5), async {
+        loop {
+            let status = fixture.command_status(&command_id).await;
+            if status == "dispatched" {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("recovered command state should commit after publishing");
     assert_eq!(status, "dispatched");
     restarted.kill();
 }

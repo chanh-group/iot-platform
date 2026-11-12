@@ -948,7 +948,7 @@ esac
     let fake_cargo = bin.join("cargo");
     fs::write(
         &fake_cargo,
-        "#!/bin/sh\n/bin/sleep 300 &\necho $! > \"$FIXTURE_TEST_DIR/test-child.pid\"\nwait\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$FIXTURE_TEST_DIR/test-child.pid\"\nexec /bin/sleep 300\n",
     )?;
     for executable in [&docker, &fake_cargo] {
         fs::set_permissions(executable, fs::Permissions::from_mode(0o755))?;
