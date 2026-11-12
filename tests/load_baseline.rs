@@ -947,7 +947,7 @@ esac
     let fake_cargo = bin.join("cargo");
     fs::write(
         &fake_cargo,
-        "#!/bin/sh\nset +m\n/bin/sleep 300 &\nchild=$!\nprintf '%s\\n' \"$child\" > \"$FIXTURE_TEST_DIR/test-child.pid\"\nps -o pgid= -p \"$child\" | tr -d ' ' > \"$FIXTURE_TEST_DIR/child-pgid\"\nexit 143\n",
+        "#!/bin/sh\nset +m\n/bin/sleep 300 &\nchild=$!\nprintf '%s\\n' \"$child\" > \"$FIXTURE_TEST_DIR/test-child.pid\"\nps -o pgid= -p \"$child\" | tr -d ' ' > \"$FIXTURE_TEST_DIR/child-pgid\"\nawk '{print $22}' /proc/$child/stat > \"$FIXTURE_TEST_DIR/child-start\"\nexit 143\n",
     )?;
     for executable in [&docker, &fake_cargo] {
         fs::set_permissions(executable, fs::Permissions::from_mode(0o755))?;
@@ -964,22 +964,33 @@ esac
         .stderr(Stdio::null())
         .spawn()?;
     let child_pid_file = fixture_dir.path().join("test-child.pid");
+    let child_group_file = fixture_dir.path().join("child-pgid");
+    let child_start_file = fixture_dir.path().join("child-start");
+    let group_pid_file = fixture_dir.path().join("test-pgid");
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !child_pid_file.exists() && Instant::now() < deadline {
+    while (!child_pid_file.exists()
+        || !child_group_file.exists()
+        || !child_start_file.exists()
+        || !group_pid_file.exists())
+        && Instant::now() < deadline
+    {
         thread::sleep(Duration::from_millis(20));
     }
-    ensure!(child_pid_file.exists(), "fake cargo did not start");
+    ensure!(
+        child_pid_file.exists()
+            && child_group_file.exists()
+            && child_start_file.exists()
+            && group_pid_file.exists(),
+        "fake cargo did not write process identity"
+    );
     let child_pid: u32 = fs::read_to_string(&child_pid_file)?.trim().parse()?;
-    let group_pid: u32 = fs::read_to_string(fixture_dir.path().join("test-pgid"))?
-        .trim()
-        .parse()?;
-    let child_group: u32 = fs::read_to_string(fixture_dir.path().join("child-pgid"))?
-        .trim()
-        .parse()?;
+    let group_pid: u32 = fs::read_to_string(&group_pid_file)?.trim().parse()?;
+    let child_group: u32 = fs::read_to_string(&child_group_file)?.trim().parse()?;
     ensure!(
         child_group == group_pid,
         "fake cargo child escaped test group: child={child_group} group={group_pid}"
     );
+    let child_start = fs::read_to_string(&child_start_file)?.trim().to_owned();
 
     let mut outside = Command::new("/bin/sleep").arg("300").spawn()?;
     let output = runner.wait_with_output()?;
@@ -988,9 +999,14 @@ esac
         "runner exit status: {:?}",
         output.status.code()
     );
+    let child_after = linux_process_identity(child_pid);
+    let cleanup_log =
+        fs::read_to_string(fixture_dir.path().join("cleanup.log")).unwrap_or_default();
     ensure!(
-        !linux_process_is_running(child_pid),
-        "test-group child survived failed test cleanup"
+        !child_after
+            .as_ref()
+            .is_some_and(|(state, start)| *state != 'Z' && start == &child_start),
+        "original test-group child survived failed test cleanup: {child_after:?}; {cleanup_log}"
     );
     ensure!(
         linux_process_is_running(outside.id()),
@@ -1010,9 +1026,18 @@ esac
 
 #[cfg(target_os = "linux")]
 fn linux_process_is_running(pid: u32) -> bool {
+    linux_process_identity(pid).is_some_and(|(state, _)| state != 'Z')
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_identity(pid: u32) -> Option<(char, String)> {
     fs::read_to_string(format!("/proc/{pid}/stat"))
         .ok()
         .and_then(|stat| stat.split_once(") ").map(|(_, rest)| rest.to_owned()))
-        .and_then(|rest| rest.chars().next())
-        .is_some_and(|state| state != 'Z')
+        .and_then(|rest| {
+            let mut fields = rest.split_whitespace();
+            let state = fields.next()?.chars().next()?;
+            let start_time = fields.nth(18)?.to_owned();
+            Some((state, start_time))
+        })
 }
