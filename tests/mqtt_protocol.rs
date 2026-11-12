@@ -15,6 +15,254 @@ use tokio::net::TcpStream;
 
 const WAIT: Duration = Duration::from_secs(5);
 
+mod protocol_postgres {
+    use std::{
+        net::{IpAddr, SocketAddr},
+        process::{Child, Command, Stdio},
+    };
+
+    use sqlx::postgres::PgPool;
+    use tempfile::TempDir;
+
+    pub struct Device {
+        pub id: String,
+        pub token: String,
+    }
+
+    pub struct Fixture {
+        pub addr: SocketAddr,
+        pub device: Device,
+        _child: ChildGuard,
+    }
+
+    struct ChildGuard(Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    pub async fn start() -> Fixture {
+        let url = std::env::var("IOT_TEST_POSTGRES_URL").expect("runner PostgreSQL URL");
+        let container = std::env::var("IOT_TEST_POSTGRES_CONTAINER").expect("runner container");
+        let port: u16 = std::env::var("IOT_TEST_POSTGRES_PORT")
+            .expect("runner mapped port")
+            .parse()
+            .expect("valid mapped port");
+        let inspect = |format: &str| {
+            let output = Command::new("docker")
+                .args(["inspect", "--format", format, &container])
+                .output()
+                .expect("inspect guarded PostgreSQL fixture");
+            assert!(output.status.success(), "Docker fixture inspection failed");
+            String::from_utf8(output.stdout)
+                .expect("Docker output is UTF-8")
+                .trim()
+                .to_owned()
+        };
+        assert_eq!(inspect("{{.Config.Image}}"), "postgres:18.6-bookworm");
+        assert_eq!(
+            inspect("{{ index .Config.Labels \"io.iot.test-fixture\" }}"),
+            "mqtt-protocol"
+        );
+        let mapped: serde_json::Value = serde_json::from_str(&inspect(
+            "{{json (index .NetworkSettings.Ports \"5432/tcp\")}}",
+        ))
+        .expect("parse mapped PostgreSQL port");
+        let mappings = mapped
+            .as_array()
+            .filter(|m| m.len() == 1)
+            .expect("one PostgreSQL mapping");
+        let host: IpAddr = mappings[0]["HostIp"]
+            .as_str()
+            .expect("mapped host")
+            .parse()
+            .expect("valid host");
+        let mapped_port: u16 = mappings[0]["HostPort"]
+            .as_str()
+            .expect("mapped port")
+            .parse()
+            .expect("valid port");
+        assert!(host.is_loopback(), "PostgreSQL mapping must bind loopback");
+        assert_eq!(mapped_port, port);
+        validate_url(&url, host, port).expect("URL must target guarded fixture");
+
+        let dir = TempDir::new().expect("temporary server config directory");
+        let http_port = crate::common::free_port();
+        let mqtt_port = loop {
+            let p = crate::common::free_port();
+            if p != http_port {
+                break p;
+            }
+        };
+        let config = dir.path().join("conf.toml");
+        std::fs::write(&config, format!("config_version=1\n[server]\ndata_dir='./data'\nshutdown_timeout_ms=1000\n[http]\nlisten='127.0.0.1:{http_port}'\n[mqtt]\nlisten='127.0.0.1:{mqtt_port}'\n[database]\nurl_env='IOT_TEST_POSTGRES_URL'\n[telemetry]\nqueue_capacity=16\nbatch_size=1\n")).expect("write test config");
+        let pool = PgPool::connect(&url)
+            .await
+            .expect("connect fixture database");
+        let (database, schema): (String, String) =
+            sqlx::query_as("SELECT current_database(), current_schema()")
+                .fetch_one(&pool)
+                .await
+                .expect("verify fixture before migration");
+        assert_eq!((database.as_str(), schema.as_str()), ("iot_test", "public"));
+        pool.close().await;
+        let output = Command::new(env!("CARGO_BIN_EXE_iot-server"))
+            .args(["migrate", "--config"])
+            .arg(&config)
+            .env("IOT_TEST_POSTGRES_URL", &url)
+            .output()
+            .expect("run migrations");
+        assert!(
+            output.status.success(),
+            "migration failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let password = "protocol-test-password";
+        let password_file = dir.path().join("admin-password");
+        std::fs::write(&password_file, password).expect("write password file");
+        let output = Command::new(env!("CARGO_BIN_EXE_iot-server"))
+            .args(["admin", "create", "--username", "admin", "--config"])
+            .arg(&config)
+            .args(["--password-file"])
+            .arg(&password_file)
+            .env("IOT_TEST_POSTGRES_URL", &url)
+            .output()
+            .expect("create fixture admin");
+        assert!(
+            output.status.success(),
+            "admin creation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let child = Command::new(env!("CARGO_BIN_EXE_iot-server"))
+            .args(["run", "--config"])
+            .arg(&config)
+            .env("IOT_TEST_POSTGRES_URL", &url)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start server");
+        let mut child = ChildGuard(child);
+        let base = format!("http://127.0.0.1:{http_port}");
+        let client = reqwest::Client::builder()
+            .cookie_store(true)
+            .build()
+            .expect("HTTP client");
+        let mut ready = false;
+        for _ in 0..100 {
+            assert!(
+                child.0.try_wait().expect("check server").is_none(),
+                "server exited"
+            );
+            if client
+                .get(format!("{base}/readyz"))
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success())
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(ready, "server did not become ready");
+        let response = client
+            .post(format!("{base}/api/v1/auth/login"))
+            .header("X-IoT-CSRF", "1")
+            .json(&serde_json::json!({"username":"admin","password":password}))
+            .send()
+            .await
+            .expect("login");
+        assert!(response.status().is_success(), "fixture login failed");
+        let cookie = response
+            .headers()
+            .get(reqwest::header::SET_COOKIE)
+            .expect("login cookie")
+            .to_str()
+            .expect("cookie UTF-8")
+            .split(';')
+            .next()
+            .expect("cookie value")
+            .to_owned();
+        let _: serde_json::Value = response.json().await.expect("login response");
+        let response = client
+            .post(format!("{base}/api/v1/devices"))
+            .header("Cookie", cookie)
+            .header("X-IoT-CSRF", "1")
+            .json(&serde_json::json!({"name":"protocol-qos","metadata":{}}))
+            .send()
+            .await
+            .expect("create device");
+        assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+        let body: serde_json::Value = response.json().await.expect("device response");
+        Fixture {
+            addr: format!("127.0.0.1:{mqtt_port}")
+                .parse()
+                .expect("MQTT address"),
+            device: Device {
+                id: body["device"]["id"].as_str().expect("device id").to_owned(),
+                token: body["credential"]["token"]
+                    .as_str()
+                    .expect("device token")
+                    .to_owned(),
+            },
+            _child: child,
+        }
+    }
+
+    fn validate_url(url: &str, mapped_host: IpAddr, mapped_port: u16) -> Result<(), &'static str> {
+        let (scheme, rest) = url.split_once("://").ok_or("invalid URL")?;
+        if scheme != "postgresql" {
+            return Err("unexpected scheme");
+        }
+        let (endpoint, query) = rest.split_once('?').ok_or("missing query")?;
+        if query != "sslmode=disable" {
+            return Err("unexpected query");
+        }
+        let (authority, database) = endpoint.rsplit_once('/').ok_or("missing database")?;
+        if database != "iot_test" {
+            return Err("unexpected database");
+        }
+        let (_, host_port) = authority.rsplit_once('@').ok_or("missing credentials")?;
+        let (host, port) = host_port.rsplit_once(':').ok_or("missing port")?;
+        let host: IpAddr = host.parse().map_err(|_| "invalid host")?;
+        let port: u16 = port.parse().map_err(|_| "invalid port")?;
+        if !host.is_loopback() || host != mapped_host || port != mapped_port {
+            return Err("URL endpoint differs from fixture mapping");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn postgres_fixture_url_guard_rejects_endpoint_and_query_overrides() {
+        let host = IpAddr::from([127, 0, 0, 1]);
+        assert_eq!(
+            validate_url(
+                "postgresql://u:p@127.0.0.1:54321/iot_test?sslmode=disable",
+                host,
+                54321
+            ),
+            Ok(())
+        );
+        for url in [
+            "postgresql://u:p@127.0.0.1:54321/iot_test?sslmode=disable&host=127.0.0.1",
+            "postgresql://u:p@127.0.0.1:54321/iot_test?sslmode=disable&port=54321",
+            "postgresql://u:p@127.0.0.1:54321/iot_test?sslmode=disable&dbname=iot_test",
+            "postgresql://u:p@192.0.2.1:54321/iot_test?sslmode=disable",
+            "postgresql://u:p@127.0.0.1:54322/iot_test?sslmode=disable",
+            "postgresql://u:p@127.0.0.1:54321/other?sslmode=disable",
+            "postgres://u:p@127.0.0.1:54321/iot_test?sslmode=disable",
+        ] {
+            assert!(
+                validate_url(url, host, 54321).is_err(),
+                "accepted unsafe URL: {url}"
+            );
+        }
+    }
+}
+
 fn push_mqtt_string(body: &mut Vec<u8>, value: &str) {
     body.extend_from_slice(&(value.len() as u16).to_be_bytes());
     body.extend_from_slice(value.as_bytes());
@@ -144,9 +392,19 @@ async fn publish_telemetry_and_wait_for_puback(
 async fn qos_levels_and_own_device_wildcard_round_trip() {
     let app = TestApp::start().await;
     let device = app.create_device("protocol-qos", true).await;
-    let (client, mut eventloop, _) =
-        mqtt_connect(app.mqtt_addr, &device.id, &device.id, &device.token, true).await;
-    let filter = format!("devices/{}/data/#", device.id);
+    qos_round_trip(app.mqtt_addr, &device.id, &device.token).await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture; run tests/protocol_postgres.sh"]
+async fn qos_levels_and_own_device_wildcard_round_trip_postgres() {
+    let fixture = protocol_postgres::start().await;
+    qos_round_trip(fixture.addr, &fixture.device.id, &fixture.device.token).await;
+}
+
+async fn qos_round_trip(addr: std::net::SocketAddr, device_id: &str, token: &str) {
+    let (client, mut eventloop, _) = mqtt_connect(addr, device_id, device_id, token, true).await;
+    let filter = format!("devices/{device_id}/data/#");
 
     assert_eq!(
         mqtt_subscribe(&client, &mut eventloop, &filter, QoS::ExactlyOnce).await,
@@ -158,7 +416,7 @@ async fn qos_levels_and_own_device_wildcard_round_trip() {
         (QoS::AtLeastOnce, "qos1", b"one".as_slice()),
         (QoS::ExactlyOnce, "qos2", b"two".as_slice()),
     ] {
-        let topic = format!("devices/{}/data/{suffix}", device.id);
+        let topic = format!("devices/{device_id}/data/{suffix}");
         mqtt_publish(&client, &topic, qos, false, payload).await;
         let received = mqtt_wait_publish(&mut eventloop, WAIT).await;
         assert_eq!(received.topic, topic);

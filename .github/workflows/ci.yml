@@ -67,6 +67,7 @@ jobs:
           sh tests/postgres_recovery.sh
           sh tests/postgres_migration_failure.sh
           sh tests/acl_postgres.sh
+          sh tests/protocol_postgres.sh
 
   frontend:
     runs-on: ubuntu-24.04

@@ -93,6 +93,10 @@ P5-03 đã bỏ theo ADR-011; giữ số mục và ID còn lại để các tham
 
 Rerun tiếp theo thêm lỗi `pg_dump` do database không tồn tại: script trả lỗi, không publish destination và không để staging directory; sau đó backup/restore và seed/verify Compose vẫn PASS. Đây không thay thế test disk-full hoặc lỗi I/O giữa chừng.
 
+Giới hạn của drill trước: backup PostgreSQL chỉ chứa DB/metadata, còn `runtime.toml` nằm trên app volume; lượt verify cũ tái dùng volume cũ. `pg_restore` lỗi sau `createdb` có thể để DB đích dở dang; xem drill tiếp theo.
+
+**Fresh-volume drill (2026-11-12):** `sh tests/postgres_compose.sh` PASS: dừng app, snapshot `runtime.toml` riêng và verify SHA-256, dump DB, restore DB cùng runtime vào volume app mới; verify lại runtime revision, API và MQTT. Dump sai format nhưng checksum hợp lệ gây `pg_restore` lỗi sau `createdb`; test xác nhận DB nguồn không đổi, đích dở dang và chỉ dọn DB fixture. Không giả định dump PostgreSQL chứa runtime config; chưa mô phỏng power-loss/disk-full.
+
 Sau review độc lập, fixture Compose dùng project UUID và kiểm tra tài nguyên trùng trước cleanup; tên DB khởi tạo mặc định theo tên app khi tạo volume mới. Smoke đã chạy lại thành công. `cargo deny check` PASS; `cargo audit` PASS với hai allowed unmaintained warnings hiện hành (`atomic-polyfill`, `instant`).
 
 `sh tests/postgres_migration_failure.sh` PASS: URL guard 1 passed, migration checksum conflict 1 passed trên container PostgreSQL fixture riêng; app exit 4, hai port khả dụng sau exit và probe không thấy listener trong lúc chạy. Giới hạn: polling có thể bỏ sót listener mở rất ngắn giữa hai lần probe.
@@ -104,6 +108,8 @@ Shared A18 bổ sung late-event history, checkpoint `through_id` cố định qu
 Shared A18 cũng kiểm tra trực tiếp repository ACK: lỗi storage rollback terminal fields và hai ACK success/failure được khởi chạy đồng thời chỉ có một `Applied`, một `Duplicate` với kết quả thắng được lưu. SQLite focused test và PostgreSQL qua `sh tests/postgres_recovery.sh` PASS. `tokio::join!` không ép interleaving ở bước đọc/ghi, nên đây chưa chứng minh race cụ thể và chưa thay thế MQTT command/failure-race matrix.
 
 MQTT ACL suite gốc dùng chung body/assertions cho SQLite và PostgreSQL subprocess: `cargo test --test mqtt_acl` 6 passed, 5 ignored; `sh tests/acl_postgres.sh` 5 passed trên năm container PostgreSQL fixture riêng. Đây chỉ là suite ACL; protocol/session-generation và các suite khác vẫn chưa đủ evidence A18.
+
+Protocol QoS/wildcard: test gốc `qos_levels_and_own_device_wildcard_round_trip` dùng cùng body/assertions cho SQLite và PostgreSQL. Test SQLite focused 1 passed; `sh tests/protocol_postgres.sh` 1 passed trên container riêng, bao gồm QoS 0/1/2. Đây chỉ là một test của suite protocol; session-generation và các case protocol còn lại vẫn mở.
 
 Shared A18 inject lỗi ghi telemetry bằng trigger DB: ACK đầu tiên `retryable/storage_unavailable`, không có row; sau khi gỡ trigger, retry cùng bytes/event ID nhận `stored` hoặc `duplicate` và có đúng một row. SQLite focused và PostgreSQL recovery runner PASS. Test quan sát ACK đầu tiên, không giám sát liên tục mọi ACK trong suốt khoảng lỗi. Assertion failed-publish cũng giữ đúng status trước đó (`pending` hoặc đã `dispatched`) thay vì giả định luôn `pending`.
 
