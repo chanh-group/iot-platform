@@ -39,6 +39,7 @@ else
     run_case max_inflight_per_client_limits_unacknowledged_qos1_deliveries_postgres
     run_case subscription_limit_is_enforced_by_the_listener_postgres
     run_case persistent_session_reconnects_then_expires_postgres
+    run_case broker_restart_discards_persistent_sessions_postgres
     run_case retained_last_will_is_replayed_after_ungraceful_disconnect_postgres
     run_case topic_level_limit_is_enforced_by_the_listener_postgres
     run_case packet_limit_is_enforced_by_the_listener_postgres

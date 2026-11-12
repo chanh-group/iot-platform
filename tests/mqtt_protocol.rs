@@ -35,7 +35,8 @@ mod protocol_postgres {
         pub addr: SocketAddr,
         pub device: Device,
         pub config: std::path::PathBuf,
-        _child: ChildGuard,
+        http_addr: SocketAddr,
+        child: ChildGuard,
         _dir: TempDir,
     }
 
@@ -45,6 +46,62 @@ mod protocol_postgres {
         fn drop(&mut self) {
             let _ = self.0.kill();
             let _ = self.0.wait();
+        }
+    }
+
+    impl ChildGuard {
+        fn stop(&mut self) {
+            let status = Command::new("kill")
+                .args(["-TERM", &self.0.id().to_string()])
+                .status()
+                .expect("send graceful server shutdown");
+            assert!(status.success(), "failed to send SIGTERM to server");
+            let status = self.0.wait().expect("wait for graceful server shutdown");
+            assert!(
+                status.success(),
+                "server did not shut down cleanly: {status}"
+            );
+        }
+    }
+
+    impl Fixture {
+        pub async fn restart(&mut self) {
+            self.child.stop();
+            let url = std::env::var("IOT_TEST_POSTGRES_URL").expect("runner PostgreSQL URL");
+            let child = Command::new(env!("CARGO_BIN_EXE_iot-server"))
+                .args(["run", "--config"])
+                .arg(&self.config)
+                .env("IOT_TEST_POSTGRES_URL", &url)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("restart server");
+            self.child = ChildGuard(child);
+
+            let client = reqwest::Client::new();
+            let base = format!("http://{}", self.http_addr);
+            let mut ready = false;
+            for _ in 0..100 {
+                assert!(
+                    self.child
+                        .0
+                        .try_wait()
+                        .expect("check restarted server")
+                        .is_none(),
+                    "restarted server exited"
+                );
+                if client
+                    .get(format!("{base}/readyz"))
+                    .send()
+                    .await
+                    .is_ok_and(|response| response.status().is_success())
+                {
+                    ready = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert!(ready, "restarted server did not become ready");
         }
     }
 
@@ -205,6 +262,9 @@ mod protocol_postgres {
             addr: format!("127.0.0.1:{mqtt_port}")
                 .parse()
                 .expect("MQTT address"),
+            http_addr: format!("127.0.0.1:{http_port}")
+                .parse()
+                .expect("HTTP address"),
             device: Device {
                 id: body["device"]["id"].as_str().expect("device id").to_owned(),
                 token: body["credential"]["token"]
@@ -212,7 +272,7 @@ mod protocol_postgres {
                     .expect("device token")
                     .to_owned(),
             },
-            _child: child,
+            child,
             config,
             _dir: dir,
         }
@@ -878,6 +938,38 @@ async fn broker_restart_discards_persistent_sessions() {
     app.restart_mqtt().await;
     let (_client, _eventloop, present) =
         mqtt_connect(app.mqtt_addr, &device.id, &device.id, &device.token, false).await;
+    assert!(
+        !present,
+        "broker sessions are in-memory and must not survive restart"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture; run tests/protocol_postgres.sh"]
+async fn broker_restart_discards_persistent_sessions_postgres() {
+    let mut fixture = protocol_postgres::start("protocol-restart", "", "").await;
+    let filter = format!("devices/{}/data/#", fixture.device.id);
+    let (client, mut eventloop, _) = mqtt_connect(
+        fixture.addr,
+        &fixture.device.id,
+        &fixture.device.id,
+        &fixture.device.token,
+        false,
+    )
+    .await;
+    mqtt_subscribe(&client, &mut eventloop, &filter, QoS::AtLeastOnce).await;
+    drop(client);
+    drop(eventloop);
+
+    fixture.restart().await;
+    let (_client, _eventloop, present) = mqtt_connect(
+        fixture.addr,
+        &fixture.device.id,
+        &fixture.device.id,
+        &fixture.device.token,
+        false,
+    )
+    .await;
     assert!(
         !present,
         "broker sessions are in-memory and must not survive restart"

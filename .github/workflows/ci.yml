@@ -69,6 +69,7 @@ jobs:
           sh tests/acl_postgres.sh
           sh tests/protocol_postgres.sh
           sh tests/mqtt_auth_postgres.sh
+          sh tests/device_api_postgres.sh
 
   frontend:
     runs-on: ubuntu-24.04

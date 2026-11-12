@@ -1,11 +1,17 @@
 mod common;
 
 use std::time::Duration;
+use std::{
+    net::TcpListener,
+    process::{Child, Command, Stdio},
+};
 
 use common::{TestApp, mqtt_connect, mqtt_connect_refused, mqtt_wait_closed};
 use iot_server::core::auth;
 use rumqttc::ConnectReturnCode;
 use serde_json::{Value, json};
+use sqlx::PgPool;
+use tempfile::TempDir;
 
 async fn admin_client(app: &TestApp, username: &str) -> reqwest::Client {
     app.create_admin(username, "device-test-password").await;
@@ -444,10 +450,30 @@ async fn device_reads_use_live_presence_and_bound_pagination() {
             .is_success()
     );
 
+    assert_device_read_pagination(
+        &http,
+        &app.base,
+        app.mqtt_addr,
+        &first.id,
+        &first.token,
+        &second.id,
+    )
+    .await;
+}
+
+async fn assert_device_read_pagination(
+    http: &reqwest::Client,
+    server_base: &str,
+    mqtt_addr: std::net::SocketAddr,
+    first_id: &str,
+    first_token: &str,
+    second_id: &str,
+) {
+    let base = format!("{server_base}/api/v1/devices");
     let (_mqtt, _events, _) =
-        common::mqtt_connect(app.mqtt_addr, &first.id, &first.id, &first.token, true).await;
+        common::mqtt_connect(mqtt_addr, first_id, first_id, first_token, true).await;
     let device: Value = http
-        .get(format!("{base}/{}", first.id))
+        .get(format!("{base}/{first_id}"))
         .send()
         .await
         .unwrap()
@@ -457,7 +483,7 @@ async fn device_reads_use_live_presence_and_bound_pagination() {
     assert_eq!(device["online"], true);
     assert_eq!(device["name"], "first-sensor");
     assert!(device["credential"]["id"].is_string());
-    assert!(!device.to_string().contains(&first.token));
+    assert!(!device.to_string().contains(first_token));
     assert!(device["credential"].get("token").is_none());
     let missing = http.get(format!("{base}/missing")).send().await.unwrap();
     assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
@@ -510,7 +536,7 @@ async fn device_reads_use_live_presence_and_bound_pagination() {
         .await
         .unwrap();
     assert_eq!(filtered["items"].as_array().unwrap().len(), 1);
-    assert_eq!(filtered["items"][0]["id"], second.id);
+    assert_eq!(filtered["items"][0]["id"], second_id);
     assert_eq!(
         http.get(&base)
             .query(&[("limit", "201")])
@@ -520,4 +546,194 @@ async fn device_reads_use_live_presence_and_bound_pagination() {
             .status(),
         reqwest::StatusCode::BAD_REQUEST
     );
+}
+
+#[tokio::test]
+#[ignore = "run through tests/device_api_postgres.sh"]
+async fn device_reads_use_live_presence_and_bound_pagination_postgres() {
+    let fixture = DevicePostgresFixture::start().await;
+    let http = fixture.http.clone();
+    let unauthenticated = http
+        .get(format!("{}/api/v1/devices", fixture.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert!(
+        http.post(format!("{}/api/v1/auth/login", fixture.base))
+            .header("X-IoT-CSRF", "1")
+            .json(&json!({"username":"device-admin", "password":"device-test-password"}))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    let (first_id, first_token) = fixture.create_device("first-sensor", true).await;
+    let (second_id, _) = fixture.create_device("second-sensor", false).await;
+    assert_device_read_pagination(
+        &http,
+        &fixture.base,
+        fixture.mqtt_addr,
+        &first_id,
+        &first_token,
+        &second_id,
+    )
+    .await;
+}
+
+struct DevicePostgresFixture {
+    _server: ChildGuard,
+    _dir: TempDir,
+    base: String,
+    mqtt_addr: std::net::SocketAddr,
+    http: reqwest::Client,
+}
+
+struct ChildGuard(Child);
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl DevicePostgresFixture {
+    async fn start() -> Self {
+        const DATABASE: &str = "iot_test";
+        let url = std::env::var("IOT_TEST_POSTGRES_URL").expect("fixture PostgreSQL URL");
+        let container = std::env::var("IOT_TEST_POSTGRES_CONTAINER").expect("fixture container");
+        let port: u16 = std::env::var("IOT_TEST_POSTGRES_PORT")
+            .expect("mapped port")
+            .parse()
+            .expect("numeric mapped port");
+        let (scheme, rest) = url.split_once("://").expect("PostgreSQL URL scheme");
+        let (authority, query) = rest.split_once('?').expect("PostgreSQL URL query");
+        let (credentials, endpoint) = authority.split_once('@').expect("PostgreSQL credentials");
+        assert_eq!(scheme, "postgresql", "refusing unsafe PostgreSQL URL");
+        assert!(
+            credentials.starts_with("postgres:") && credentials.len() > 9,
+            "refusing unsafe PostgreSQL credentials"
+        );
+        assert_eq!(
+            endpoint,
+            format!("127.0.0.1:{port}/{DATABASE}"),
+            "refusing unsafe PostgreSQL endpoint"
+        );
+        assert_eq!(
+            query, "sslmode=disable",
+            "refusing unsafe PostgreSQL options"
+        );
+        let inspect = |format: &str| {
+            Command::new("docker")
+                .args(["inspect", "--format", format, &container])
+                .output()
+                .expect("docker inspect")
+        };
+        let output = inspect("{{.Config.Image}}");
+        assert!(output.status.success(), "fixture container is unavailable");
+        let image = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            image.trim(),
+            "postgres:18.6-bookworm",
+            "unexpected fixture image"
+        );
+        let label =
+            String::from_utf8(inspect("{{ index .Config.Labels \"io.iot.test-fixture\" }}").stdout)
+                .unwrap();
+        assert_eq!(label.trim(), "device-api", "unexpected fixture label");
+        let mapping = String::from_utf8(inspect("{{(index (index .NetworkSettings.Ports \"5432/tcp\") 0).HostIp}}:{{(index (index .NetworkSettings.Ports \"5432/tcp\") 0).HostPort}}").stdout).unwrap();
+        assert_eq!(
+            mapping.trim(),
+            format!("127.0.0.1:{port}"),
+            "unexpected fixture port mapping"
+        );
+        let pool = PgPool::connect(&url)
+            .await
+            .expect("connect fixture database");
+        let (database, schema): (String, String) =
+            sqlx::query_as("SELECT current_database(), current_schema()")
+                .fetch_one(&pool)
+                .await
+                .expect("verify database before migration");
+        assert_eq!(database, DATABASE, "refusing non-fixture database");
+        assert_eq!(schema, "public", "refusing non-fixture schema");
+        pool.close().await;
+        let dir = tempfile::tempdir().expect("temp config directory");
+        let http = free_port();
+        let mqtt = free_port();
+        let config = dir.path().join("conf.toml");
+        std::fs::write(&config, format!("config_version=1\n[server]\ndata_dir='./data'\n[http]\nlisten='127.0.0.1:{http}'\n[mqtt]\nlisten='127.0.0.1:{mqtt}'\n[database]\nurl_env='IOT_TEST_POSTGRES_URL'\n")).unwrap();
+        let binary = env!("CARGO_BIN_EXE_iot-server");
+        assert!(
+            Command::new(binary)
+                .args(["migrate", "--config"])
+                .arg(&config)
+                .env("IOT_TEST_POSTGRES_URL", &url)
+                .status()
+                .expect("migrate")
+                .success()
+        );
+        let password = dir.path().join("password");
+        std::fs::write(&password, "device-test-password\n").unwrap();
+        assert!(
+            Command::new(binary)
+                .args(["admin", "create", "--username", "device-admin", "--config"])
+                .arg(&config)
+                .args(["--password-file"])
+                .arg(&password)
+                .env("IOT_TEST_POSTGRES_URL", &url)
+                .status()
+                .expect("create admin")
+                .success()
+        );
+        let server = ChildGuard(
+            Command::new(binary)
+                .args(["run", "--config"])
+                .arg(config)
+                .env("IOT_TEST_POSTGRES_URL", url)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("start server"),
+        );
+        let base = format!("http://127.0.0.1:{http}");
+        common::wait_ready(&reqwest::Client::new(), &base).await;
+        Self {
+            _server: server,
+            _dir: dir,
+            base,
+            mqtt_addr: format!("127.0.0.1:{mqtt}").parse().unwrap(),
+            http: reqwest::Client::builder()
+                .cookie_store(true)
+                .build()
+                .unwrap(),
+        }
+    }
+
+    async fn create_device(&self, name: &str, enabled: bool) -> (String, String) {
+        let response: Value = self
+            .http
+            .post(format!("{}/api/v1/devices", self.base))
+            .header("X-IoT-CSRF", "1")
+            .json(&json!({"name":name,"enabled":enabled}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        (
+            response["device"]["id"].as_str().unwrap().to_owned(),
+            response["credential"]["token"].as_str().unwrap().to_owned(),
+        )
+    }
+}
+
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
