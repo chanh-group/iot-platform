@@ -19,43 +19,86 @@ const WAIT: Duration = Duration::from_secs(5);
 async fn valid_token_connects_and_marks_presence() {
     let server = TestApp::start().await;
     let device = server.create_device("sensor-ok", true).await;
-
-    let (client, eventloop, session_present) = mqtt_connect(
+    let presence = server.presence.clone();
+    let online_id = device.id.clone();
+    let pool = server.pool.clone();
+    let last_seen_id = device.id.clone();
+    valid_token_presence_body(
         server.mqtt_addr,
         &device.id,
+        &device.token,
+        move || {
+            let presence = presence.clone();
+            let id = online_id.clone();
+            async move {
+                presence
+                    .is_online(&id)
+                    .expect("presence state should remain healthy")
+            }
+        },
+        move || {
+            let pool = pool.clone();
+            let id = last_seen_id.clone();
+            async move {
+                sqlx::query_scalar("SELECT last_seen_at FROM devices WHERE id = ?")
+                    .bind(id)
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap()
+            }
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture; run tests/mqtt_auth_postgres.sh"]
+async fn valid_token_connects_and_marks_presence_postgres() {
+    let server = postgres::PostgresApp::start().await;
+    let device = server.create_device("sensor-ok").await;
+    let online_server = server.clone_for_queries();
+    let online_id = device.id.clone();
+    let last_seen_server = server.clone_for_queries();
+    let last_seen_id = device.id.clone();
+    valid_token_presence_body(
+        server.mqtt_addr(),
         &device.id,
         &device.token,
-        true,
-    )
-    .await;
-    assert!(!session_present);
-
-    wait_until(
-        || {
-            server
-                .presence
-                .is_online(&device.id)
-                .expect("presence state should remain healthy")
+        move || {
+            let server = online_server.clone();
+            let id = online_id.clone();
+            async move { server.is_online(&id).await }
         },
-        WAIT,
-        "device to become online",
+        move || {
+            let server = last_seen_server.clone();
+            let id = last_seen_id.clone();
+            async move { server.last_seen(&id).await }
+        },
     )
     .await;
-    assert!(server.last_seen(&device.id).await.is_some());
+}
+
+async fn valid_token_presence_body<Online, OnlineFuture, LastSeen, LastSeenFuture>(
+    address: std::net::SocketAddr,
+    device_id: &str,
+    token: &str,
+    is_online: Online,
+    last_seen: LastSeen,
+) where
+    Online: Fn() -> OnlineFuture,
+    OnlineFuture: std::future::Future<Output = bool>,
+    LastSeen: Fn() -> LastSeenFuture,
+    LastSeenFuture: std::future::Future<Output = Option<i64>>,
+{
+    let (client, eventloop, session_present) =
+        mqtt_connect(address, device_id, device_id, token, true).await;
+    assert!(!session_present);
+    wait_online(&is_online, true, "device to become online").await;
+    assert!(last_seen().await.is_some());
 
     drop(client);
     drop(eventloop);
-    wait_until(
-        || {
-            !server
-                .presence
-                .is_online(&device.id)
-                .expect("presence state should remain healthy")
-        },
-        WAIT,
-        "device to become offline",
-    )
-    .await;
+    wait_online(&is_online, false, "device to become offline").await;
 }
 
 #[tokio::test]
