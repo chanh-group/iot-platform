@@ -10,6 +10,7 @@ use iot_server::config::schema::MqttConfig;
 use rumqttc::{
     AsyncClient, ConnectReturnCode, Event as MqttEvent, LastWill, Packet, QoS, SubscribeReasonCode,
 };
+use sqlx::{PgPool, SqlitePool};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -436,12 +437,79 @@ async fn max_inflight_per_client_limits_unacknowledged_qos1_deliveries() {
         ..MqttConfig::default()
     };
     let app = TestApp::builder().mqtt_config(config).start().await;
-    assert_eq!(app.mqtt_config.max_inflight_per_client, 1);
     let device = app.create_device("protocol-inflight", true).await;
-    let ack_topic = format!("devices/{}/telemetry/ack", device.id);
-    let telemetry_topic = format!("devices/{}/telemetry", device.id);
+    max_inflight_round_trip(
+        app.mqtt_addr,
+        &device.id,
+        &device.token,
+        app.mqtt_config.max_inflight_per_client,
+        TelemetryCounter::Sqlite(&app.pool),
+    )
+    .await;
+}
 
-    let mut options = mqtt_options(app.mqtt_addr, &device.id, &device.id, &device.token, true);
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture; run tests/protocol_postgres.sh"]
+async fn max_inflight_per_client_limits_unacknowledged_qos1_deliveries_postgres() {
+    let fixture =
+        protocol_postgres::start("protocol-inflight", "max_inflight_per_client=1\n", "").await;
+    let url = std::env::var("IOT_TEST_POSTGRES_URL").expect("runner PostgreSQL URL");
+    let pool = PgPool::connect(&url)
+        .await
+        .expect("connect guarded fixture database");
+    let configured = iot_server::config::load(&fixture.config)
+        .unwrap()
+        .config
+        .mqtt
+        .max_inflight_per_client;
+    max_inflight_round_trip(
+        fixture.addr,
+        &fixture.device.id,
+        &fixture.device.token,
+        configured,
+        TelemetryCounter::Postgres(&pool),
+    )
+    .await;
+    pool.close().await;
+}
+
+enum TelemetryCounter<'a> {
+    Sqlite(&'a SqlitePool),
+    Postgres(&'a PgPool),
+}
+
+impl TelemetryCounter<'_> {
+    async fn count(&self, device_id: &str) -> i64 {
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar("SELECT COUNT(*) FROM telemetry_events WHERE device_id = ?")
+                    .bind(device_id)
+                    .fetch_one(*pool)
+                    .await
+                    .unwrap()
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_scalar("SELECT COUNT(*) FROM telemetry_events WHERE device_id = $1")
+                    .bind(device_id)
+                    .fetch_one(*pool)
+                    .await
+                    .unwrap()
+            }
+        }
+    }
+}
+
+async fn max_inflight_round_trip(
+    address: std::net::SocketAddr,
+    device_id: &str,
+    token: &str,
+    max_inflight_per_client: u64,
+    counter: TelemetryCounter<'_>,
+) {
+    assert_eq!(max_inflight_per_client, 1);
+    let ack_topic = format!("devices/{device_id}/telemetry/ack");
+    let telemetry_topic = format!("devices/{device_id}/telemetry");
+    let mut options = mqtt_options(address, device_id, device_id, token, true);
     options.set_manual_acks(true);
     let (client, mut eventloop) = AsyncClient::new(options, 32);
     assert!(matches!(
@@ -469,12 +537,7 @@ async fn max_inflight_per_client_limits_unacknowledged_qos1_deliveries() {
 
     tokio::time::timeout(WAIT, async {
         loop {
-            let count: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM telemetry_events WHERE device_id = ?")
-                    .bind(&device.id)
-                    .fetch_one(&app.pool)
-                    .await
-                    .unwrap();
+            let count = counter.count(device_id).await;
             if count == 3 {
                 break;
             }
