@@ -25,6 +25,7 @@ run_case() (
     [ "$(docker inspect --format '{{.State.Health.Status}}' "$name")" = healthy ]
     IOT_TEST_POSTGRES_URL="postgresql://postgres:${password}@127.0.0.1:${port}/iot_test?sslmode=disable" \
     IOT_TEST_POSTGRES_CONTAINER="$name" IOT_TEST_POSTGRES_PORT="$port" \
-        cargo test --manifest-path "$repo_root/Cargo.toml" --test device_api device_reads_use_live_presence_and_bound_pagination_postgres -- --ignored --exact --nocapture
+        cargo test --manifest-path "$repo_root/Cargo.toml" --test device_api "$1" -- --ignored --exact --nocapture
 )
-run_case
+run_case device_reads_use_live_presence_and_bound_pagination_postgres
+run_case pagination_orders_equal_timestamps_by_descending_id_postgres

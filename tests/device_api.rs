@@ -392,7 +392,6 @@ async fn pagination_orders_equal_timestamps_by_descending_id() {
         .execute(&app.pool)
         .await
         .unwrap();
-    expected.sort_by(|a, b| b.cmp(a));
     let http = app.client();
     assert!(
         http.post(format!("{}/api/v1/auth/login", app.base))
@@ -404,7 +403,48 @@ async fn pagination_orders_equal_timestamps_by_descending_id() {
             .status()
             .is_success()
     );
-    let url = format!("{}/api/v1/devices", app.base);
+    assert_equal_timestamp_page_order(&http, &app.base, &expected).await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture; run tests/device_api_postgres.sh"]
+async fn pagination_orders_equal_timestamps_by_descending_id_postgres() {
+    let fixture = DevicePostgresFixture::start().await;
+    assert!(
+        fixture
+            .http
+            .post(format!("{}/api/v1/auth/login", fixture.base))
+            .header("X-IoT-CSRF", "1")
+            .json(&json!({"username":"device-admin", "password":"device-test-password"}))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    let mut expected = Vec::new();
+    for name in ["page-a", "page-b", "page-c"] {
+        expected.push(fixture.create_device(name, true).await.0);
+    }
+    let url = std::env::var("IOT_TEST_POSTGRES_URL").unwrap();
+    let pool = PgPool::connect(&url).await.unwrap();
+    sqlx::query("UPDATE devices SET created_at = 123456789 WHERE id = ANY($1)")
+        .bind(&expected)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    assert_equal_timestamp_page_order(&fixture.http, &fixture.base, &expected).await;
+}
+
+async fn assert_equal_timestamp_page_order(
+    http: &reqwest::Client,
+    base: &str,
+    expected: &[String],
+) {
+    let mut expected = expected.to_vec();
+    expected.sort_by(|a, b| b.cmp(a));
+    let url = format!("{base}/api/v1/devices");
     let mut cursor = None;
     let mut actual = Vec::new();
     for _ in 0..3 {

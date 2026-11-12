@@ -113,7 +113,7 @@ MQTT ACL suite gốc dùng chung body/assertions cho SQLite và PostgreSQL subpr
 
 Protocol: test gốc QoS 0/1/2 với wildcard, giới hạn topic level/packet, inflight và subscription chạy body/assertions chung trên SQLite/PostgreSQL. Packet-limit PostgreSQL đặt `telemetry.max_payload_bytes=1024` để config hợp lệ với `mqtt.max_packet_bytes=1024`.
 
-Device API: pagination test PostgreSQL dùng chung assertions với SQLite, giữ order/cursor/filter/presence/token-redaction checks; focused SQLite và `sh tests/device_api_postgres.sh` đều 1 passed. Mutation/audit/error cases khác của `device_api.rs` chưa port toàn bộ.
+Device API: hai body PostgreSQL dùng chung assertions với SQLite: live presence/bounded pagination và tie-break cursor pagination với ba device có cùng `created_at`. Focused SQLite và `sh tests/device_api_postgres.sh` đều pass (mỗi case 1 passed). Mutation/audit/error cases khác của `device_api.rs` chưa port toàn bộ.
 
 Persistent session reconnect/expiry, broker restart và retained last-will cũng đã được port: focused SQLite và PostgreSQL fixture PASS; broker-restart giữ assertion offline trước restart, discarded session-present sau restart, và device online lại sau reconnect. Session expiry PostgreSQL dùng broker in-process `start_with_ingest` cùng repository fixture và TTL test 500 ms; listener subprocess production vẫn giữ cấu hình hợp lệ, không kiểm tra TTL dưới minimum 60 giây. Còn các protocol cases khác chưa port.
 
