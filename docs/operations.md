@@ -292,7 +292,123 @@ Tạo snapshot PostgreSQL nhất quán khi app đang chạy (chỉ database):
 
 Script kiểm tra container PostgreSQL thuộc đúng Compose project hiện tại, dùng secret file trong container, tạo custom-format dump bằng `pg_dump`, ghi version/database và SHA-256 manifest vào staging directory mode `0700`, rồi publish atomic. Destination đã tồn tại thì bị từ chối; lỗi dump không publish backup dở. Không truyền URL/password qua argv hoặc log. Giữ dump, manifest và secret theo chính sách lưu trữ/khôi phục của operator; dump chứa toàn bộ dữ liệu nhạy cảm.
 
-**Phạm vi:** dump chỉ chứa PostgreSQL, không chứa `runtime.toml` trong app volume. Giữ một bản sao được kiểm tra quyền và checksum của app data volume riêng; để lấy cặp snapshot nhất quán, dừng app trước khi sao chép volume và chạy dump, không cho process khác sửa runtime config trong lúc đó. Không coi DB dump riêng là backup đầy đủ runtime revision. Drill `sh tests/postgres_compose.sh` kiểm tra snapshot runtime riêng và khôi phục vào app volume mới; đây chưa thay thế các gate hỗ trợ PostgreSQL còn mở.
+**Phạm vi:** dump chỉ chứa PostgreSQL, không chứa `runtime.toml` trong app volume. Để có cặp snapshot nhất quán, dừng app trước khi dump DB và sao chép `runtime.toml`; không để process khác sửa runtime config hoặc ghi DB trong lúc đó. Không coi DB dump riêng là backup đầy đủ runtime revision. Drill `sh tests/postgres_compose.sh` đã kiểm tra checksum và mode của dump, snapshot runtime riêng, restore database mới và runtime vào app volume mới. Drill giữ nguyên PostgreSQL volume, nên hướng dẫn dưới đây tạo database mới trên PostgreSQL hiện có; chưa chứng minh restore vào PostgreSQL volume mới.
+
+### Snapshot runtime và restore vào app volume mới
+
+Thực hiện từ `deploy/`, với đúng `COMPOSE_PROJECT_NAME`, secret và image của deployment đang dùng. Ví dụ dưới đây dùng project `thingsboardrust-postgres`; thay tên project/database/path bằng giá trị thật. Chạy các bước trong **cùng một shell script** bắt đầu bằng `set -eu`, không dán từng dòng riêng vào shell tương tác; dừng ngay nếu bất kỳ lệnh nào lỗi. Backup chứa dữ liệu nhạy cảm: đặt trên filesystem tin cậy, không đưa vào Git. Checksum chỉ phát hiện lỗi dữ liệu, không xác thực nguồn backup; chỉ restore archive và metadata từ nguồn tin cậy.
+
+1. Dừng app (không dừng PostgreSQL) và xác nhận đã dừng. Lấy tên app volume từ Compose project hiện tại:
+
+   ```sh
+   set -eu
+   umask 077
+   cd /path/to/ThingsBoardRust/deploy
+   export COMPOSE_PROJECT_NAME=thingsboardrust-postgres
+   export IOT_POSTGRES_PASSWORD_FILE="$PWD/secrets/postgres_password"
+   export IOT_DATABASE_NAME=iot
+   ./compose-postgres.sh stop iot-server
+   app_container=$(./compose-postgres.sh ps --all --quiet iot-server)
+   test -n "$app_container"
+   test "$(docker inspect --format '{{.State.Running}}' "$app_container")" = false
+   source_volume="${COMPOSE_PROJECT_NAME}_iot_data"
+   test "$(docker volume inspect --format '{{index .Labels "com.docker.compose.project"}}' "$source_volume")" = "$COMPOSE_PROJECT_NAME"
+   test "$(docker volume inspect --format '{{index .Labels "com.docker.compose.volume"}}' "$source_volume")" = iot_data
+   ```
+
+2. Tạo snapshot runtime với quyền chỉ operator đọc được, lưu mode/owner của runtime file và data directory để khôi phục như trong drill. Ví dụ yêu cầu `runtime.toml` đã tồn tại; nếu file chưa tồn tại, lệnh sẽ dừng và không được coi snapshot là hoàn chỉnh. Chọn một thư mục backup mới; các lệnh từ chối ghi đè nó:
+
+   ```sh
+   backup=/path/to/backups/iot-postgres-2026-11-12
+   mkdir -m 0700 "$backup"
+   mkdir -m 0700 "$backup/runtime"
+   docker run --rm --user 0:0 \
+     --mount "type=volume,source=$source_volume,target=/app/data,readonly" \
+     postgres:18.6-bookworm stat -c '%a:%u:%g' /app/data/runtime.toml > "$backup/runtime/runtime.meta"
+   docker run --rm --user 0:0 \
+     --mount "type=volume,source=$source_volume,target=/app/data,readonly" \
+     postgres:18.6-bookworm stat -c '%a:%u:%g' /app/data > "$backup/runtime/data-dir.meta"
+   docker run --rm --user 0:0 \
+     --mount "type=volume,source=$source_volume,target=/app/data,readonly" \
+     postgres:18.6-bookworm tar -C /app/data -cpf - runtime.toml > "$backup/runtime/runtime.tar"
+   chmod 0600 "$backup/runtime/"*
+   (cd "$backup/runtime" && sha256sum runtime.tar runtime.meta data-dir.meta > SHA256SUMS)
+   chmod 0600 "$backup/runtime/SHA256SUMS"
+   (cd "$backup/runtime" && sha256sum -c SHA256SUMS)
+   stat -c '%a %n' "$backup/runtime" "$backup/runtime/"*
+   ```
+
+   `runtime` phải là mode `700`, mọi file mode `600`. Giữ thư mục backup nguyên trạng; không sửa archive/manifest sau khi tạo. Sau đó tạo dump database bằng helper (nó không dừng app thay operator):
+
+   ```sh
+   ./backup-postgres.sh "$backup/database"
+   (cd "$backup/database" && sha256sum -c SHA256SUMS)
+   ```
+
+   Xác nhận app vẫn dừng trước khi tiếp tục. Nếu bất kỳ lệnh snapshot/backup/verify nào lỗi, không dùng snapshot đó để phục hồi. App chỉ được khởi động lại sau khi restore đã sẵn sàng hoặc đã hủy quy trình có kiểm soát.
+
+3. Restore vào tên database và volume app mới, không đụng database/volume gốc. Lệnh `restore-postgres.sh` xác minh checksum và từ chối database đã tồn tại; volume mới cũng phải chưa tồn tại. Backup database cần PostgreSQL 18 đang chạy trong cùng Compose project. Chọn tên đích duy nhất:
+
+   ```sh
+   restore_db=iot_restore_20261112
+   restore_volume="${COMPOSE_PROJECT_NAME}_iot_data_restore_20261112"
+   if docker volume inspect "$restore_volume" >/dev/null 2>&1; then
+     echo "restore volume already exists; choose a new name" >&2
+     exit 1
+   fi
+   ./restore-postgres.sh "$backup/database" "$restore_db"
+   docker volume create "$restore_volume"
+   (cd "$backup/runtime" && sha256sum -c SHA256SUMS)
+   docker run --rm -i --user 0:0 \
+     --mount "type=volume,source=$restore_volume,target=/restore" \
+     postgres:18.6-bookworm tar -C /restore -xpf - < "$backup/runtime/runtime.tar"
+   IFS=: read -r dir_mode dir_uid dir_gid < "$backup/runtime/data-dir.meta"
+   case "$dir_mode:$dir_uid:$dir_gid" in
+     *[!0-9:]*|:*|*::*|*:) echo "invalid directory metadata" >&2; exit 1 ;;
+   esac
+   docker run --rm --user 0:0 \
+     --mount "type=volume,source=$restore_volume,target=/restore" \
+     postgres:18.6-bookworm sh -ec "chown '$dir_uid:$dir_gid' /restore; chmod '$dir_mode' /restore"
+   runtime_meta=$(docker run --rm --user 0:0 \
+     --mount "type=volume,source=$restore_volume,target=/restore,readonly" \
+     postgres:18.6-bookworm stat -c '%a:%u:%g' /restore/runtime.toml)
+   test "$runtime_meta" = "$(cat "$backup/runtime/runtime.meta")"
+   ```
+
+   Chỉ giải nén archive do operator tạo và đã xác minh checksum. Không tái sử dụng volume đích có sẵn, kể cả khi lần restore trước thất bại. Tạo override Compose trỏ app tới volume mới, đồng thời giữ nguyên PostgreSQL volume hiện tại:
+
+   ```sh
+   restore_override="$PWD/restore-compose-$restore_db.yml"
+   if [ -e "$restore_override" ] || [ -L "$restore_override" ]; then
+     echo "restore override already exists" >&2; exit 1
+   fi
+   set -C
+   cat > "$restore_override" <<EOF
+   services: {}
+   volumes:
+     iot_data:
+       external: true
+       name: $restore_volume
+     postgres_data:
+       external: true
+       name: ${COMPOSE_PROJECT_NAME}_postgres_data
+   EOF
+   set +C
+   IOT_DATABASE_NAME="$restore_db" ./compose-postgres.sh \
+     --file "$restore_override" up -d --force-recreate iot-server
+   curl -fsS http://127.0.0.1:8080/readyz
+   ```
+
+   Kiểm tra login admin, devices/credentials, telemetry history, commands, audit và runtime revision trước khi cho thiết bị ghi lại. Giữ nguyên backup, database gốc và app volume gốc cho tới khi xác minh hoàn tất. `restore-postgres.sh` có thể để lại database đích rỗng/dở dang nếu `pg_restore` lỗi; không đổi sang database đó và không tự động xóa nó.
+
+4. Rollback: dừng app đang dùng dữ liệu restore, giữ nguyên database/volume restore để điều tra. Trỏ lại database và app volume gốc bằng cách bỏ override; không xóa target nào:
+
+   ```sh
+   IOT_DATABASE_NAME="$restore_db" ./compose-postgres.sh stop iot-server
+   IOT_DATABASE_NAME=iot ./compose-postgres.sh up -d --force-recreate iot-server
+   ```
+
+   Lệnh thứ hai dùng app volume gốc từ Compose file chuẩn và database `iot`. Kiểm tra `/readyz`, đăng nhập và đối chiếu dữ liệu trước khi cho thiết bị ghi lại. Rollback này bảo toàn cả database/volume gốc lẫn target restore; không dùng `down -v`.
 
 ### Restore vào database mới
 

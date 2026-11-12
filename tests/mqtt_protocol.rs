@@ -1,6 +1,7 @@
 mod common;
 
 use std::time::Duration;
+use std::{future::Future, sync::Arc, sync::atomic::AtomicBool};
 
 use common::{
     TestApp, mqtt_connect, mqtt_connect_refused, mqtt_next, mqtt_options, mqtt_publish,
@@ -591,8 +592,98 @@ async fn max_inflight_round_trip(
 async fn retained_last_will_is_replayed_after_ungraceful_disconnect() {
     let app = TestApp::start().await;
     let device = app.create_device("protocol-will", true).await;
-    let status = format!("devices/{}/status", device.id);
-    let mut options = mqtt_options(app.mqtt_addr, &device.id, &device.id, &device.token, false);
+    retained_will_round_trip(
+        app.mqtt_addr,
+        &app.presence,
+        &device.id,
+        &device.token,
+        || async { app.retained_count().await },
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture; run tests/protocol_postgres.sh"]
+async fn retained_last_will_is_replayed_after_ungraceful_disconnect_postgres() {
+    let fixture = protocol_postgres::start("protocol-will", "", "").await;
+    let loaded = iot_server::config::load(&fixture.config).unwrap();
+    let storage = iot_server::storage::runtime::StorageRuntime::connect(&loaded)
+        .await
+        .unwrap();
+    let telemetry = &loaded.config.telemetry;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let (ingest, worker) = iot_server::core::telemetry::spawn_worker(
+        storage.repositories.telemetry.clone(),
+        iot_server::core::events::EventBus::new(),
+        telemetry.queue_capacity as usize,
+        telemetry.max_batch_bytes as usize,
+        loaded.runtime_config.clone(),
+        iot_server::core::telemetry::IngestWorkerControl {
+            cancellation: cancel.clone(),
+            readiness: Arc::new(AtomicBool::new(true)),
+        },
+    );
+    let mut config = loaded.config.mqtt.clone();
+    config.listen = "127.0.0.1:0".parse().unwrap();
+    let presence = Arc::new(iot_server::core::presence::Presence::new());
+    let mqtt = iot_server::mqtt::server::MqttServer::start_with_ingest(
+        &config,
+        Arc::new(AtomicBool::new(false)),
+        iot_server::mqtt::server::MqttRepositories {
+            devices: storage.repositories.devices.clone(),
+            commands: storage.repositories.commands.clone(),
+            attributes: storage.repositories.attributes.clone(),
+        },
+        Arc::clone(&presence),
+        (
+            ingest,
+            iot_server::core::telemetry::TelemetryPayload::try_from(telemetry).unwrap(),
+            telemetry.queue_capacity as usize,
+        ),
+    )
+    .await
+    .unwrap();
+    let guard = PostgresMqttGuard {
+        mqtt,
+        cancel,
+        worker,
+    };
+    retained_will_round_trip(
+        guard.mqtt.local_addr(),
+        &presence,
+        &fixture.device.id,
+        &fixture.device.token,
+        || guard.mqtt.retained_count(),
+    )
+    .await;
+}
+
+struct PostgresMqttGuard {
+    mqtt: iot_server::mqtt::server::MqttServer,
+    cancel: tokio_util::sync::CancellationToken,
+    worker: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for PostgresMqttGuard {
+    fn drop(&mut self) {
+        self.mqtt.abort();
+        self.cancel.cancel();
+        self.worker.abort();
+    }
+}
+
+async fn retained_will_round_trip<F, Fut>(
+    address: std::net::SocketAddr,
+    presence: &iot_server::core::presence::Presence,
+    device_id: &str,
+    token: &str,
+    retained_count: F,
+) where
+    F: Fn() -> Fut,
+    Fut: Future<Output = isize>,
+{
+    let status = format!("devices/{device_id}/status");
+    let mut options = mqtt_options(address, device_id, device_id, token, false);
     options.set_last_will(LastWill::new(&status, b"offline", QoS::AtLeastOnce, true));
     let (client, mut eventloop) = AsyncClient::new(options, 16);
     assert!(matches!(
@@ -604,8 +695,8 @@ async fn retained_last_will_is_replayed_after_ungraceful_disconnect() {
     drop(eventloop);
     wait_until(
         || {
-            !app.presence
-                .is_online(&device.id)
+            !presence
+                .is_online(device_id)
                 .expect("presence state should remain healthy")
         },
         WAIT,
@@ -613,15 +704,14 @@ async fn retained_last_will_is_replayed_after_ungraceful_disconnect() {
     )
     .await;
     tokio::time::timeout(WAIT, async {
-        while app.retained_count().await != 1 {
+        while retained_count().await != 1 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .expect("the broker should store the retained will");
 
-    let (client, mut eventloop, _) =
-        mqtt_connect(app.mqtt_addr, &device.id, &device.id, &device.token, true).await;
+    let (client, mut eventloop, _) = mqtt_connect(address, device_id, device_id, token, true).await;
     assert_eq!(
         mqtt_subscribe(&client, &mut eventloop, &status, QoS::AtLeastOnce).await,
         SubscribeReasonCode::Success(QoS::AtLeastOnce)
@@ -629,6 +719,7 @@ async fn retained_last_will_is_replayed_after_ungraceful_disconnect() {
     let will = mqtt_wait_publish(&mut eventloop, WAIT).await;
     assert_eq!(will.topic, status);
     assert_eq!(will.payload.as_ref(), b"offline");
+    assert_eq!(will.qos, QoS::AtLeastOnce);
     assert!(will.retain);
 }
 

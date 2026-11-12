@@ -97,6 +97,8 @@ Giới hạn của drill trước: backup PostgreSQL chỉ chứa DB/metadata, c
 
 **Fresh-volume drill (2026-11-12):** `sh tests/postgres_compose.sh` PASS: dừng app, snapshot `runtime.toml` riêng và verify SHA-256, dump DB, restore DB cùng runtime vào volume app mới; verify lại runtime revision, API và MQTT. Dump sai format nhưng checksum hợp lệ gây `pg_restore` lỗi sau `createdb`; test xác nhận DB nguồn không đổi, đích dở dang và chỉ dọn DB fixture. Không giả định dump PostgreSQL chứa runtime config; chưa mô phỏng power-loss/disk-full.
 
+Runbook thủ công trong `docs/operations.md` bổ sung các bước snapshot/restore/rollback; sáu khối shell đã qua `sh -n` nhưng chưa được chạy nguyên văn end-to-end. Không dùng syntax check thay cho drill vận hành.
+
 Sau review độc lập, fixture Compose dùng project UUID và kiểm tra tài nguyên trùng trước cleanup; tên DB khởi tạo mặc định theo tên app khi tạo volume mới. Smoke đã chạy lại thành công. `cargo deny check` PASS; `cargo audit` PASS với hai allowed unmaintained warnings hiện hành (`atomic-polyfill`, `instant`).
 
 `sh tests/postgres_migration_failure.sh` PASS: URL guard 1 passed, migration checksum conflict 1 passed trên container PostgreSQL fixture riêng; app exit 4, hai port khả dụng sau exit và probe không thấy listener trong lúc chạy. Giới hạn: polling có thể bỏ sót listener mở rất ngắn giữa hai lần probe.
@@ -114,6 +116,8 @@ Protocol: ba test gốc dùng cùng body/assertions cho SQLite và PostgreSQL: Q
 Persistent session reconnect/expiry cũng dùng body gốc cho hai backend: focused SQLite 1 passed; `sh tests/protocol_postgres.sh` hiện 4 passed, gồm QoS, session expiry và hai test giới hạn. PostgreSQL session expiry dùng broker in-process `start_with_ingest` cùng repository fixture và TTL test 500 ms; listener subprocess production vẫn giữ cấu hình hợp lệ, không được kiểm tra với TTL dưới minimum 60 giây. Các case session-generation khác vẫn mở.
 
 Test gốc `max_inflight_per_client_limits_unacknowledged_qos1_deliveries` dùng chung body cho SQLite/PostgreSQL, với `max_inflight_per_client=1` và truy vấn row theo device; focused SQLite và `sh tests/protocol_postgres.sh max_inflight_per_client_limits_unacknowledged_qos1_deliveries_postgres` đều 1 passed. Runner mặc định giữ bốn case trước và thêm case này.
+
+Retained last-will dùng chung assertions gốc: focused SQLite và `sh tests/protocol_postgres.sh retained_last_will_is_replayed_after_ungraceful_disconnect_postgres` đều 1 passed. PostgreSQL chạy broker in-process `start_with_ingest` cùng adapter fixture; test kiểm tra presence, retained count và replay. Đây không thay thế các test protocol còn lại.
 
 MQTT auth: toàn bộ bốn test gốc chạy cùng body trên SQLite/PostgreSQL: từ chối MQTT 3.1/5, duplicate client ID/session generation, valid token/presence và credential-refusal matrix. SQLite focused PASS; `sh tests/mqtt_auth_postgres.sh` 4 passed với container riêng từng test. Matrix giữ bảy trường hợp từ chối, kiểm tra không PUBACK/không ghi telemetry, token sau rotate hoạt động và presence drain sau khi xác nhận online.
 
