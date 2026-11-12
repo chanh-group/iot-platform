@@ -371,15 +371,84 @@ async fn command_list_paginates_filters_and_detail_is_scoped_to_contract_fields(
     let app = TestApp::start().await;
     let device = app.create_device("command-list", true).await;
     let http = admin_client(&app, "command-list-admin").await;
+    let ids = create_three_commands(&http, &app.base, &device.id).await;
+    sqlx::query("UPDATE commands SET created_at = ? WHERE device_id = ?")
+        .bind(auth::now_ms() - 1_000)
+        .bind(&device.id)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE commands SET status = 'dispatched', dispatched_at = ? WHERE id = ?")
+        .bind(auth::now_ms())
+        .bind(&ids[0])
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let expected_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM commands WHERE device_id = ? ORDER BY created_at DESC, id DESC",
+    )
+    .bind(&device.id)
+    .fetch_all(&app.pool)
+    .await
+    .unwrap();
+    assert_command_list_contract(&http, &app.base, &device.id, &ids, &expected_ids).await;
+}
+
+#[tokio::test]
+#[ignore = "requires tests/command_list_postgres.sh"]
+async fn command_list_paginates_filters_and_detail_is_scoped_to_contract_fields_postgres() {
+    let app = mqtt_auth_postgres::PostgresApp::start().await;
+    let device = app.create_device("command-list").await;
+    let http = postgres_admin_client(app.admin_cookie());
+    let ids = create_three_commands(&http, app.base_url(), &device.id).await;
+    let pool = sqlx::PgPool::connect(&std::env::var("IOT_TEST_POSTGRES_URL").unwrap())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE commands SET created_at = $1 WHERE device_id = $2")
+        .bind(auth::now_ms() - 1_000)
+        .bind(&device.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE commands SET status = 'dispatched', dispatched_at = $1 WHERE id = $2")
+        .bind(auth::now_ms())
+        .bind(&ids[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+    let expected_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM commands WHERE device_id = $1 ORDER BY created_at DESC, id DESC",
+    )
+    .bind(&device.id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_command_list_contract(&http, app.base_url(), &device.id, &ids, &expected_ids).await;
+}
+
+fn postgres_admin_client(cookie: &str) -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(reqwest::header::COOKIE, cookie.parse().unwrap());
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap()
+}
+
+async fn create_three_commands(http: &reqwest::Client, base: &str, device_id: &str) -> Vec<String> {
     let mut ids = Vec::new();
     for index in 0..3 {
-        let response = create_command(
-            &http,
-            &app,
-            &device.id,
-            &format!(r#"{{"name":"reboot","idempotency_key":"key-{index}"}}"#),
-        )
-        .await;
+        let response = http
+            .post(format!("{base}/api/v1/devices/{device_id}/commands"))
+            .header("X-IoT-CSRF", "1")
+            .header("X-Request-ID", "command-api-123")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(format!(
+                r#"{{"name":"reboot","idempotency_key":"key-{index}"}}"#
+            ))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
         ids.push(
             response.json::<Value>().await.unwrap()["command_id"]
@@ -388,14 +457,17 @@ async fn command_list_paginates_filters_and_detail_is_scoped_to_contract_fields(
                 .to_owned(),
         );
     }
-    sqlx::query("UPDATE commands SET created_at = ? WHERE device_id = ?")
-        .bind(auth::now_ms() - 1_000)
-        .bind(&device.id)
-        .execute(&app.pool)
-        .await
-        .unwrap();
+    ids
+}
 
-    let list_url = format!("{}/api/v1/devices/{}/commands", app.base, device.id);
+async fn assert_command_list_contract(
+    http: &reqwest::Client,
+    base: &str,
+    device_id: &str,
+    ids: &[String],
+    expected_ids: &[String],
+) {
+    let list_url = format!("{base}/api/v1/devices/{device_id}/commands");
     let first: Value = http
         .get(&list_url)
         .query(&[("limit", "2")])
@@ -424,21 +496,7 @@ async fn command_list_paginates_filters_and_detail_is_scoped_to_contract_fields(
         .map(|item| item["id"].as_str().unwrap().to_owned())
         .collect();
     page_ids.push(second["items"][0]["id"].as_str().unwrap().to_owned());
-    let expected_ids: Vec<String> = sqlx::query_scalar(
-        "SELECT id FROM commands WHERE device_id = ? ORDER BY created_at DESC, id DESC",
-    )
-    .bind(&device.id)
-    .fetch_all(&app.pool)
-    .await
-    .unwrap();
     assert_eq!(page_ids, expected_ids);
-
-    sqlx::query("UPDATE commands SET status = 'dispatched', dispatched_at = ? WHERE id = ?")
-        .bind(auth::now_ms())
-        .bind(&ids[0])
-        .execute(&app.pool)
-        .await
-        .unwrap();
     let filtered: Value = http
         .get(&list_url)
         .query(&[("status", "dispatched")])
@@ -464,7 +522,7 @@ async fn command_list_paginates_filters_and_detail_is_scoped_to_contract_fields(
     );
 
     let detail: Value = http
-        .get(format!("{}/api/v1/commands/{}", app.base, ids[0]))
+        .get(format!("{base}/api/v1/commands/{}", ids[0]))
         .send()
         .await
         .unwrap()
@@ -477,7 +535,7 @@ async fn command_list_paginates_filters_and_detail_is_scoped_to_contract_fields(
     assert!(detail.get("request_sha256").is_none());
 
     let missing = http
-        .get(format!("{}/api/v1/commands/{}", app.base, Uuid::now_v7()))
+        .get(format!("{base}/api/v1/commands/{}", Uuid::now_v7()))
         .send()
         .await
         .unwrap();
@@ -490,7 +548,7 @@ async fn command_list_paginates_filters_and_detail_is_scoped_to_contract_fields(
     let missing_device = http
         .get(format!(
             "{}/api/v1/devices/019c0000-0000-7000-8000-000000000000/commands",
-            app.base
+            base
         ))
         .send()
         .await

@@ -75,6 +75,7 @@ jobs:
           sh tests/auth_postgres.sh
           sh tests/overview_postgres.sh
           sh tests/command_api_postgres.sh
+          sh tests/command_list_postgres.sh
 
   frontend:
     runs-on: ubuntu-24.04
