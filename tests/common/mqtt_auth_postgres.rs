@@ -15,6 +15,7 @@ pub struct PostgresApp {
     base: String,
     mqtt_addr: SocketAddr,
     cookie: String,
+    pool: sqlx::PgPool,
     _child: ChildGuard,
     _dir: TempDir,
 }
@@ -144,6 +145,9 @@ impl PostgresApp {
             base,
             mqtt_addr: format!("127.0.0.1:{mqtt_port}").parse().unwrap(),
             cookie,
+            pool: sqlx::PgPool::connect(&url)
+                .await
+                .expect("connect query pool"),
             _child: child,
         }
     }
@@ -182,6 +186,43 @@ impl PostgresApp {
         assert!(response.status().is_success(), "overview query failed");
         let body: serde_json::Value = response.json().await.expect("overview");
         assert_eq!(body["devices"]["online"], 0);
+    }
+
+    pub fn clone_for_queries(&self) -> PostgresQueries {
+        PostgresQueries {
+            base: self.base.clone(),
+            cookie: self.cookie.clone(),
+            pool: self.pool.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct PostgresQueries {
+    base: String,
+    cookie: String,
+    pool: sqlx::PgPool,
+}
+
+impl PostgresQueries {
+    pub async fn is_online(&self, device_id: &str) -> bool {
+        let response = reqwest::Client::new()
+            .get(format!("{}/api/v1/devices/{device_id}", self.base))
+            .header("Cookie", &self.cookie)
+            .send()
+            .await
+            .expect("query device presence");
+        assert!(response.status().is_success(), "device query failed");
+        let body: serde_json::Value = response.json().await.expect("device");
+        body["online"].as_bool().expect("device online state")
+    }
+
+    pub async fn last_seen(&self, device_id: &str) -> Option<i64> {
+        sqlx::query_scalar("SELECT last_seen_at FROM devices WHERE id = $1")
+            .bind(device_id)
+            .fetch_optional(&self.pool)
+            .await
+            .expect("query PostgreSQL last_seen")
     }
 }
 

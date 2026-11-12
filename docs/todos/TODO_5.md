@@ -113,7 +113,7 @@ Protocol: ba test gốc dùng cùng body/assertions cho SQLite và PostgreSQL: Q
 
 Persistent session reconnect/expiry cũng dùng body gốc cho hai backend: focused SQLite 1 passed; `sh tests/protocol_postgres.sh` hiện 4 passed, gồm QoS, session expiry và hai test giới hạn. PostgreSQL session expiry dùng broker in-process `start_with_ingest` cùng repository fixture và TTL test 500 ms; listener subprocess production vẫn giữ cấu hình hợp lệ, không được kiểm tra với TTL dưới minimum 60 giây. Các case session-generation khác vẫn mở.
 
-MQTT version auth: test gốc từ chối MQTT 3.1 và MQTT 5 chạy cùng body trên SQLite/PostgreSQL; focused SQLite và `sh tests/mqtt_auth_postgres.sh` đều 1 passed. PostgreSQL kiểm tra tổng online bằng `/api/v1/overview`, endpoint dùng trực tiếp `Presence::online_count()`. Các test khác trong `mqtt_auth.rs` chưa được port.
+MQTT auth: test gốc từ chối MQTT 3.1/5 và test duplicate client ID/session generation chạy cùng body trên SQLite/PostgreSQL; SQLite focused PASS, `sh tests/mqtt_auth_postgres.sh` 2 passed với container riêng từng test. Version test kiểm tra tổng online qua `/api/v1/overview`; session-generation kiểm tra presence theo device và `last_seen`. Các test khác trong `mqtt_auth.rs` chưa được port.
 
 Shared A18 inject lỗi ghi telemetry bằng trigger DB: ACK đầu tiên `retryable/storage_unavailable`, không có row; sau khi gỡ trigger, retry cùng bytes/event ID nhận `stored` hoặc `duplicate` và có đúng một row. SQLite focused và PostgreSQL recovery runner PASS. Test quan sát ACK đầu tiên, không giám sát liên tục mọi ACK trong suốt khoảng lỗi. Assertion failed-publish cũng giữ đúng status trước đó (`pending` hoặc đã `dispatched`) thay vì giả định luôn `pending`.
 

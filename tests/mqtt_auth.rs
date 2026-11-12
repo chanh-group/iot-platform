@@ -218,60 +218,115 @@ async fn duplicate_client_id_uses_session_generation() {
     let server = TestApp::start().await;
     let device = server.create_device("sensor-dup", true).await;
 
-    let (client1, mut eventloop1, _) = mqtt_connect(
+    let presence = server.presence.clone();
+    let online_id = device.id.clone();
+    let pool = server.pool.clone();
+    let last_seen_id = device.id.clone();
+    duplicate_client_id_uses_session_generation_body(
         server.mqtt_addr,
         &device.id,
-        &device.id,
         &device.token,
-        true,
-    )
-    .await;
-    wait_until(
-        || {
-            server
-                .presence
-                .is_online(&device.id)
-                .expect("presence state should remain healthy")
+        move || {
+            let presence = presence.clone();
+            let id = online_id.clone();
+            async move {
+                presence
+                    .is_online(&id)
+                    .expect("presence state should remain healthy")
+            }
         },
-        WAIT,
-        "first connection online",
+        move || {
+            let pool = pool.clone();
+            let id = last_seen_id.clone();
+            async move {
+                sqlx::query_scalar("SELECT last_seen_at FROM devices WHERE id = ?")
+                    .bind(id)
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap()
+            }
+        },
     )
     .await;
+}
 
-    let (client2, eventloop2, session_present) = mqtt_connect(
-        server.mqtt_addr,
-        &device.id,
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture; run tests/mqtt_auth_postgres.sh"]
+async fn duplicate_client_id_uses_session_generation_postgres() {
+    let server = postgres::PostgresApp::start().await;
+    let device = server.create_device("sensor-dup").await;
+    let online_server = server.clone_for_queries();
+    let online_id = device.id.clone();
+    let last_seen_server = server.clone_for_queries();
+    let last_seen_id = device.id.clone();
+    duplicate_client_id_uses_session_generation_body(
+        server.mqtt_addr(),
         &device.id,
         &device.token,
-        true,
+        move || {
+            let server = online_server.clone();
+            let id = online_id.clone();
+            async move { server.is_online(&id).await }
+        },
+        move || {
+            let server = last_seen_server.clone();
+            let id = last_seen_id.clone();
+            async move { server.last_seen(&id).await }
+        },
     )
     .await;
+}
+
+async fn duplicate_client_id_uses_session_generation_body<
+    Online,
+    OnlineFuture,
+    LastSeen,
+    LastSeenFuture,
+>(
+    mqtt_addr: std::net::SocketAddr,
+    device_id: &str,
+    token: &str,
+    is_online: Online,
+    last_seen: LastSeen,
+) where
+    Online: Fn() -> OnlineFuture,
+    OnlineFuture: std::future::Future<Output = bool>,
+    LastSeen: Fn() -> LastSeenFuture,
+    LastSeenFuture: std::future::Future<Output = Option<i64>>,
+{
+    let (client1, mut eventloop1, _) =
+        mqtt_connect(mqtt_addr, device_id, device_id, token, true).await;
+    wait_online(&is_online, true, "first connection online").await;
+
+    let (client2, eventloop2, session_present) =
+        mqtt_connect(mqtt_addr, device_id, device_id, token, true).await;
     assert!(!session_present, "clean session must not be resumed");
     mqtt_wait_closed(&mut eventloop1, WAIT).await;
 
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
-        server
-            .presence
-            .is_online(&device.id)
-            .expect("presence state should remain healthy"),
+        is_online().await,
         "disconnect of the replaced session must not clear the new one"
     );
 
     drop(client2);
     drop(eventloop2);
-    wait_until(
-        || {
-            !server
-                .presence
-                .is_online(&device.id)
-                .expect("presence state should remain healthy")
-        },
-        WAIT,
-        "second connection offline",
-    )
-    .await;
-    assert!(server.last_seen(&device.id).await.is_some());
+    wait_online(&is_online, false, "second connection offline").await;
+    assert!(last_seen().await.is_some());
 
     drop(client1);
+}
+
+async fn wait_online<F, Fut>(is_online: &F, expected: bool, message: &str)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    tokio::time::timeout(WAIT, async {
+        while is_online().await != expected {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {message}"));
 }
