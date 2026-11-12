@@ -113,6 +113,9 @@ IOT_LOAD_POSTGRES_URL="postgres://iot_load:$PASSWORD@127.0.0.1:$PORT/iot_load_fi
             sid=$(ps -o sid= -p "$$" | tr -d " ")
             [ "$pgid" = "$$" ] && [ "$sid" = "$$" ] || exit 125
             printf "%s\n" "$pgid" > "$pgid_file"
+            if [ -n "${FIXTURE_TEST_DIR:-}" ]; then
+                printf "%s\n" "$pgid" > "$FIXTURE_TEST_DIR/test-pgid"
+            fi
             exec "$@"
         ' iot-load-test-group "$PGID_FILE" cargo test --test load_baseline one_thousand_qos1_clients_measure_postgres_load -- --ignored --nocapture &
 TEST_WRAPPER_PID=$!

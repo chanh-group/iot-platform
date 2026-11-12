@@ -947,7 +947,7 @@ esac
     let fake_cargo = bin.join("cargo");
     fs::write(
         &fake_cargo,
-        "#!/bin/sh\n/bin/sleep 300 &\nprintf '%s\\n' \"$!\" > \"$FIXTURE_TEST_DIR/test-child.pid\"\nexit 143\n",
+        "#!/bin/sh\nset +m\n/bin/sleep 300 &\nchild=$!\nprintf '%s\\n' \"$child\" > \"$FIXTURE_TEST_DIR/test-child.pid\"\nps -o pgid= -p \"$child\" | tr -d ' ' > \"$FIXTURE_TEST_DIR/child-pgid\"\nexit 143\n",
     )?;
     for executable in [&docker, &fake_cargo] {
         fs::set_permissions(executable, fs::Permissions::from_mode(0o755))?;
@@ -970,6 +970,16 @@ esac
     }
     ensure!(child_pid_file.exists(), "fake cargo did not start");
     let child_pid: u32 = fs::read_to_string(&child_pid_file)?.trim().parse()?;
+    let group_pid: u32 = fs::read_to_string(fixture_dir.path().join("test-pgid"))?
+        .trim()
+        .parse()?;
+    let child_group: u32 = fs::read_to_string(fixture_dir.path().join("child-pgid"))?
+        .trim()
+        .parse()?;
+    ensure!(
+        child_group == group_pid,
+        "fake cargo child escaped test group: child={child_group} group={group_pid}"
+    );
 
     let mut outside = Command::new("/bin/sleep").arg("300").spawn()?;
     let output = runner.wait_with_output()?;
