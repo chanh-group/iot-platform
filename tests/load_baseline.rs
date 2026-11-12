@@ -896,7 +896,7 @@ fn metric_value(exposition: &str, name: &str) -> u64 {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn postgres_fixture_interrupt_kills_only_its_test_group_and_cleans_its_container()
+fn postgres_fixture_sigterm_kills_only_its_test_group_and_cleans_its_container()
 -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     use std::thread;
@@ -975,12 +975,12 @@ esac
 
     let mut outside = Command::new("/bin/sleep").arg("300").spawn()?;
     let signal = Command::new("kill")
-        .args(["-INT", &runner_pid.to_string()])
+        .args(["-TERM", &runner_pid.to_string()])
         .status()?;
-    ensure!(signal.success(), "failed to interrupt fixture runner");
+    ensure!(signal.success(), "failed to terminate fixture runner");
     let output = runner.wait_with_output()?;
     ensure!(
-        output.status.code() == Some(130),
+        output.status.code() == Some(143),
         "runner exit status: {:?}",
         output.status.code()
     );
