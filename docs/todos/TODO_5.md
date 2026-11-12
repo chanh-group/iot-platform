@@ -119,6 +119,8 @@ Attributes: test gốc latest values/invalid/retained updates dùng shared body 
 
 Credential rotation: test gốc online rotation dùng shared assertions SQLite/PostgreSQL; xác minh session kick, token cũ bị từ chối, token mới dùng được, rotated_from/audit/redaction. Focused SQLite và `sh tests/credential_rotate_postgres.sh` đều 1 passed. Các disabled/not-found/auth-CSRF/rollback API cases còn lại chưa được port toàn bộ.
 
+Admin auth: test login/me/logout và cookie flags chạy shared HTTP assertions cho SQLite/PostgreSQL; PostgreSQL cũng xác minh login sai không tạo audit, token chỉ lưu dạng hash, login/logout audit có mặt và details không lộ password/session token. Focused SQLite và `sh tests/auth_postgres.sh` đều 1 passed. Auth rate-limit, CSRF/origin và secure-cookie config API matrix còn mở.
+
 Persistent session reconnect/expiry, broker restart và retained last-will cũng đã được port: focused SQLite và PostgreSQL fixture PASS; broker-restart giữ assertion offline trước restart, discarded session-present sau restart, và device online lại sau reconnect. Session expiry PostgreSQL dùng broker in-process `start_with_ingest` cùng repository fixture và TTL test 500 ms; listener subprocess production vẫn giữ cấu hình hợp lệ, không kiểm tra TTL dưới minimum 60 giây. Còn các protocol cases khác chưa port.
 
 Test gốc `max_inflight_per_client_limits_unacknowledged_qos1_deliveries` dùng chung body cho SQLite/PostgreSQL, với `max_inflight_per_client=1` và truy vấn row theo device; focused SQLite và PostgreSQL runner đều passed. Runner mặc định tiếp tục giữ các case protocol đã port.
