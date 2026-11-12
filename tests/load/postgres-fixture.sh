@@ -126,6 +126,13 @@ if [ -z "$TEST_PGID" ] || ! group_is_alive; then
     echo 'could not establish isolated load-test process group' >&2
     exit 1
 fi
+while kill -0 "$TEST_WRAPPER_PID" 2>/dev/null; do
+    state=$(ps -o stat= -p "$TEST_WRAPPER_PID" 2>/dev/null | tr -d ' ' || true)
+    case "$state" in
+        ''|Z*) break ;;
+    esac
+    sleep 0.05
+done
 if wait "$TEST_WRAPPER_PID"; then
     status=0
 else
