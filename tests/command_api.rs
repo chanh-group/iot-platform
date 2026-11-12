@@ -37,6 +37,23 @@ async fn create_command(
         .unwrap()
 }
 
+async fn assert_command_audit_failure(http: &reqwest::Client, base: &str, device_id: &str) {
+    let response = http
+        .post(format!("{base}/api/v1/devices/{device_id}/commands"))
+        .header("X-IoT-CSRF", "1")
+        .header("X-Request-ID", "command-api-123")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(r#"{"name":"reboot","idempotency_key":"audit-failure"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["code"],
+        "storage_unavailable"
+    );
+}
+
 async fn assert_raw_request_idempotency(http: &reqwest::Client, base: &str, device_id: &str) {
     let request =
         r#"{"name":"reboot","params":{"n":1},"ttl_ms":60000,"idempotency_key":"same-key"}"#;
@@ -659,19 +676,7 @@ async fn audit_failure_rolls_back_command_and_returns_storage_error() {
     .execute(&app.pool)
     .await
     .unwrap();
-
-    let response = create_command(
-        &http,
-        &app,
-        &device.id,
-        r#"{"name":"reboot","idempotency_key":"audit-failure"}"#,
-    )
-    .await;
-    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(
-        response.json::<Value>().await.unwrap()["code"],
-        "storage_unavailable"
-    );
+    assert_command_audit_failure(&http, &app.base, &device.id).await;
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM commands WHERE device_id = ?")
             .bind(&device.id)
@@ -689,4 +694,66 @@ async fn audit_failure_rolls_back_command_and_returns_storage_error() {
         .unwrap(),
         0
     );
+    sqlx::query("DROP TRIGGER fail_command_audit")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires tests/command_api_postgres.sh"]
+async fn audit_failure_rolls_back_command_and_returns_storage_error_postgres() {
+    let app = mqtt_auth_postgres::PostgresApp::start().await;
+    let device = app.create_device("command-audit").await;
+    let http = postgres_admin_client(app.admin_cookie());
+    let pool = sqlx::PgPool::connect(&std::env::var("IOT_TEST_POSTGRES_URL").unwrap())
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE FUNCTION fail_command_audit_fn() RETURNS trigger AS $$
+         BEGIN
+             IF NEW.action = 'command.create' THEN
+                 RAISE EXCEPTION 'injected audit failure';
+             END IF;
+             RETURN NEW;
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_command_audit BEFORE INSERT ON audit_events
+         FOR EACH ROW EXECUTE FUNCTION fail_command_audit_fn()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    assert_command_audit_failure(&http, app.base_url(), &device.id).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM commands WHERE device_id = $1")
+            .bind(&device.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'command.create'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        0
+    );
+    sqlx::query("DROP TRIGGER fail_command_audit ON audit_events")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP FUNCTION fail_command_audit_fn()")
+        .execute(&pool)
+        .await
+        .unwrap();
 }

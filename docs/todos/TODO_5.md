@@ -125,7 +125,7 @@ Admin auth: test login/me/logout và cookie flags chạy shared HTTP assertions 
 
 Overview API: test gốc database windows/live presence dùng shared assertions trên SQLite/PostgreSQL; PostgreSQL seed telemetry/command bằng bind SQL, tạo online presence qua MQTT, và lấy rejected-counter baseline từ chính API subprocess. Focused SQLite 1 passed; PostgreSQL runner 3 lượt liên tiếp, mỗi lượt 1 passed. Overview failure/readiness cases khác vẫn mở.
 
-Command API: raw-byte idempotency/replay test gốc dùng chung request/response assertions cho SQLite/PostgreSQL; xác minh replay cùng ID, khác bytes báo conflict, chỉ một command và một `command.create` audit. SQLite focused 1 passed; `sh tests/command_api_postgres.sh` 1 passed. Command expiry/late-ACK, storage-failure/ACK race và full lifecycle matrix vẫn mở.
+Command API: raw-byte idempotency/replay test gốc dùng chung request/response assertions cho SQLite/PostgreSQL; xác minh replay cùng ID, khác bytes báo conflict, chỉ một command và một `command.create` audit. Audit-failure API test cũng dùng shared HTTP/storage assertions với trigger SQL theo backend; PostgreSQL trả `storage_unavailable` và không lưu command/audit. SQLite focused cases đều 1 passed; `sh tests/command_api_postgres.sh` chạy 3 cases, mỗi case 1 passed. Command expiry/late-ACK, storage-failure/ACK race và full lifecycle matrix vẫn mở.
 
 Command list API: test gốc pagination/filter/detail dùng chung API assertions trên SQLite/PostgreSQL; ba command có cùng `created_at` để kiểm tra keyset order, status filter, cursor mismatch, field scope và not-found errors. SQLite focused 1 passed; `sh tests/command_list_postgres.sh` 1 passed. Queue race/expiry, late ACK và storage failure/race cases còn thiếu.
 
