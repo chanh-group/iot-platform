@@ -1,6 +1,8 @@
 //! P2-02/P2-04: device auth hook, protocol gating, presence generation (A03).
 
 mod common;
+#[path = "common/mqtt_auth_postgres.rs"]
+mod postgres;
 
 use std::time::Duration;
 
@@ -189,12 +191,26 @@ async fn mqtt_31_and_mqtt_5_are_refused_at_the_wire() {
     let server = TestApp::start().await;
     let device = server.create_device("sensor-proto", true).await;
 
-    let v3 = raw_connack(server.mqtt_addr, 3, &device.id, &device.id, &device.token).await;
+    assert_mqtt_versions_refused(server.mqtt_addr, &device.id, &device.token).await;
+    assert_eq!(server.presence.online_count().unwrap(), 0);
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture; run tests/mqtt_auth_postgres.sh"]
+async fn mqtt_31_and_mqtt_5_are_refused_at_the_wire_postgres() {
+    let server = postgres::PostgresApp::start().await;
+    let device = server.create_device("sensor-proto").await;
+
+    assert_mqtt_versions_refused(server.mqtt_addr(), &device.id, &device.token).await;
+    server.assert_no_devices_online().await;
+}
+
+async fn assert_mqtt_versions_refused(address: std::net::SocketAddr, device_id: &str, token: &str) {
+    let v3 = raw_connack(address, 3, device_id, device_id, token).await;
     assert_eq!(connack_code(&v3, 3), 0x05);
 
-    let v5 = raw_connack(server.mqtt_addr, 5, &device.id, &device.id, &device.token).await;
+    let v5 = raw_connack(address, 5, device_id, device_id, token).await;
     assert_eq!(connack_code(&v5, 5), 0x87);
-    assert_eq!(server.presence.online_count().unwrap(), 0);
 }
 
 #[tokio::test]

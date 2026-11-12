@@ -32,7 +32,9 @@ mod protocol_postgres {
     pub struct Fixture {
         pub addr: SocketAddr,
         pub device: Device,
+        pub config: std::path::PathBuf,
         _child: ChildGuard,
+        _dir: TempDir,
     }
 
     struct ChildGuard(Child);
@@ -209,6 +211,8 @@ mod protocol_postgres {
                     .to_owned(),
             },
             _child: child,
+            config,
+            _dir: dir,
         }
     }
 
@@ -573,10 +577,77 @@ async fn persistent_session_reconnects_then_expires() {
     };
     let app = TestApp::builder().mqtt_config(config).start().await;
     let device = app.create_device("protocol-session", true).await;
-    let filter = format!("devices/{}/data/#", device.id);
+    persistent_session_round_trip(app.mqtt_addr, &app.presence, &device.id, &device.token).await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture; run tests/protocol_postgres.sh"]
+async fn persistent_session_reconnects_then_expires_postgres() {
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    let fixture = protocol_postgres::start("protocol-session", "", "").await;
+    let loaded = iot_server::config::load(&fixture.config).unwrap();
+    let storage = iot_server::storage::runtime::StorageRuntime::connect(&loaded)
+        .await
+        .unwrap();
+    let telemetry = &loaded.config.telemetry;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let (ingest, task) = iot_server::core::telemetry::spawn_worker(
+        storage.repositories.telemetry.clone(),
+        iot_server::core::events::EventBus::new(),
+        telemetry.queue_capacity as usize,
+        telemetry.max_batch_bytes as usize,
+        loaded.runtime_config.clone(),
+        iot_server::core::telemetry::IngestWorkerControl {
+            cancellation: cancel.clone(),
+            readiness: Arc::new(AtomicBool::new(true)),
+        },
+    );
+    let mut config = loaded.config.mqtt.clone();
+    config.listen = "127.0.0.1:0".parse().unwrap();
+    config.max_session_expiry_ms = 500;
+    let presence = Arc::new(iot_server::core::presence::Presence::new());
+    let mqtt = iot_server::mqtt::server::MqttServer::start_with_ingest(
+        &config,
+        Arc::new(AtomicBool::new(false)),
+        iot_server::mqtt::server::MqttRepositories {
+            devices: storage.repositories.devices.clone(),
+            commands: storage.repositories.commands.clone(),
+            attributes: storage.repositories.attributes.clone(),
+        },
+        Arc::clone(&presence),
+        (
+            ingest,
+            iot_server::core::telemetry::TelemetryPayload::try_from(telemetry).unwrap(),
+            telemetry.queue_capacity as usize,
+        ),
+    )
+    .await
+    .unwrap();
+    persistent_session_round_trip(
+        mqtt.local_addr(),
+        &presence,
+        &fixture.device.id,
+        &fixture.device.token,
+    )
+    .await;
+    mqtt.abort();
+    drop(mqtt);
+    cancel.cancel();
+    task.await.unwrap();
+    storage.close().await;
+}
+
+async fn persistent_session_round_trip(
+    address: std::net::SocketAddr,
+    presence: &iot_server::core::presence::Presence,
+    device_id: &str,
+    token: &str,
+) {
+    let filter = format!("devices/{device_id}/data/#");
 
     let (client, mut eventloop, present) =
-        mqtt_connect(app.mqtt_addr, &device.id, &device.id, &device.token, false).await;
+        mqtt_connect(address, device_id, device_id, token, false).await;
     assert!(!present);
     assert_eq!(
         mqtt_subscribe(&client, &mut eventloop, &filter, QoS::AtLeastOnce).await,
@@ -586,8 +657,8 @@ async fn persistent_session_reconnects_then_expires() {
     drop(eventloop);
     wait_until(
         || {
-            !app.presence
-                .is_online(&device.id)
+            !presence
+                .is_online(device_id)
                 .expect("presence state should remain healthy")
         },
         WAIT,
@@ -596,12 +667,12 @@ async fn persistent_session_reconnects_then_expires() {
     .await;
 
     let (client, mut eventloop, present) =
-        mqtt_connect(app.mqtt_addr, &device.id, &device.id, &device.token, false).await;
+        mqtt_connect(address, device_id, device_id, token, false).await;
     assert!(
         present,
         "an unexpired clean_session=false session should resume"
     );
-    let topic = format!("devices/{}/data/resumed", device.id);
+    let topic = format!("devices/{device_id}/data/resumed");
     mqtt_publish(&client, &topic, QoS::AtLeastOnce, false, b"resumed").await;
     assert_eq!(
         mqtt_wait_publish(&mut eventloop, WAIT)
@@ -614,8 +685,8 @@ async fn persistent_session_reconnects_then_expires() {
     drop(eventloop);
     wait_until(
         || {
-            !app.presence
-                .is_online(&device.id)
+            !presence
+                .is_online(device_id)
                 .expect("presence state should remain healthy")
         },
         WAIT,
@@ -625,7 +696,7 @@ async fn persistent_session_reconnects_then_expires() {
 
     tokio::time::sleep(Duration::from_millis(700)).await;
     let (_client, _eventloop, present) =
-        mqtt_connect(app.mqtt_addr, &device.id, &device.id, &device.token, false).await;
+        mqtt_connect(address, device_id, device_id, token, false).await;
     assert!(!present, "an expired persistent session must be discarded");
 }
 

@@ -109,7 +109,11 @@ Shared A18 cũng kiểm tra trực tiếp repository ACK: lỗi storage rollback
 
 MQTT ACL suite gốc dùng chung body/assertions cho SQLite và PostgreSQL subprocess: `cargo test --test mqtt_acl` 6 passed, 5 ignored; `sh tests/acl_postgres.sh` 5 passed trên năm container PostgreSQL fixture riêng. Đây chỉ là suite ACL; protocol/session-generation và các suite khác vẫn chưa đủ evidence A18.
 
-Protocol: ba test gốc dùng cùng body/assertions cho SQLite và PostgreSQL: QoS 0/1/2 với wildcard, giới hạn topic level và giới hạn packet. SQLite focused tests PASS; `sh tests/protocol_postgres.sh` 3 passed, mỗi test dùng container riêng. Test packet-limit PostgreSQL đặt `telemetry.max_payload_bytes=1024` để config hợp lệ với `mqtt.max_packet_bytes=1024`. Session-generation và các case protocol còn lại vẫn mở.
+Protocol: ba test gốc dùng cùng body/assertions cho SQLite và PostgreSQL: QoS 0/1/2 với wildcard, giới hạn topic level và giới hạn packet. SQLite focused tests PASS; lượt đầu `sh tests/protocol_postgres.sh` 3 passed, mỗi test dùng container riêng. Test packet-limit PostgreSQL đặt `telemetry.max_payload_bytes=1024` để config hợp lệ với `mqtt.max_packet_bytes=1024`. Session-generation và các case protocol còn lại vẫn mở.
+
+Persistent session reconnect/expiry cũng dùng body gốc cho hai backend: focused SQLite 1 passed; `sh tests/protocol_postgres.sh` hiện 4 passed, gồm QoS, session expiry và hai test giới hạn. PostgreSQL session expiry dùng broker in-process `start_with_ingest` cùng repository fixture và TTL test 500 ms; listener subprocess production vẫn giữ cấu hình hợp lệ, không được kiểm tra với TTL dưới minimum 60 giây. Các case session-generation khác vẫn mở.
+
+MQTT version auth: test gốc từ chối MQTT 3.1 và MQTT 5 chạy cùng body trên SQLite/PostgreSQL; focused SQLite và `sh tests/mqtt_auth_postgres.sh` đều 1 passed. PostgreSQL kiểm tra tổng online bằng `/api/v1/overview`, endpoint dùng trực tiếp `Presence::online_count()`. Các test khác trong `mqtt_auth.rs` chưa được port.
 
 Shared A18 inject lỗi ghi telemetry bằng trigger DB: ACK đầu tiên `retryable/storage_unavailable`, không có row; sau khi gỡ trigger, retry cùng bytes/event ID nhận `stored` hoặc `duplicate` và có đúng một row. SQLite focused và PostgreSQL recovery runner PASS. Test quan sát ACK đầu tiên, không giám sát liên tục mọi ACK trong suốt khoảng lỗi. Assertion failed-publish cũng giữ đúng status trước đó (`pending` hoặc đã `dispatched`) thay vì giả định luôn `pending`.
 
