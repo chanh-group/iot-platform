@@ -32,4 +32,5 @@ run_case() {
     created=0
 }
 run_case idempotency_uses_raw_request_bytes_and_does_not_audit_replays_postgres
+run_case concurrent_creates_do_not_exceed_pending_queue_limit_postgres
 run_case audit_failure_rolls_back_command_and_returns_storage_error_postgres

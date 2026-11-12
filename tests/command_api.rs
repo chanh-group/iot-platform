@@ -641,6 +641,87 @@ async fn concurrent_creates_do_not_exceed_pending_queue_limit() {
     );
 }
 
+#[tokio::test]
+#[ignore = "requires tests/command_api_postgres.sh"]
+async fn concurrent_creates_do_not_exceed_pending_queue_limit_postgres() {
+    let app = mqtt_auth_postgres::PostgresApp::start().await;
+    let device = app.create_device("command-limit").await;
+    let http = postgres_admin_client(app.admin_cookie());
+    let pool = sqlx::PgPool::connect(&std::env::var("IOT_TEST_POSTGRES_URL").unwrap())
+        .await
+        .unwrap();
+    let limit = 100_i64;
+    let now = auth::now_ms();
+    let mut tx = pool.begin().await.unwrap();
+    for _ in 0..limit - 1 {
+        sqlx::query(
+            "INSERT INTO commands (
+                id, device_id, name, params_json, status, created_at, expires_at, next_attempt_at
+             ) VALUES ($1, $2, 'reboot', '{}', 'pending', $3, $4, $3)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&device.id)
+        .bind(now)
+        .bind(now + 86_400_000)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    let base = app.base_url();
+    let first = http
+        .post(format!("{base}/api/v1/devices/{}/commands", device.id))
+        .header("X-IoT-CSRF", "1")
+        .header("X-Request-ID", "command-api-123")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(r#"{"name":"reboot","idempotency_key":"race-a"}"#)
+        .send();
+    let second = http
+        .post(format!("{base}/api/v1/devices/{}/commands", device.id))
+        .header("X-IoT-CSRF", "1")
+        .header("X-Request-ID", "command-api-123")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(r#"{"name":"reboot","idempotency_key":"race-b"}"#)
+        .send();
+    let (first, second) = tokio::join!(first, second);
+    let first = first.unwrap();
+    let second = second.unwrap();
+    let statuses = [first.status(), second.status()];
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == reqwest::StatusCode::ACCEPTED)
+            .count(),
+        1
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == reqwest::StatusCode::CONFLICT)
+            .count(),
+        1
+    );
+    let conflict = if first.status() == reqwest::StatusCode::CONFLICT {
+        first
+    } else {
+        second
+    };
+    let body: Value = conflict.json().await.unwrap();
+    assert_eq!(body["code"], "command_queue_full");
+    assert_eq!(body["details"]["limit"], limit);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM commands WHERE device_id = $1 AND status IN ('pending', 'dispatched')",
+        )
+        .bind(&device.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        limit
+    );
+}
+
 async fn insert_active_commands(pool: &sqlx::SqlitePool, device_id: &str, count: u64) {
     let now = auth::now_ms();
     let mut tx = pool.begin().await.unwrap();
