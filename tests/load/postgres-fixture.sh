@@ -18,6 +18,16 @@ group_is_alive() {
         '$1 == group && $2 == group && $3 !~ /^Z/ { found = 1 } END { exit !found }'
 }
 
+signal_test_group() {
+    signal=$1
+    ps -eo pid=,pgid=,sid= | awk -v group="$TEST_PGID" \
+        '$2 == group && $3 == group { print $1 }' |
+        while IFS= read -r pid; do
+            case "$pid" in ''|*[!0-9]*) continue ;; esac
+            /bin/kill "-$signal" "$pid" 2>/dev/null || true
+        done
+}
+
 fixture_log_process_group() {
     [ -n "${FIXTURE_TEST_DIR:-}" ] || return 0
     printf 'phase=%s pgid=%s\n' "$1" "$TEST_PGID" >> "$FIXTURE_TEST_DIR/cleanup.log"
@@ -38,22 +48,16 @@ terminate_test_group() {
     fi
     if group_is_alive; then
         fixture_log_process_group before-term
-        if /bin/kill -TERM -- "-$TEST_PGID" 2>/dev/null; then
-            fixture_log_process_group term-sent
-        else
-            fixture_log_process_group term-failed
-        fi
+        signal_test_group TERM
+        fixture_log_process_group term-sent
         for _ in $(seq 1 50); do
             group_is_alive || break
             sleep 0.1
         done
         if group_is_alive; then
             fixture_log_process_group before-kill
-            if /bin/kill -KILL -- "-$TEST_PGID" 2>/dev/null; then
-                fixture_log_process_group kill-sent
-            else
-                fixture_log_process_group kill-failed
-            fi
+            signal_test_group KILL
+            fixture_log_process_group kill-sent
         fi
     fi
     if [ -n "$TEST_WRAPPER_PID" ]; then
