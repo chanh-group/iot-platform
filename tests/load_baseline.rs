@@ -896,7 +896,7 @@ fn metric_value(exposition: &str, name: &str) -> u64 {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn postgres_fixture_sigterm_kills_only_its_test_group_and_cleans_its_container()
+fn postgres_fixture_wrapper_termination_cleans_only_its_test_group_and_container()
 -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     use std::thread;
@@ -964,20 +964,24 @@ esac
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    let runner_pid = runner.id();
     let child_pid_file = fixture_dir.path().join("test-child.pid");
+    let wrapper_pid_file = fixture_dir.path().join("test-wrapper.pid");
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !child_pid_file.exists() && Instant::now() < deadline {
+    while (!child_pid_file.exists() || !wrapper_pid_file.exists()) && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(20));
     }
     ensure!(child_pid_file.exists(), "fake cargo did not start");
     let child_pid: u32 = fs::read_to_string(&child_pid_file)?.trim().parse()?;
+    let wrapper_pid: u32 = fs::read_to_string(&wrapper_pid_file)?.trim().parse()?;
 
     let mut outside = Command::new("/bin/sleep").arg("300").spawn()?;
     let signal = Command::new("kill")
-        .args(["-TERM", &runner_pid.to_string()])
+        .args(["-TERM", &wrapper_pid.to_string()])
         .status()?;
-    ensure!(signal.success(), "failed to terminate fixture runner");
+    ensure!(
+        signal.success(),
+        "failed to terminate isolated test wrapper"
+    );
     let output = runner.wait_with_output()?;
     ensure!(
         output.status.code() == Some(143),
@@ -990,7 +994,7 @@ esac
     );
     ensure!(
         linux_process_is_running(outside.id()),
-        "interrupt cleanup signalled a process outside its test group"
+        "fixture cleanup signalled a process outside its test group"
     );
     let cleanup = fs::read_to_string(fixture_dir.path().join("docker-rm.log"))?;
     ensure!(
