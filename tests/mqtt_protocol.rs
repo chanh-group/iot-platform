@@ -34,6 +34,7 @@ mod protocol_postgres {
     pub struct Fixture {
         pub addr: SocketAddr,
         pub device: Device,
+        cookie: String,
         pub config: std::path::PathBuf,
         http_addr: SocketAddr,
         child: ChildGuard,
@@ -102,6 +103,61 @@ mod protocol_postgres {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
             assert!(ready, "restarted server did not become ready");
+        }
+
+        pub async fn wait_device_offline(&self, device_id: &str) {
+            let client = reqwest::Client::new();
+            tokio::time::timeout(super::WAIT, async {
+                loop {
+                    let response = client
+                        .get(format!(
+                            "http://{}/api/v1/devices/{device_id}",
+                            self.http_addr
+                        ))
+                        .header("Cookie", &self.cookie)
+                        .send()
+                        .await
+                        .expect("query PostgreSQL device presence");
+                    assert!(response.status().is_success(), "device query failed");
+                    let body: serde_json::Value = response.json().await.expect("device response");
+                    if body["online"].as_bool() == Some(false) {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("device disconnect should clear presence before restart");
+        }
+
+        pub async fn wait_device_online(&self, device_id: &str) {
+            let client = reqwest::Client::new();
+            tokio::time::timeout(super::WAIT, async {
+                loop {
+                    let response = client
+                        .get(format!(
+                            "http://{}/api/v1/devices/{device_id}",
+                            self.http_addr
+                        ))
+                        .header("Cookie", &self.cookie)
+                        .send()
+                        .await
+                        .expect("query PostgreSQL device presence");
+                    assert!(response.status().is_success(), "device query failed");
+                    if response
+                        .json::<serde_json::Value>()
+                        .await
+                        .expect("device response")["online"]
+                        .as_bool()
+                        == Some(true)
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("device connection should establish presence");
         }
     }
 
@@ -250,7 +306,7 @@ mod protocol_postgres {
         let _: serde_json::Value = response.json().await.expect("login response");
         let response = client
             .post(format!("{base}/api/v1/devices"))
-            .header("Cookie", cookie)
+            .header("Cookie", &cookie)
             .header("X-IoT-CSRF", "1")
             .json(&serde_json::json!({"name":device_name,"metadata":{}}))
             .send()
@@ -272,6 +328,7 @@ mod protocol_postgres {
                     .expect("device token")
                     .to_owned(),
             },
+            cookie,
             child,
             config,
             _dir: dir,
@@ -942,6 +999,12 @@ async fn broker_restart_discards_persistent_sessions() {
         !present,
         "broker sessions are in-memory and must not survive restart"
     );
+    wait_until(
+        || app.presence.is_online(&device.id).unwrap_or(false),
+        WAIT,
+        "reconnected session online",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -960,6 +1023,7 @@ async fn broker_restart_discards_persistent_sessions_postgres() {
     mqtt_subscribe(&client, &mut eventloop, &filter, QoS::AtLeastOnce).await;
     drop(client);
     drop(eventloop);
+    fixture.wait_device_offline(&fixture.device.id).await;
 
     fixture.restart().await;
     let (_client, _eventloop, present) = mqtt_connect(
@@ -974,6 +1038,7 @@ async fn broker_restart_discards_persistent_sessions_postgres() {
         !present,
         "broker sessions are in-memory and must not survive restart"
     );
+    fixture.wait_device_online(&fixture.device.id).await;
 }
 
 #[tokio::test]
