@@ -44,7 +44,7 @@ mod protocol_postgres {
         }
     }
 
-    pub async fn start() -> Fixture {
+    pub async fn start(device_name: &str, mqtt_config: &str, telemetry_config: &str) -> Fixture {
         let url = std::env::var("IOT_TEST_POSTGRES_URL").expect("runner PostgreSQL URL");
         let container = std::env::var("IOT_TEST_POSTGRES_CONTAINER").expect("runner container");
         let port: u16 = std::env::var("IOT_TEST_POSTGRES_PORT")
@@ -98,7 +98,7 @@ mod protocol_postgres {
             }
         };
         let config = dir.path().join("conf.toml");
-        std::fs::write(&config, format!("config_version=1\n[server]\ndata_dir='./data'\nshutdown_timeout_ms=1000\n[http]\nlisten='127.0.0.1:{http_port}'\n[mqtt]\nlisten='127.0.0.1:{mqtt_port}'\n[database]\nurl_env='IOT_TEST_POSTGRES_URL'\n[telemetry]\nqueue_capacity=16\nbatch_size=1\n")).expect("write test config");
+        std::fs::write(&config, format!("config_version=1\n[server]\ndata_dir='./data'\nshutdown_timeout_ms=1000\n[http]\nlisten='127.0.0.1:{http_port}'\n[mqtt]\nlisten='127.0.0.1:{mqtt_port}'\n{mqtt_config}[database]\nurl_env='IOT_TEST_POSTGRES_URL'\n[telemetry]\nqueue_capacity=16\nbatch_size=1\n{telemetry_config}")).expect("write test config");
         let pool = PgPool::connect(&url)
             .await
             .expect("connect fixture database");
@@ -191,7 +191,7 @@ mod protocol_postgres {
             .post(format!("{base}/api/v1/devices"))
             .header("Cookie", cookie)
             .header("X-IoT-CSRF", "1")
-            .json(&serde_json::json!({"name":"protocol-qos","metadata":{}}))
+            .json(&serde_json::json!({"name":device_name,"metadata":{}}))
             .send()
             .await
             .expect("create device");
@@ -398,7 +398,7 @@ async fn qos_levels_and_own_device_wildcard_round_trip() {
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL fixture; run tests/protocol_postgres.sh"]
 async fn qos_levels_and_own_device_wildcard_round_trip_postgres() {
-    let fixture = protocol_postgres::start().await;
+    let fixture = protocol_postgres::start("protocol-qos", "", "").await;
     qos_round_trip(fixture.addr, &fixture.device.id, &fixture.device.token).await;
 }
 
@@ -690,21 +690,32 @@ async fn topic_level_limit_is_enforced_by_the_listener() {
     };
     let app = TestApp::builder().mqtt_config(config).start().await;
     let device = app.create_device("protocol-topic-limit", true).await;
-    let (client, mut eventloop, _) =
-        mqtt_connect(app.mqtt_addr, &device.id, &device.id, &device.token, true).await;
-    let filter = format!("devices/{}/data/#", device.id);
-    let too_deep_filter = format!("devices/{}/data/x/y/#", device.id);
+    topic_level_limit_round_trip(app.mqtt_addr, &device.id, &device.token).await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture; run tests/protocol_postgres.sh"]
+async fn topic_level_limit_is_enforced_by_the_listener_postgres() {
+    let fixture =
+        protocol_postgres::start("protocol-topic-limit", "max_topic_levels=4\n", "").await;
+    topic_level_limit_round_trip(fixture.addr, &fixture.device.id, &fixture.device.token).await;
+}
+
+async fn topic_level_limit_round_trip(addr: std::net::SocketAddr, device_id: &str, token: &str) {
+    let (client, mut eventloop, _) = mqtt_connect(addr, device_id, device_id, token, true).await;
+    let filter = format!("devices/{device_id}/data/#");
+    let too_deep_filter = format!("devices/{device_id}/data/x/y/#");
     assert_eq!(
         mqtt_subscribe(&client, &mut eventloop, &too_deep_filter, QoS::AtLeastOnce).await,
         SubscribeReasonCode::Failure
     );
     mqtt_subscribe(&client, &mut eventloop, &filter, QoS::AtLeastOnce).await;
 
-    let allowed = format!("devices/{}/data/x", device.id);
+    let allowed = format!("devices/{device_id}/data/x");
     mqtt_publish(&client, &allowed, QoS::AtLeastOnce, false, b"ok").await;
     assert_eq!(mqtt_wait_publish(&mut eventloop, WAIT).await.topic, allowed);
 
-    let too_deep = format!("devices/{}/data/x/y", device.id);
+    let too_deep = format!("devices/{device_id}/data/x/y");
     mqtt_publish(&client, &too_deep, QoS::AtLeastOnce, false, b"deny").await;
     mqtt_wait_closed(&mut eventloop, WAIT).await;
 }
@@ -717,9 +728,24 @@ async fn packet_limit_is_enforced_by_the_listener() {
     };
     let app = TestApp::builder().mqtt_config(config).start().await;
     let device = app.create_device("protocol-packet-limit", true).await;
-    let (client, mut eventloop, _) =
-        mqtt_connect(app.mqtt_addr, &device.id, &device.id, &device.token, true).await;
-    let topic = format!("devices/{}/data/large", device.id);
+    packet_limit_round_trip(app.mqtt_addr, &device.id, &device.token).await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture; run tests/protocol_postgres.sh"]
+async fn packet_limit_is_enforced_by_the_listener_postgres() {
+    let fixture = protocol_postgres::start(
+        "protocol-packet-limit",
+        "max_packet_bytes=1024\n",
+        "max_payload_bytes=1024\n",
+    )
+    .await;
+    packet_limit_round_trip(fixture.addr, &fixture.device.id, &fixture.device.token).await;
+}
+
+async fn packet_limit_round_trip(addr: std::net::SocketAddr, device_id: &str, token: &str) {
+    let (client, mut eventloop, _) = mqtt_connect(addr, device_id, device_id, token, true).await;
+    let topic = format!("devices/{device_id}/data/large");
     let payload = [b'x'; 2_048];
 
     mqtt_publish(&client, &topic, QoS::AtLeastOnce, false, &payload).await;

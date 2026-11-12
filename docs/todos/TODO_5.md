@@ -80,8 +80,8 @@ P5-03 đã bỏ theo ADR-011; giữ số mục và ID còn lại để các tham
 
 ## 4. Compose và backup/restore PostgreSQL — P5-04
 
-- [ ] Thêm biến thể Compose riêng theo backend: database server ngoài có volume, healthcheck, cấu hình/secret phù hợp; app retry kết nối có giới hạn, không chỉ dựa vào thứ tự startup. Không nhúng password cố định trong image/repo hoặc log URL đầy đủ.
-- [ ] Smoke trên môi trường cô lập: migrate, bootstrap admin, MQTT→commit→ACK→REST, recreate app/database với volume và xác nhận device, credential, telemetry, command và runtime revision còn đúng.
+- [x] Thêm biến thể Compose riêng theo backend: database server ngoài có volume, healthcheck, cấu hình/secret phù hợp; app retry kết nối có giới hạn, không chỉ dựa vào thứ tự startup. Không nhúng password cố định trong image/repo hoặc log URL đầy đủ.
+- [x] Smoke trên môi trường cô lập: migrate, bootstrap admin, MQTT→commit→ACK→REST, recreate app/database với volume và xác nhận device, credential, telemetry, command và runtime revision còn đúng.
 - [ ] Viết quy trình backup/restore theo engine và kiểm tra quyền, tính nhất quán, version, checksum và thất bại; restore vào DB/data dir mới, khởi động app và kiểm tra dữ liệu qua API/MQTT. Không ghi đè dữ liệu đang dùng; ghi artifact, lệnh và timestamp.
 - [ ] Tài liệu hóa cách triển khai, config, secret, health/readiness, backup, restore, rollback, giới hạn và troubleshooting; SQLite/WAL procedure không bị thay thế bằng hướng dẫn engine ngoài.
 
@@ -109,7 +109,7 @@ Shared A18 cũng kiểm tra trực tiếp repository ACK: lỗi storage rollback
 
 MQTT ACL suite gốc dùng chung body/assertions cho SQLite và PostgreSQL subprocess: `cargo test --test mqtt_acl` 6 passed, 5 ignored; `sh tests/acl_postgres.sh` 5 passed trên năm container PostgreSQL fixture riêng. Đây chỉ là suite ACL; protocol/session-generation và các suite khác vẫn chưa đủ evidence A18.
 
-Protocol QoS/wildcard: test gốc `qos_levels_and_own_device_wildcard_round_trip` dùng cùng body/assertions cho SQLite và PostgreSQL. Test SQLite focused 1 passed; `sh tests/protocol_postgres.sh` 1 passed trên container riêng, bao gồm QoS 0/1/2. Đây chỉ là một test của suite protocol; session-generation và các case protocol còn lại vẫn mở.
+Protocol: ba test gốc dùng cùng body/assertions cho SQLite và PostgreSQL: QoS 0/1/2 với wildcard, giới hạn topic level và giới hạn packet. SQLite focused tests PASS; `sh tests/protocol_postgres.sh` 3 passed, mỗi test dùng container riêng. Test packet-limit PostgreSQL đặt `telemetry.max_payload_bytes=1024` để config hợp lệ với `mqtt.max_packet_bytes=1024`. Session-generation và các case protocol còn lại vẫn mở.
 
 Shared A18 inject lỗi ghi telemetry bằng trigger DB: ACK đầu tiên `retryable/storage_unavailable`, không có row; sau khi gỡ trigger, retry cùng bytes/event ID nhận `stored` hoặc `duplicate` và có đúng một row. SQLite focused và PostgreSQL recovery runner PASS. Test quan sát ACK đầu tiên, không giám sát liên tục mọi ACK trong suốt khoảng lỗi. Assertion failed-publish cũng giữ đúng status trước đó (`pending` hoặc đã `dispatched`) thay vì giả định luôn `pending`.
 

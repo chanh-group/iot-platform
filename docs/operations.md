@@ -284,7 +284,7 @@ Admin file phải đọc được bởi UID container `10001`: chỉ dùng `0644
 
 ### PostgreSQL backup
 
-Tạo backup nhất quán khi app đang chạy:
+Tạo snapshot PostgreSQL nhất quán khi app đang chạy (chỉ database):
 
 ```sh
 ./backup-postgres.sh /path/to/backups/iot-postgres-2026-11-10
@@ -309,6 +309,8 @@ curl -fsS http://127.0.0.1:8080/readyz
 ```
 
 Restore script chỉ nhận database mới chưa tồn tại, yêu cầu target PostgreSQL 18 và xác minh checksum trước `pg_restore`; database gốc không bị sửa. Sau khi app reconnect, verify admin login, devices/credentials qua API, telemetry history, command, audit và runtime revision. Giữ nguyên database/backup gốc tới khi drill được xác nhận. Nếu restore dở, không đổi `IOT_DATABASE_NAME` sang DB đó; điều tra/xóa chỉ database mới do drill sở hữu, không `down -v` volume.
+
+Ví dụ trên giữ app volume hiện tại; không phục hồi `runtime.toml` từ backup. Nếu cần khôi phục sang app volume mới, phải khôi phục bản sao runtime riêng đã kiểm tra checksum và quyền trước khi start app. `restore-postgres.sh` không tự sao chép hay xác minh runtime config.
 
 **Rollback sau restore thử:** dừng app đang dùng DB đích, giữ nguyên DB đích để điều tra; khôi phục app volume/runtime config ban đầu nếu đã thay đổi, đặt `IOT_DATABASE_NAME` về tên DB gốc rồi recreate riêng app. Kiểm tra `/readyz`, đăng nhập và đối chiếu dữ liệu trước khi cho thiết bị ghi lại. Không xóa DB hoặc volume gốc. `pg_restore` lỗi sau `createdb` có thể để lại DB đích dở dang; chỉ operator xác minh tên và quyền sở hữu của DB đích mới được quyết định dọn nó trước khi thử lại.
 
