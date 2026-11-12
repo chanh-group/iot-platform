@@ -892,11 +892,23 @@ async fn subscription_limit_is_enforced_by_the_listener() {
     };
     let app = TestApp::builder().mqtt_config(config).start().await;
     let device = app.create_device("protocol-sub-limit", true).await;
-    let (client, mut eventloop, _) =
-        mqtt_connect(app.mqtt_addr, &device.id, &device.id, &device.token, true).await;
+    subscription_limit_round_trip(app.mqtt_addr, &device.id, &device.token).await;
+}
 
-    let status = format!("devices/{}/status", device.id);
-    let data = format!("devices/{}/data/#", device.id);
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture; run tests/protocol_postgres.sh"]
+async fn subscription_limit_is_enforced_by_the_listener_postgres() {
+    let fixture =
+        protocol_postgres::start("protocol-sub-limit", "max_subscriptions_per_client=1\n", "")
+            .await;
+    subscription_limit_round_trip(fixture.addr, &fixture.device.id, &fixture.device.token).await;
+}
+
+async fn subscription_limit_round_trip(addr: std::net::SocketAddr, device_id: &str, token: &str) {
+    let (client, mut eventloop, _) = mqtt_connect(addr, device_id, device_id, token, true).await;
+
+    let status = format!("devices/{device_id}/status");
+    let data = format!("devices/{device_id}/data/#");
     assert_eq!(
         mqtt_subscribe(&client, &mut eventloop, &status, QoS::AtLeastOnce).await,
         SubscribeReasonCode::Success(QoS::AtLeastOnce)

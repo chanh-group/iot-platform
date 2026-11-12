@@ -117,6 +117,8 @@ Persistent session reconnect/expiry cũng dùng body gốc cho hai backend: focu
 
 Test gốc `max_inflight_per_client_limits_unacknowledged_qos1_deliveries` dùng chung body cho SQLite/PostgreSQL, với `max_inflight_per_client=1` và truy vấn row theo device; focused SQLite và `sh tests/protocol_postgres.sh max_inflight_per_client_limits_unacknowledged_qos1_deliveries_postgres` đều 1 passed. Runner mặc định giữ bốn case trước và thêm case này.
 
+Test gốc `subscription_limit_is_enforced_by_the_listener` dùng chung body SQLite/PostgreSQL với giới hạn một subscription; focused SQLite và `sh tests/protocol_postgres.sh subscription_limit_is_enforced_by_the_listener_postgres` đều 1 passed. Runner mặc định có thêm case PostgreSQL này.
+
 Retained last-will dùng chung assertions gốc: focused SQLite và `sh tests/protocol_postgres.sh retained_last_will_is_replayed_after_ungraceful_disconnect_postgres` đều 1 passed. PostgreSQL chạy broker in-process `start_with_ingest` cùng adapter fixture; test kiểm tra presence, retained count và replay. Đây không thay thế các test protocol còn lại.
 
 MQTT auth: toàn bộ bốn test gốc chạy cùng body trên SQLite/PostgreSQL: từ chối MQTT 3.1/5, duplicate client ID/session generation, valid token/presence và credential-refusal matrix. SQLite focused PASS; `sh tests/mqtt_auth_postgres.sh` 4 passed với container riêng từng test. Matrix giữ bảy trường hợp từ chối, kiểm tra không PUBACK/không ghi telemetry, token sau rotate hoạt động và presence drain sau khi xác nhận online.

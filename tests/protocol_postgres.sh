@@ -37,6 +37,7 @@ if [ "$#" -eq 1 ]; then
 else
     run_case qos_levels_and_own_device_wildcard_round_trip_postgres
     run_case max_inflight_per_client_limits_unacknowledged_qos1_deliveries_postgres
+    run_case subscription_limit_is_enforced_by_the_listener_postgres
     run_case persistent_session_reconnects_then_expires_postgres
     run_case retained_last_will_is_replayed_after_ungraceful_disconnect_postgres
     run_case topic_level_limit_is_enforced_by_the_listener_postgres
