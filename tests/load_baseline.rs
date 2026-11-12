@@ -896,9 +896,8 @@ fn metric_value(exposition: &str, name: &str) -> u64 {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn postgres_fixture_interrupt_cleans_only_its_test_group_and_container() -> anyhow::Result<()> {
+fn postgres_fixture_failed_test_cleans_only_its_test_group_and_container() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    use std::os::unix::process::CommandExt;
     use std::thread;
 
     let fixture_dir = tempfile::tempdir()?;
@@ -948,7 +947,7 @@ esac
     let fake_cargo = bin.join("cargo");
     fs::write(
         &fake_cargo,
-        "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$FIXTURE_TEST_DIR/test-child.pid\"\nexec /bin/sleep 300\n",
+        "#!/bin/sh\n/bin/sleep 300 &\nprintf '%s\\n' \"$!\" > \"$FIXTURE_TEST_DIR/test-child.pid\"\nexit 143\n",
     )?;
     for executable in [&docker, &fake_cargo] {
         fs::set_permissions(executable, fs::Permissions::from_mode(0o755))?;
@@ -957,9 +956,7 @@ esac
         &std::env::var_os("PATH").context("PATH missing")?,
     )))?;
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/load/postgres-fixture.sh");
-    let mut runner_command = Command::new("sh");
-    runner_command.process_group(0);
-    let runner = runner_command
+    let runner = Command::new("sh")
         .arg(script)
         .env("PATH", path)
         .env("FIXTURE_TEST_DIR", fixture_dir.path())
@@ -975,13 +972,6 @@ esac
     let child_pid: u32 = fs::read_to_string(&child_pid_file)?.trim().parse()?;
 
     let mut outside = Command::new("/bin/sleep").arg("300").spawn()?;
-    let signal = Command::new("kill")
-        .args(["-TERM", "--", &format!("-{}", runner.id())])
-        .status()?;
-    ensure!(
-        signal.success(),
-        "failed to terminate fixture runner process group"
-    );
     let output = runner.wait_with_output()?;
     ensure!(
         output.status.code() == Some(143),
@@ -990,7 +980,7 @@ esac
     );
     ensure!(
         !linux_process_is_running(child_pid),
-        "test-group child survived runner interrupt"
+        "test-group child survived failed test cleanup"
     );
     ensure!(
         linux_process_is_running(outside.id()),
