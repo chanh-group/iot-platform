@@ -37,6 +37,52 @@ async fn create_command(
         .unwrap()
 }
 
+async fn assert_raw_request_idempotency(http: &reqwest::Client, base: &str, device_id: &str) {
+    let request =
+        r#"{"name":"reboot","params":{"n":1},"ttl_ms":60000,"idempotency_key":"same-key"}"#;
+
+    let first = http
+        .post(format!("{base}/api/v1/devices/{device_id}/commands"))
+        .header("X-IoT-CSRF", "1")
+        .header("X-Request-ID", "command-api-123")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(request.to_owned())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), reqwest::StatusCode::ACCEPTED);
+    let first_body: Value = first.json().await.unwrap();
+    let replay = http
+        .post(format!("{base}/api/v1/devices/{device_id}/commands"))
+        .header("X-IoT-CSRF", "1")
+        .header("X-Request-ID", "command-api-123")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(request.to_owned())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(replay.headers()["idempotent-replayed"], "true");
+    let replay_body: Value = replay.json().await.unwrap();
+    assert_eq!(replay_body["command_id"], first_body["command_id"]);
+
+    let same_value_different_bytes = "{\n \"idempotency_key\":\"same-key\", \"ttl_ms\":60000, \"params\":{\"n\":1}, \"name\":\"reboot\"\n}";
+    let conflict = http
+        .post(format!("{base}/api/v1/devices/{device_id}/commands"))
+        .header("X-IoT-CSRF", "1")
+        .header("X-Request-ID", "command-api-123")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(same_value_different_bytes)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        conflict.json::<Value>().await.unwrap()["code"],
+        "idempotency_conflict"
+    );
+}
+
 #[tokio::test]
 async fn create_commits_command_and_redacted_audit_before_returning_202() {
     let app = TestApp::start().await;
@@ -213,25 +259,7 @@ async fn idempotency_uses_raw_request_bytes_and_does_not_audit_replays() {
     let app = TestApp::start().await;
     let device = app.create_device("command-idempotency", true).await;
     let http = admin_client(&app, "command-idempotency-admin").await;
-    let request =
-        r#"{"name":"reboot","params":{"n":1},"ttl_ms":60000,"idempotency_key":"same-key"}"#;
-
-    let first = create_command(&http, &app, &device.id, request).await;
-    assert_eq!(first.status(), reqwest::StatusCode::ACCEPTED);
-    let first_body: Value = first.json().await.unwrap();
-    let replay = create_command(&http, &app, &device.id, request).await;
-    assert_eq!(replay.status(), reqwest::StatusCode::ACCEPTED);
-    assert_eq!(replay.headers()["idempotent-replayed"], "true");
-    let replay_body: Value = replay.json().await.unwrap();
-    assert_eq!(replay_body["command_id"], first_body["command_id"]);
-
-    let same_value_different_bytes = "{\n \"idempotency_key\":\"same-key\", \"ttl_ms\":60000, \"params\":{\"n\":1}, \"name\":\"reboot\"\n}";
-    let conflict = create_command(&http, &app, &device.id, same_value_different_bytes).await;
-    assert_eq!(conflict.status(), reqwest::StatusCode::CONFLICT);
-    assert_eq!(
-        conflict.json::<Value>().await.unwrap()["code"],
-        "idempotency_conflict"
-    );
+    assert_raw_request_idempotency(&http, &app.base, &device.id).await;
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM commands WHERE device_id = ? AND idempotency_key = 'same-key'",
@@ -247,6 +275,47 @@ async fn idempotency_uses_raw_request_bytes_and_does_not_audit_replays() {
             "SELECT COUNT(*) FROM audit_events WHERE action = 'command.create'",
         )
         .fetch_one(&app.pool)
+        .await
+        .unwrap(),
+        1
+    );
+}
+
+#[path = "common/mqtt_auth_postgres.rs"]
+mod mqtt_auth_postgres;
+
+#[tokio::test]
+#[ignore = "requires tests/command_api_postgres.sh"]
+async fn idempotency_uses_raw_request_bytes_and_does_not_audit_replays_postgres() {
+    let app = mqtt_auth_postgres::PostgresApp::start().await;
+    let device = app.create_device("command-idempotency").await;
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(reqwest::header::COOKIE, app.admin_cookie().parse().unwrap());
+    let http = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap();
+    let base = app.base_url();
+    assert_raw_request_idempotency(&http, base, &device.id).await;
+
+    let pool = sqlx::PgPool::connect(&std::env::var("IOT_TEST_POSTGRES_URL").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM commands WHERE device_id = $1 AND idempotency_key = 'same-key'",
+        )
+        .bind(&device.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'command.create'",
+        )
+        .fetch_one(&pool)
         .await
         .unwrap(),
         1

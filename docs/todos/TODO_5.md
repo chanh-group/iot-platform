@@ -125,6 +125,8 @@ Admin auth: test login/me/logout và cookie flags chạy shared HTTP assertions 
 
 Overview API: test gốc database windows/live presence dùng shared assertions trên SQLite/PostgreSQL; PostgreSQL seed telemetry/command bằng bind SQL, tạo online presence qua MQTT, và lấy rejected-counter baseline từ chính API subprocess. Focused SQLite 1 passed; PostgreSQL runner 3 lượt liên tiếp, mỗi lượt 1 passed. Overview failure/readiness cases khác vẫn mở.
 
+Command API: raw-byte idempotency/replay test gốc dùng chung request/response assertions cho SQLite/PostgreSQL; xác minh replay cùng ID, khác bytes báo conflict, chỉ một command và một `command.create` audit. SQLite focused 1 passed; `sh tests/command_api_postgres.sh` 1 passed. Command expiry/late-ACK, storage-failure/ACK race và full lifecycle matrix vẫn mở.
+
 Persistent session reconnect/expiry, broker restart và retained last-will cũng đã được port: focused SQLite và PostgreSQL fixture PASS; broker-restart giữ assertion offline trước restart, discarded session-present sau restart, và device online lại sau reconnect. Session expiry PostgreSQL dùng broker in-process `start_with_ingest` cùng repository fixture và TTL test 500 ms; listener subprocess production vẫn giữ cấu hình hợp lệ, không kiểm tra TTL dưới minimum 60 giây. Còn các protocol cases khác chưa port.
 
 Test gốc `max_inflight_per_client_limits_unacknowledged_qos1_deliveries` dùng chung body cho SQLite/PostgreSQL, với `max_inflight_per_client=1` và truy vấn row theo device; focused SQLite và PostgreSQL runner đều passed. Runner mặc định tiếp tục giữ các case protocol đã port.
