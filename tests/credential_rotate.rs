@@ -1,4 +1,6 @@
 mod common;
+#[path = "common/mqtt_auth_postgres.rs"]
+mod mqtt_auth_postgres;
 
 use std::time::Duration;
 
@@ -8,6 +10,125 @@ use common::{
 };
 use rumqttc::{AsyncClient, ConnectReturnCode, ConnectionError, Event, Packet, QoS};
 use serde_json::{Value, json};
+
+async fn assert_online_rotation(
+    client: &reqwest::Client,
+    base: &str,
+    mqtt_addr: std::net::SocketAddr,
+    device_id: &str,
+    old_token: &str,
+) -> (String, String) {
+    let (_old_client, mut old_eventloop, _) =
+        mqtt_connect(mqtt_addr, device_id, device_id, old_token, true).await;
+    let response = client
+        .post(format!(
+            "{base}/api/v1/devices/{device_id}/credentials/rotate"
+        ))
+        .header("X-IoT-CSRF", "1")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["device_id"], device_id);
+    let new_credential_id = body["credential"]["id"].as_str().unwrap().to_owned();
+    let new_token = body["credential"]["token"].as_str().unwrap().to_owned();
+    assert_ne!(new_token, old_token);
+    assert_eq!(new_token.len(), 47);
+
+    mqtt_wait_closed(&mut old_eventloop, Duration::from_secs(3)).await;
+    assert_eq!(
+        mqtt_connect_refused(mqtt_addr, device_id, device_id, old_token).await,
+        ConnectReturnCode::BadUserNamePassword
+    );
+    let (_new_client, _new_eventloop, _) =
+        mqtt_connect(mqtt_addr, device_id, device_id, &new_token, true).await;
+    (new_credential_id, new_token)
+}
+
+fn assert_rotation_storage(
+    old_credential_id: &str,
+    new_credential_id: &str,
+    new_token: &str,
+    old_status: &str,
+    rotated_from: Option<&str>,
+    audit_action: &str,
+    audit_details: &Value,
+) {
+    assert_eq!(old_status, "revoked");
+    assert_eq!(rotated_from, Some(old_credential_id));
+    assert_eq!(audit_action, "credential.rotate");
+    assert_eq!(
+        *audit_details,
+        json!({
+            "old_credential_id": old_credential_id,
+            "new_credential_id": new_credential_id
+        })
+    );
+    assert!(!audit_details.to_string().contains(new_token));
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture; run tests/credential_rotate_postgres.sh"]
+async fn rotates_an_online_device_and_rejects_the_previous_token_postgres() {
+    let app = mqtt_auth_postgres::PostgresApp::start().await;
+    let http = reqwest::Client::builder()
+        .default_headers(reqwest::header::HeaderMap::from_iter([(
+            reqwest::header::COOKIE,
+            app.admin_cookie().parse().unwrap(),
+        )]))
+        .build()
+        .unwrap();
+    let device = app.create_device("credential-rotation-postgres").await;
+    let pool = sqlx::PgPool::connect(&std::env::var("IOT_TEST_POSTGRES_URL").unwrap())
+        .await
+        .unwrap();
+    let old_credential_id: String = sqlx::query_scalar(
+        "SELECT id FROM device_credentials WHERE device_id = $1 AND status = 'active'",
+    )
+    .bind(&device.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let (new_credential_id, new_token) = assert_online_rotation(
+        &http,
+        app.base_url(),
+        app.mqtt_addr(),
+        &device.id,
+        &device.token,
+    )
+    .await;
+
+    let old_status: String =
+        sqlx::query_scalar("SELECT status FROM device_credentials WHERE id = $1")
+            .bind(&old_credential_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let rotated_from: Option<String> =
+        sqlx::query_scalar("SELECT rotated_from FROM device_credentials WHERE id = $1")
+            .bind(&new_credential_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let audit: (String, Value) = sqlx::query_as(
+        "SELECT action, details_json FROM audit_events WHERE target_id = $1 ORDER BY id DESC LIMIT 1",
+    )
+    .bind(&device.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_rotation_storage(
+        &old_credential_id,
+        &new_credential_id,
+        &new_token,
+        &old_status,
+        rotated_from.as_deref(),
+        &audit.0,
+        &audit.1,
+    );
+}
 
 async fn admin_client(app: &TestApp, username: &str) -> reqwest::Client {
     app.create_admin(username, "credential-rotation-test-password")
@@ -52,25 +173,8 @@ async fn rotates_an_online_device_and_rejects_the_previous_token() {
     .fetch_one(&app.pool)
     .await
     .unwrap();
-    let (_old_client, mut old_eventloop, _) =
-        mqtt_connect(app.mqtt_addr, &device.id, &device.id, &device.token, true).await;
-
-    let response = rotate(&http, &app, &device.id).await;
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-    let body: Value = response.json().await.unwrap();
-    assert_eq!(body["device_id"], device.id);
-    let new_credential_id = body["credential"]["id"].as_str().unwrap();
-    let new_token = body["credential"]["token"].as_str().unwrap();
-    assert_ne!(new_token, device.token);
-    assert_eq!(new_token.len(), 47);
-
-    mqtt_wait_closed(&mut old_eventloop, Duration::from_secs(3)).await;
-    assert_eq!(
-        mqtt_connect_refused(app.mqtt_addr, &device.id, &device.id, &device.token).await,
-        ConnectReturnCode::BadUserNamePassword
-    );
-    let (_new_client, _new_eventloop, _) =
-        mqtt_connect(app.mqtt_addr, &device.id, &device.id, new_token, true).await;
+    let (new_credential_id, new_token) =
+        assert_online_rotation(&http, &app.base, app.mqtt_addr, &device.id, &device.token).await;
 
     let old_status: String =
         sqlx::query_scalar("SELECT status FROM device_credentials WHERE id = ?")
@@ -80,12 +184,10 @@ async fn rotates_an_online_device_and_rejects_the_previous_token() {
             .unwrap();
     let rotated_from: Option<String> =
         sqlx::query_scalar("SELECT rotated_from FROM device_credentials WHERE id = ?")
-            .bind(new_credential_id)
+            .bind(&new_credential_id)
             .fetch_one(&app.pool)
             .await
             .unwrap();
-    assert_eq!(old_status, "revoked");
-    assert_eq!(rotated_from.as_deref(), Some(old_credential_id.as_str()));
     let audit: (String, String) = sqlx::query_as(
         "SELECT action, details_json FROM audit_events WHERE target_id = ? ORDER BY id DESC LIMIT 1",
     )
@@ -93,15 +195,15 @@ async fn rotates_an_online_device_and_rejects_the_previous_token() {
     .fetch_one(&app.pool)
     .await
     .unwrap();
-    assert_eq!(audit.0, "credential.rotate");
-    assert_eq!(
-        serde_json::from_str::<Value>(&audit.1).unwrap(),
-        json!({
-            "old_credential_id": old_credential_id,
-            "new_credential_id": new_credential_id
-        })
+    assert_rotation_storage(
+        &old_credential_id,
+        &new_credential_id,
+        &new_token,
+        &old_status,
+        rotated_from.as_deref(),
+        &audit.0,
+        &serde_json::from_str(&audit.1).unwrap(),
     );
-    assert!(!audit.1.contains(new_token));
 }
 
 #[tokio::test]

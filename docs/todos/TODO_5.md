@@ -115,13 +115,19 @@ Protocol: test gốc QoS 0/1/2 với wildcard, giới hạn topic level/packet, 
 
 Device API: hai body PostgreSQL dùng chung assertions với SQLite: live presence/bounded pagination và tie-break cursor pagination với ba device có cùng `created_at`. Focused SQLite và `sh tests/device_api_postgres.sh` đều pass (mỗi case 1 passed). Mutation/audit/error cases khác của `device_api.rs` chưa port toàn bộ.
 
+Attributes: test gốc latest values/invalid/retained updates dùng shared body cho SQLite/PostgreSQL; gồm HTTP cursor pagination, persisted-state reject checks và storage-unavailable khi lần lượt thiếu attributes/devices/sessions table. Focused SQLite và `sh tests/attributes_postgres.sh` đều 1 passed. PostgreSQL subprocess không thể chia sẻ process-local rejection metric; tương đương được xác nhận qua state không đổi. Các retained-cap/restart cases khác vẫn chưa port.
+
+Credential rotation: test gốc online rotation dùng shared assertions SQLite/PostgreSQL; xác minh session kick, token cũ bị từ chối, token mới dùng được, rotated_from/audit/redaction. Focused SQLite và `sh tests/credential_rotate_postgres.sh` đều 1 passed. Các disabled/not-found/auth-CSRF/rollback API cases còn lại chưa được port toàn bộ.
+
 Persistent session reconnect/expiry, broker restart và retained last-will cũng đã được port: focused SQLite và PostgreSQL fixture PASS; broker-restart giữ assertion offline trước restart, discarded session-present sau restart, và device online lại sau reconnect. Session expiry PostgreSQL dùng broker in-process `start_with_ingest` cùng repository fixture và TTL test 500 ms; listener subprocess production vẫn giữ cấu hình hợp lệ, không kiểm tra TTL dưới minimum 60 giây. Còn các protocol cases khác chưa port.
 
-Test gốc `max_inflight_per_client_limits_unacknowledged_qos1_deliveries` dùng chung body cho SQLite/PostgreSQL, với `max_inflight_per_client=1` và truy vấn row theo device; focused SQLite và `sh tests/protocol_postgres.sh max_inflight_per_client_limits_unacknowledged_qos1_deliveries_postgres` đều 1 passed. Runner mặc định giữ bốn case trước và thêm case này.
+Test gốc `max_inflight_per_client_limits_unacknowledged_qos1_deliveries` dùng chung body cho SQLite/PostgreSQL, với `max_inflight_per_client=1` và truy vấn row theo device; focused SQLite và PostgreSQL runner đều passed. Runner mặc định tiếp tục giữ các case protocol đã port.
 
-Test gốc `subscription_limit_is_enforced_by_the_listener` dùng chung body SQLite/PostgreSQL với giới hạn một subscription; focused SQLite và `sh tests/protocol_postgres.sh subscription_limit_is_enforced_by_the_listener_postgres` đều 1 passed. Runner mặc định có thêm case PostgreSQL này.
+Test gốc `subscription_limit_is_enforced_by_the_listener` dùng chung body SQLite/PostgreSQL với giới hạn một subscription; focused SQLite và PostgreSQL runner đều passed.
 
 Retained last-will dùng chung assertions gốc: focused SQLite và `sh tests/protocol_postgres.sh retained_last_will_is_replayed_after_ungraceful_disconnect_postgres` đều 1 passed. PostgreSQL chạy broker in-process `start_with_ingest` cùng adapter fixture; test kiểm tra presence, retained count và replay. Đây không thay thế các test protocol còn lại.
+
+**Rust workflow rerun (2026-11-12T13:28+07:00):** `cargo test --all` PASS (301 passed, 0 failed, 29 ignored); `cargo clippy --all-targets --all-features -- -D warnings` PASS; `cargo fmt --all --check` PASS. PostgreSQL ignored suites cần chạy riêng; targeted attributes và credential-rotation PostgreSQL mỗi test 1 passed.
 
 MQTT auth: toàn bộ bốn test gốc chạy cùng body trên SQLite/PostgreSQL: từ chối MQTT 3.1/5, duplicate client ID/session generation, valid token/presence và credential-refusal matrix. SQLite focused PASS; `sh tests/mqtt_auth_postgres.sh` 4 passed với container riêng từng test. Matrix giữ bảy trường hợp từ chối, kiểm tra không PUBACK/không ghi telemetry, token sau rotate hoạt động và presence drain sau khi xác nhận online.
 

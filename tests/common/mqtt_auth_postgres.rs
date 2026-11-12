@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::{
     net::{IpAddr, SocketAddr},
     process::{Child, Command, Stdio},
@@ -154,6 +156,14 @@ impl PostgresApp {
 
     pub fn mqtt_addr(&self) -> SocketAddr {
         self.mqtt_addr
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base
+    }
+
+    pub fn admin_cookie(&self) -> &str {
+        &self.cookie
     }
 
     pub async fn create_device(&self, name: &str) -> TestDevice {
