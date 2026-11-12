@@ -176,6 +176,52 @@ impl PostgresApp {
         }
     }
 
+    pub async fn create_device_disabled(&self, name: &str) -> TestDevice {
+        let device = self.create_device(name).await;
+        let response = reqwest::Client::new()
+            .patch(format!("{}/api/v1/devices/{}", self.base, device.id))
+            .header("Cookie", &self.cookie)
+            .header("X-IoT-CSRF", "1")
+            .json(&serde_json::json!({"enabled":false}))
+            .send()
+            .await
+            .expect("disable test device");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        device
+    }
+
+    pub async fn revoke_active_credential(&self, device_id: &str) {
+        sqlx::query(
+            "UPDATE device_credentials SET status = 'revoked', revoked_at = $1
+             WHERE device_id = $2 AND status = 'active'",
+        )
+        .bind(iot_server::core::auth::now_ms())
+        .bind(device_id)
+        .execute(&self.pool)
+        .await
+        .expect("revoke fixture credential");
+    }
+
+    pub async fn rotate_credential(&self, device_id: &str) -> String {
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/api/v1/devices/{device_id}/credentials/rotate",
+                self.base
+            ))
+            .header("Cookie", &self.cookie)
+            .header("X-IoT-CSRF", "1")
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("rotate fixture credential");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = response.json().await.expect("rotation response");
+        body["credential"]["token"]
+            .as_str()
+            .expect("rotated credential token")
+            .to_owned()
+    }
+
     pub async fn assert_no_devices_online(&self) {
         let response = reqwest::Client::new()
             .get(format!("{}/api/v1/overview", self.base))
@@ -205,6 +251,35 @@ pub struct PostgresQueries {
 }
 
 impl PostgresQueries {
+    pub async fn telemetry_count(&self, device_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM telemetry_events WHERE device_id = $1")
+            .bind(device_id)
+            .fetch_one(&self.pool)
+            .await
+            .expect("count PostgreSQL telemetry rows")
+    }
+
+    pub async fn wait_no_devices_online(&self) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let response = reqwest::Client::new()
+                    .get(format!("{}/api/v1/overview", self.base))
+                    .header("Cookie", &self.cookie)
+                    .send()
+                    .await
+                    .expect("query overview");
+                assert!(response.status().is_success(), "overview query failed");
+                let body: serde_json::Value = response.json().await.expect("overview");
+                if body["devices"]["online"].as_u64() == Some(0) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("presence to drain");
+    }
+
     pub async fn is_online(&self, device_id: &str) -> bool {
         let response = reqwest::Client::new()
             .get(format!("{}/api/v1/devices/{device_id}", self.base))

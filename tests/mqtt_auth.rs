@@ -7,8 +7,8 @@ mod postgres;
 use std::time::Duration;
 
 use common::{
-    TestApp, connack_code, mqtt_connect, mqtt_connect_refused, mqtt_wait_closed, raw_connack,
-    raw_publish_after_refused_connect, wait_until,
+    TestApp, TestDevice, connack_code, mqtt_connect, mqtt_connect_refused, mqtt_wait_closed,
+    raw_connack, raw_publish_after_refused_connect, wait_until,
 };
 use iot_server::config::schema::TelemetryConfig;
 use rumqttc::ConnectReturnCode;
@@ -118,6 +118,113 @@ async fn bad_credentials_are_all_refused_with_the_same_code() {
     server.revoke_active_credential(&revoked.id).await;
     let rotated = server.create_device("sensor-rotated", true).await;
     let rotated_new_token = server.rotate_credential(&rotated.id).await;
+    let pool = server.pool.clone();
+    let presence = server.presence.clone();
+    let online_presence = server.presence.clone();
+    let online_id = rotated.id.clone();
+    bad_credentials_body(
+        server.mqtt_addr,
+        (device, disabled, revoked, rotated),
+        rotated_new_token,
+        move |device_id| {
+            let device_id = device_id.to_owned();
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar("SELECT COUNT(*) FROM telemetry_events WHERE device_id = ?")
+                    .bind(device_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        },
+        move || {
+            let presence = presence.clone();
+            async move {
+                wait_until(
+                    || {
+                        presence
+                            .online_count()
+                            .expect("presence state should remain healthy")
+                            == 0
+                    },
+                    WAIT,
+                    "presence to drain",
+                )
+                .await;
+            }
+        },
+        move || {
+            let presence = online_presence.clone();
+            let id = online_id.clone();
+            async move {
+                presence
+                    .is_online(&id)
+                    .expect("presence state should remain healthy")
+            }
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture; run tests/mqtt_auth_postgres.sh"]
+async fn bad_credentials_are_all_refused_with_the_same_code_postgres() {
+    let server = postgres::PostgresApp::start().await;
+    let device = postgres_device(server.create_device("sensor-refused").await);
+    let disabled = postgres_device(server.create_device_disabled("sensor-disabled").await);
+    let revoked = postgres_device(server.create_device("sensor-revoked").await);
+    server.revoke_active_credential(&revoked.id).await;
+    let rotated = postgres_device(server.create_device("sensor-rotated").await);
+    let rotated_new_token = server.rotate_credential(&rotated.id).await;
+    let telemetry_queries = server.clone_for_queries();
+    let presence_queries = server.clone_for_queries();
+    let online_queries = server.clone_for_queries();
+    let online_id = rotated.id.clone();
+
+    bad_credentials_body(
+        server.mqtt_addr(),
+        (device, disabled, revoked, rotated),
+        rotated_new_token,
+        move |device_id| {
+            let server = telemetry_queries.clone();
+            let device_id = device_id.to_owned();
+            async move { server.telemetry_count(&device_id).await }
+        },
+        move || {
+            let server = presence_queries.clone();
+            async move { server.wait_no_devices_online().await }
+        },
+        move || {
+            let server = online_queries.clone();
+            let id = online_id.clone();
+            async move { server.is_online(&id).await }
+        },
+    )
+    .await;
+}
+
+fn postgres_device(device: postgres::TestDevice) -> TestDevice {
+    TestDevice {
+        id: device.id,
+        token: device.token,
+    }
+}
+
+async fn bad_credentials_body<F, Fut, D, Drain, Online, OnlineFuture>(
+    address: std::net::SocketAddr,
+    (device, disabled, revoked, rotated): (TestDevice, TestDevice, TestDevice, TestDevice),
+    rotated_new_token: String,
+    telemetry_count: F,
+    drain_presence: D,
+    is_online: Online,
+) where
+    F: Fn(&str) -> Fut,
+    Fut: std::future::Future<Output = i64>,
+    D: FnOnce() -> Drain,
+    Drain: std::future::Future<Output = ()>,
+    Online: Fn() -> OnlineFuture,
+    OnlineFuture: std::future::Future<Output = bool>,
+{
     let unknown = uuid::Uuid::now_v7().to_string();
     let other = uuid::Uuid::now_v7().to_string();
 
@@ -166,7 +273,7 @@ async fn bad_credentials_are_all_refused_with_the_same_code() {
         ),
     ] {
         assert_eq!(
-            mqtt_connect_refused(server.mqtt_addr, client_id, username, token).await,
+            mqtt_connect_refused(address, client_id, username, token).await,
             ConnectReturnCode::BadUserNamePassword,
             "{label}"
         );
@@ -180,7 +287,7 @@ async fn bad_credentials_are_all_refused_with_the_same_code() {
         };
         assert!(
             !raw_publish_after_refused_connect(
-                server.mqtt_addr,
+                address,
                 device_id,
                 device_id,
                 token,
@@ -193,40 +300,19 @@ async fn bad_credentials_are_all_refused_with_the_same_code() {
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
     for device_id in [&device.id, &disabled.id] {
-        let rows: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM telemetry_events WHERE device_id = ?")
-                .bind(device_id)
-                .fetch_one(&server.pool)
-                .await
-                .unwrap();
+        let rows = telemetry_count(device_id).await;
         assert_eq!(
             rows, 0,
             "refused MQTT authentication must not store telemetry"
         );
     }
 
-    let (client, eventloop, _) = mqtt_connect(
-        server.mqtt_addr,
-        &rotated.id,
-        &rotated.id,
-        &rotated_new_token,
-        true,
-    )
-    .await;
+    let (client, eventloop, _) =
+        mqtt_connect(address, &rotated.id, &rotated.id, &rotated_new_token, true).await;
+    wait_online(&is_online, true, "rotated device online").await;
     drop(client);
     drop(eventloop);
-    wait_until(
-        || {
-            server
-                .presence
-                .online_count()
-                .expect("presence state should remain healthy")
-                == 0
-        },
-        WAIT,
-        "presence to drain",
-    )
-    .await;
+    drain_presence().await;
 }
 
 #[tokio::test]

@@ -37,5 +37,6 @@ run_test() {
 }
 
 run_test mqtt_31_and_mqtt_5_are_refused_at_the_wire_postgres
+run_test bad_credentials_are_all_refused_with_the_same_code_postgres
 run_test duplicate_client_id_uses_session_generation_postgres
 run_test valid_token_connects_and_marks_presence_postgres
