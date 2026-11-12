@@ -298,10 +298,13 @@ async fn csrf_content_type_and_origin_are_enforced() {
     let server = TestApp::start().await;
     server.create_admin("admin", PASSWORD).await;
     let client = server.client();
+    assert_csrf_content_type_and_origin(server.base.as_str(), &client, PASSWORD).await;
+}
 
+async fn assert_csrf_content_type_and_origin(base: &str, client: &reqwest::Client, password: &str) {
     let response = client
-        .post(login_url(&server))
-        .json(&json!({ "username": "admin", "password": PASSWORD }))
+        .post(format!("{base}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": password }))
         .send()
         .await
         .unwrap();
@@ -309,7 +312,7 @@ async fn csrf_content_type_and_origin_are_enforced() {
     assert_eq!(json_body(response).await["code"], "csrf_failed");
 
     let response = client
-        .post(login_url(&server))
+        .post(format!("{base}/api/v1/auth/login"))
         .header("X-IoT-CSRF", "1")
         .header(CONTENT_TYPE, "text/plain")
         .body(r#"{"username":"admin","password":"x"}"#)
@@ -320,10 +323,10 @@ async fn csrf_content_type_and_origin_are_enforced() {
     assert_eq!(json_body(response).await["code"], "unsupported_media_type");
 
     let response = client
-        .post(login_url(&server))
+        .post(format!("{base}/api/v1/auth/login"))
         .header("X-IoT-CSRF", "1")
         .header(ORIGIN, "http://evil.example")
-        .json(&json!({ "username": "admin", "password": PASSWORD }))
+        .json(&json!({ "username": "admin", "password": password }))
         .send()
         .await
         .unwrap();
@@ -331,27 +334,47 @@ async fn csrf_content_type_and_origin_are_enforced() {
     assert_eq!(json_body(response).await["code"], "csrf_failed");
 
     let response = client
-        .post(login_url(&server))
+        .post(format!("{base}/api/v1/auth/login"))
         .header("X-IoT-CSRF", "1")
-        .header(ORIGIN, &server.base)
-        .json(&json!({ "username": "admin", "password": PASSWORD }))
+        .header(ORIGIN, base)
+        .json(&json!({ "username": "admin", "password": password }))
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
-    let response = me(&client, &server).await;
+    let response = client
+        .get(format!("{base}/api/v1/auth/me"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
     let response = client
-        .post(format!("{}/api/v1/auth/logout", server.base))
+        .post(format!("{base}/api/v1/auth/logout"))
         .header(CONTENT_TYPE, "application/json")
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    let response = me(&client, &server).await;
+    let response = client
+        .get(format!("{base}/api/v1/auth/me"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+#[ignore = "requires isolated disposable PostgreSQL fixture; run tests/auth_postgres.sh"]
+async fn csrf_content_type_and_origin_are_enforced_postgres() {
+    let server = postgres::PostgresApp::start().await;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    assert_csrf_content_type_and_origin(server.base_url(), &client, "mqtt-auth-test-password")
+        .await;
 }
 
 #[tokio::test]
