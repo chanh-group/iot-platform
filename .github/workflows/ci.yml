@@ -77,6 +77,7 @@ jobs:
           sh tests/command_api_postgres.sh
           sh tests/command_list_postgres.sh
           sh tests/command_offline_postgres.sh
+          sh tests/command_ack_postgres.sh
 
   frontend:
     runs-on: ubuntu-24.04
