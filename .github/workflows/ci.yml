@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: ['**']
   pull_request:
     branches: [master]
 
@@ -26,10 +26,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - uses: oven-sh/setup-bun@v2
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         with:
           bun-version: 1.4.2
 
       - name: Build frontend assets for rust-embed
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         working-directory: web
         run: |
           bun install --frozen-lockfile
@@ -39,12 +41,43 @@ jobs:
         env:
           RUST_BACKTRACE: "1"
         run: |
-          cargo fmt --all --check
-          cargo clippy --all-targets --all-features -- -D warnings
           cargo test --all
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo fmt --all --check
+          python3 tests/load/test_cgroup.py
+          git diff --check
+
+      - name: Release tests and build
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        run: |
           cargo test --release --locked
           cargo build --release --locked
-          git diff --check
+
+  postgres:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.98.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: PostgreSQL integration and recovery
+        run: |
+          sh tests/postgres_recovery.sh
+          sh tests/postgres_migration_failure.sh
+          sh tests/acl_postgres.sh
+          sh tests/protocol_postgres.sh
+          sh tests/mqtt_auth_postgres.sh
+          sh tests/device_api_postgres.sh
+          sh tests/attributes_postgres.sh
+          sh tests/credential_rotate_postgres.sh
+          sh tests/auth_postgres.sh
+          sh tests/overview_postgres.sh
+          sh tests/command_api_postgres.sh
+          sh tests/command_list_postgres.sh
+          sh tests/command_offline_postgres.sh
+          sh tests/command_ack_postgres.sh
 
   frontend:
     runs-on: ubuntu-24.04
@@ -60,10 +93,21 @@ jobs:
         run: |
           bun install --frozen-lockfile
           bun run --bun typecheck
+
+      - name: Frontend tests without backend build
+        if: github.event_name != 'push' || github.ref != 'refs/heads/master'
+        working-directory: web
+        run: bun test $(ls tests/*.test.ts | grep -v '/backend-ui.test.ts$')
+
+      - name: Full frontend tests and build
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        working-directory: web
+        run: |
           bun run --bun test
           bun run --bun build
 
   docker:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4

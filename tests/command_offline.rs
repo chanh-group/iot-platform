@@ -1,4 +1,6 @@
 mod common;
+#[path = "common/mqtt_auth_postgres.rs"]
+mod mqtt_auth_postgres;
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -157,6 +159,75 @@ async fn reconnect_resends_with_the_persisted_command_id() {
         SubscribeReasonCode::Success(QoS::AtLeastOnce)
     );
     let resent = mqtt_wait_publish(&mut eventloop, Duration::from_secs(5)).await;
+    let payload: Value = serde_json::from_slice(&resent.payload).unwrap();
+    assert_eq!(payload["command_id"], command_id);
+}
+
+#[tokio::test]
+#[ignore = "requires tests/command_offline_postgres.sh"]
+async fn reconnect_resends_with_the_persisted_command_id_postgres() {
+    let app = mqtt_auth_postgres::PostgresApp::start().await;
+    let device = app.create_device("command-resend-postgres").await;
+    let (client, mut eventloop, _) =
+        mqtt_connect(app.mqtt_addr(), &device.id, &device.id, &device.token, true).await;
+    let topic = format!("devices/{}/commands", device.id);
+    assert_eq!(
+        mqtt_subscribe(&client, &mut eventloop, &topic, QoS::AtLeastOnce).await,
+        SubscribeReasonCode::Success(QoS::AtLeastOnce)
+    );
+
+    let http = reqwest::Client::new();
+    let created: Value = http
+        .post(format!(
+            "{}/api/v1/devices/{}/commands",
+            app.base_url(),
+            device.id
+        ))
+        .header(reqwest::header::COOKIE, app.admin_cookie())
+        .header("X-IoT-CSRF", "1")
+        .json(&json!({"name":"reboot","params":{"delay_s":5}}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let command_id = created["command_id"].as_str().unwrap().to_owned();
+    let first = common::mqtt_wait_publish(&mut eventloop, Duration::from_secs(4)).await;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&first.payload).unwrap()["command_id"],
+        command_id
+    );
+
+    drop(client);
+    drop(eventloop);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let response = http
+                .get(format!("{}/api/v1/overview", app.base_url()))
+                .header(reqwest::header::COOKIE, app.admin_cookie())
+                .send()
+                .await
+                .unwrap();
+            let overview: Value = response.json().await.unwrap();
+            if overview["devices"]["online"] == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("device disconnect");
+
+    let (client, mut eventloop, _) =
+        mqtt_connect(app.mqtt_addr(), &device.id, &device.id, &device.token, true).await;
+    assert_eq!(
+        mqtt_subscribe(&client, &mut eventloop, &topic, QoS::AtLeastOnce).await,
+        SubscribeReasonCode::Success(QoS::AtLeastOnce)
+    );
+    let resent = common::mqtt_wait_publish(&mut eventloop, Duration::from_secs(5)).await;
     let payload: Value = serde_json::from_slice(&resent.payload).unwrap();
     assert_eq!(payload["command_id"], command_id);
 }

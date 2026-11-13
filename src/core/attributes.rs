@@ -1,9 +1,14 @@
 //! Validated latest-value device attributes (`02` §2.7).
 
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Map, Value};
+use tokio::sync::mpsc;
 
 use crate::core::telemetry::{TelemetryPayload, valid_values};
+use crate::observability::metrics::Metrics;
 
 /// Attribute updates ready for persistence.
 #[derive(Debug, Clone, PartialEq)]
@@ -14,6 +19,75 @@ pub struct ValidatedAttributes {
     pub updated_at: i64,
     /// Values to upsert by key.
     pub values: Map<String, Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AttributeRow {
+    pub key: String,
+    pub value_json: String,
+    pub device_ts: Option<i64>,
+    pub updated_at: i64,
+}
+
+#[async_trait]
+pub trait AttributesRepository: Send + Sync {
+    async fn upsert(&self, device_id: &str, attributes: &ValidatedAttributes)
+    -> anyhow::Result<()>;
+
+    async fn latest(
+        &self,
+        device_id: &str,
+        after: Option<&str>,
+        limit: i64,
+    ) -> anyhow::Result<Vec<AttributeRow>>;
+}
+
+struct Work {
+    device_id: String,
+    attributes: ValidatedAttributes,
+}
+
+#[derive(Clone)]
+pub(crate) struct AttributeHandle(mpsc::Sender<Work>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubmitError {
+    Full,
+    Closed,
+}
+
+impl AttributeHandle {
+    pub(crate) fn try_submit(
+        &self,
+        device_id: String,
+        attributes: ValidatedAttributes,
+    ) -> Result<(), SubmitError> {
+        self.0
+            .try_send(Work {
+                device_id,
+                attributes,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => SubmitError::Full,
+                mpsc::error::TrySendError::Closed(_) => SubmitError::Closed,
+            })
+    }
+}
+
+pub(crate) fn spawn_worker(
+    repository: Arc<dyn AttributesRepository>,
+    capacity: usize,
+) -> (AttributeHandle, tokio::task::JoinHandle<()>) {
+    let (sender, mut receiver) = mpsc::channel::<Work>(capacity);
+    let task = tokio::spawn(async move {
+        while let Some(work) = receiver.recv().await {
+            if let Err(error) = repository.upsert(&work.device_id, &work.attributes).await {
+                Metrics::global().attribute_rejected_total.inc();
+                tracing::warn!(%error, device_id = %work.device_id, "attribute update dropped");
+            }
+        }
+    });
+    (AttributeHandle(sender), task)
 }
 
 /// A payload validation failure. Attributes are dropped without an application ACK.

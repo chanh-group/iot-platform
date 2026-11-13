@@ -500,10 +500,10 @@ it("tests live telemetry selection, paged history, scoped refreshes, config conf
       "--remote-debugging-port=0",
       `--user-data-dir=${profile}`,
       "about:blank",
-    ], { stdout: "ignore", stderr: "ignore" });
+    ], { stdout: "ignore", stderr: "inherit" });
     const activePortFile = `${profile}/DevToolsActivePort`;
     let devtoolsPort = "";
-    for (let attempt = 0; attempt < 100 && !devtoolsPort; attempt += 1) {
+    for (let attempt = 0; attempt < 600 && !devtoolsPort; attempt += 1) {
       if (await Bun.file(activePortFile).exists()) {
         devtoolsPort = (await Bun.file(activePortFile).text()).split("\n")[0] ?? "";
       } else {

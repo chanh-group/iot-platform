@@ -180,7 +180,7 @@ Nếu spike fail: dừng triển khai, mở ADR mới và chọn lại **một b
 - Migration nhúng bằng `sqlx::migrate!("./migrations/sqlite")`; chạy trước khi mở listener. Lỗi migration làm startup fail.
 - SQLite: `journal_mode=WAL`, `synchronous=FULL`, `foreign_keys=ON`, `busy_timeout=5000`, pool mặc định 5. Đây là mặc định bắt buộc vì application ACK hứa dữ liệu đã bền qua mất điện; không có mode `NORMAL` trong MVP.
 - Telemetry có **một worker ghi batch**; batch dùng `BEGIN IMMEDIATE` để tránh lỗi nâng lock. Các write admin/command dùng transaction ngắn.
-- `core` định nghĩa `Repository` trait; `storage::sqlite` implement. Postgres/MySQL là implementation riêng ở Phase 5.
+- `core` định nghĩa `Repository` trait; `storage::sqlite` implement. PostgreSQL là implementation riêng ở Phase 5.
 - Không ORM, không query builder generic.
 - SQLx dùng bảng `_sqlx_migrations`; đây là `schema_migrations` logic trong SPEC. Không tạo bảng trùng.
 - Không tự migrate dữ liệu giữa engine; export/import là hạng mục riêng.
@@ -385,7 +385,7 @@ core -> không import axum/rmqtt/sqlx
 | Retained/session limit | 10.000 retained / 16 MiB; session expiry tối đa 1h; 8 subscription/client; 32 inflight; 256 queue/client |
 | Cross-device pub/sub | Deny mặc định; chưa có API cấp quyền trong MVP |
 | MQTT 5 | Từ chối ở connect; làm sau MVP |
-| PostgreSQL/MySQL | Phase 5; chỉ công bố khi A18 pass |
+| PostgreSQL | Phase 5; chỉ công bố khi A18 pass |
 
 ## 13. Chính sách version
 
@@ -409,3 +409,20 @@ core -> không import axum/rmqtt/sqlx
 - **Quyết định:** Giữ SQLx pin `=0.9.0`, không dùng Git dependency và không bỏ qua advisory. Vendor đúng crate `sqlx-sqlite 0.9.0` (`vendor/sqlx-sqlite`, checksum `488e99c397a62007e4229aec669a179816339afc6d2620ca6fa420dbee2e982c`), chỉ backport upper bound `<0.40.0` từ upstream commits `94aafe3a68884d923b0798a767c8d7f6cfda89d2` và `10462fa4414c6c7f1ed1d39bb31678e3b726878c`, để lock `libsqlite3-sys 0.39.1` chứa SQLite 3.54.1.
 - **Version/release:** Giữ nguyên tag `v0.1.0` đã push như candidate thất bại, không di chuyển/reuse tag; release workflow chưa tới bước push image và GitHub Release chưa được tạo. Bump package version sang `0.1.1` cho release kế tiếp theo checklist, rồi verify đủ CI, SBOM, scan, OIDC signature/provenance và digest trước khi Phase 5.
 - **Nâng cấp:** Bỏ local patch khi có bản SQLx đã phát hành và pin được chứa giới hạn tương thích cho `libsqlite3-sys 0.39.x` trở lên.
+
+### ADR-010 — PostgreSQL 18 storage backend
+
+- **Bối cảnh:** P5-01 xác nhận repository hiện còn các SQLite-specific leaks và các mapping engine-specific chưa được chọn. Không được bắt đầu PostgreSQL code trước khi chốt engine/version, URL, SQLx feature, migrations và các semantics có thể ảnh hưởng dữ liệu.
+- **Quyết định:** PostgreSQL **18.6** là phiên bản đầu tiên được triển khai; Compose/test dùng image `postgres:18.6-bookworm` (OCI tag đã được xác minh tồn tại ngày 2026-11-10). PostgreSQL 18 còn trong thời hạn hỗ trợ upstream. SQLx giữ pin `=0.9.0`, bật `postgres`, `json`, `tls-rustls-ring-native-roots`, và giữ `sqlite`, `runtime-tokio`, `migrate`, `macros`; không thêm ORM hoặc driver khác. SQLite vẫn là mặc định.
+- **Config/connection:** `database.url` hoặc `database.url_env` (mutually exclusive) chứa URL đầy đủ; scheme `sqlite://` hoặc `postgres://`/`postgresql://` chọn adapter. URL env thiếu, scheme sai hoặc backend chưa hỗ trợ làm config/startup fail; không fallback. PostgreSQL config phải chỉ rõ `sslmode=verify-full` hoặc `sslmode=disable`; mode khác/thiếu bị từ chối ngay khi load/check, không lấy chính sách từ `PGSSLMODE`. `disable` chỉ dành cho DB local/cô lập được operator cấu hình tường minh. `connect_timeout_ms` áp dụng cho kết nối/acquire và startup thử lại hữu hạn tối đa 5 lần với backoff 100/200/400/800 ms. SQLx không log statement/URL; mọi lỗi ra API/log phải giữ redaction. URL PostgreSQL giữ nguyên các query parameter SQLx khác; production dùng `verify-full` với CA phù hợp.
+- **Pool/migrations:** pool tối đa theo `database.max_connections` (mặc định 5), bounded acquire/connect timeout; migrations nằm riêng ở `migrations/postgres`, dùng SQLx `_sqlx_migrations`, chạy trước listener, chạy lại an toàn; lỗi không xóa DB và không tự downgrade. Không sửa migration SQLite đã áp dụng.
+- **Schema mapping:** thời gian và telemetry IDs dùng signed `BIGINT`; IDs domain tiếp tục là UUID v7 canonical `TEXT`; token/hash dùng `BYTEA`; booleans dùng `BOOLEAN`; JSON object/value dùng `JSONB` và phải round-trip thành contract `serde_json::Value`. Device-name uniqueness/search dùng ASCII case-folding rõ ràng với collation `C`, không locale-dependent. Giữ unique/FK/cascade và exactly-one-active-credential semantics bằng constraints/index PostgreSQL.
+- **Transactions/checkpoint:** isolation mặc định `READ COMMITTED`; mọi mutation + audit vẫn ở một transaction, ngoại trừ runtime-config audit hậu rename như contract. Queue limit/idempotency/credential transitions phải khóa hoặc dùng constraint để chống race. Telemetry dùng một hàng allocator transaction-scoped bị `SELECT ... FOR UPDATE` khóa trước khi cấp ID; lock được giữ tới commit/rollback. Không dùng `SEQUENCE`, `IDENTITY` hay auto-increment để chứng minh committed-prefix. Bản ghi allocator và telemetry insert cùng transaction; duplicate/conflict có thể tạo gap đã commit nhưng không được để transaction tương lai lấp ID dưới checkpoint.
+- **Retention/session:** giữ cleanup mỗi giờ, xóa tối đa 5.000 session mỗi transaction/lượt rồi nghỉ 10 ms giữa các batch; áp dụng expired và revoked quá 7 ngày. SQLite và PostgreSQL phải chạy qua domain port và cùng test lịch chạy, cutoff, batch cap, cancellation.
+- **Giới hạn quyết định:** đây là lựa chọn triển khai P5-02, không phải tuyên bố hỗ trợ/A18 PASS. PostgreSQL HA/replication, auto data migration, database TLS config riêng và đổi isolation không nằm trong quyết định này; thay đổi cần ADR/evidence riêng.
+
+### ADR-011: Thu hẹp backend Phase 5
+
+- **Ngày:** 2026-11-11. **Quyết định:** Phase 5 chỉ bổ sung PostgreSQL; SQLite vẫn là mặc định. Các backend SQL khác ngoài phạm vi, không còn task hoặc gate triển khai cho chúng.
+- PostgreSQL vẫn phải đạt A18, SQLite regression và toàn bộ gate vận hành, backup/restore và load trước khi được công bố hỗ trợ. Quyết định này không thay đổi version, TLS hoặc hành vi backend hiện tại.
+- **Căn cứ:** PostgreSQL versioning policy (18.6 hiện hành, hỗ trợ tới 2030-11-14) và OCI manifest của `postgres:18.6-bookworm` được kiểm tra ngày 2026-11-10; transaction row-lock semantics theo PostgreSQL 18 docs. Mọi backend vẫn phải qua matrix A18 riêng trước khi công bố hỗ trợ.

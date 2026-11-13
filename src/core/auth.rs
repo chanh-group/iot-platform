@@ -8,6 +8,75 @@ use rand::rngs::{SysError, SysRng};
 use sha2::Sha256;
 use thiserror::Error;
 
+#[async_trait::async_trait]
+pub trait SessionCleanupRepository: Send + Sync {
+    async fn delete_expired_sessions(&self, now: i64) -> anyhow::Result<u64>;
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminUser {
+    pub id: String,
+    pub username: String,
+    pub password_hash: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminSession {
+    pub id: String,
+    pub user_id: String,
+    pub username: String,
+    pub expires_at: i64,
+}
+
+pub struct NewAdminSession<'a> {
+    pub user: &'a AdminUser,
+    pub token_hash: &'a [u8],
+    pub now: i64,
+    pub expires_at: i64,
+    pub remote_ip: &'a str,
+    pub user_agent: Option<&'a str>,
+    pub request_id: &'a str,
+}
+
+#[derive(Debug, Error)]
+pub enum AdminCreateError {
+    #[error("an admin user already exists")]
+    AlreadyExists,
+    #[error("admin storage unavailable")]
+    Storage(#[source] anyhow::Error),
+}
+
+#[async_trait::async_trait]
+pub trait AdminRepository: Send + Sync {
+    async fn create_admin(
+        &self,
+        username: &str,
+        password_hash: &str,
+        now: i64,
+    ) -> Result<AdminUser, AdminCreateError>;
+
+    async fn find_user(&self, username: &str) -> anyhow::Result<Option<AdminUser>>;
+
+    async fn create_session_and_audit(&self, request: NewAdminSession<'_>) -> anyhow::Result<()>;
+
+    async fn verify_session(
+        &self,
+        token_hash: &[u8],
+        now: i64,
+    ) -> anyhow::Result<Option<AdminSession>>;
+
+    async fn session_is_live(&self, session_id: &str, now: i64) -> anyhow::Result<bool>;
+
+    async fn revoke_session_and_audit(
+        &self,
+        session: &AdminSession,
+        now: i64,
+        request_id: &str,
+        remote_ip: &str,
+    ) -> anyhow::Result<()>;
+}
+
 /// Length of a raw session token before base64url encoding.
 pub const SESSION_TOKEN_BYTES: usize = 32;
 

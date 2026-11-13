@@ -8,5 +8,7 @@ pub mod device;
 pub mod device_channel;
 pub mod domain_error;
 pub mod events;
+pub(crate) mod json;
 pub mod presence;
+pub mod storage;
 pub mod telemetry;

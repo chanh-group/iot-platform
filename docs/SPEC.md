@@ -11,7 +11,7 @@ Xây dựng một IoT platform thu gọn bằng Rust, lấy cảm hứng từ m�
 
 Ứng dụng tích hợp MQTT broker để node kết nối trực tiếp và pub/sub, HTTP server phục vụ dashboard/API, quản lý thiết bị, lưu telemetry và gửi lệnh xuống thiết bị. Dashboard cho phép thay đổi các thiết lập runtime được hỗ trợ.
 
-“All-in-one” nghĩa là broker, API, dashboard và core chạy trong cùng một process. SQLite được nhúng; PostgreSQL/MySQL là database server bên ngoài, kết nối bằng URL hoặc triển khai kèm qua Docker Compose. Không tự viết PostgreSQL/MySQL server và không yêu cầu broker MQTT bên ngoài.
+“All-in-one” nghĩa là broker, API, dashboard và core chạy trong cùng một process. SQLite được nhúng; PostgreSQL là database server bên ngoài, kết nối bằng URL hoặc triển khai kèm qua Docker Compose. Không tự viết PostgreSQL server và không yêu cầu broker MQTT bên ngoài.
 
 ## 2. Phạm vi và nguyên tắc
 
@@ -28,7 +28,7 @@ Xây dựng một IoT platform thu gọn bằng Rust, lấy cảm hứng từ m�
 
 ### 2.2. Sau MVP
 
-- PostgreSQL và MySQL với migration, kiểm thử tương đương SQLite.
+- PostgreSQL với migration, kiểm thử tương đương SQLite.
 - TLS MQTT tích hợp, nếu MVP triển khai TLS qua TCP proxy.
 - Thuộc tính thiết bị nâng cao, rule đơn giản và export dữ liệu.
 - Tài khoản chỉ đọc, giới hạn chi tiết theo nhóm thiết bị.
@@ -56,7 +56,7 @@ flowchart TD
     R --> C
     C --> D["Storage abstraction"]
     D --> S["SQLite"]
-    D --> P["PostgreSQL hoặc MySQL"]
+    D --> P["PostgreSQL"]
 ```
 
 | Module | Trách nhiệm |
@@ -141,7 +141,7 @@ Trạng thái online do kết nối xác thực quyết định; status/LWT ch�
 - `event_id`: node sinh và giữ nguyên khi retry; bắt buộc cho luồng xác nhận bền vững.
 - `ts`: Unix milliseconds UTC; thiếu thì dùng thời gian server nhận.
 - `received_at`: server tự ghi, không cho client ghi đè.
-- `values`: object phẳng, tối đa 128 key; giá trị number hữu hạn, boolean hoặc string tối đa 4 KiB; không nhận object/array/null trong MVP.
+- `values`: object phẳng, tối đa 128 key; giá trị number hữu hạn, boolean hoặc string tối đa 4 KiB không chứa U+0000; không nhận object/array/null trong MVP.
 - ID thiết bị lấy từ principal và topic. Tổng payload giới hạn bởi cấu hình.
 - Timestamp sai kiểu hoặc vượt chính sách cho phép phải bị từ chối; không âm thầm sửa.
 - Retained publish vào topic telemetry/command không được xử lý thành telemetry/lệnh; trả lỗi ứng dụng cho telemetry có event ID hợp lệ.
@@ -225,8 +225,9 @@ Unique `(device_id, event_id)`; index telemetry `(device_id, ts, internal_id)`, 
 ### 8.2. Backend
 
 - SQLite là mặc định, dùng WAL và thiết kế một đường ghi batch để hạn chế cạnh tranh writer.
-- PostgreSQL/MySQL dùng pool hữu hạn, transaction và prepared/bound parameters.
+- PostgreSQL dùng pool hữu hạn, transaction và prepared/bound parameters.
 - Migration và kiểu lưu JSON do từng backend quyết định; repository giữ semantics chung.
+- Để JSONB round-trip giống SQLite, mọi JSON key/string được persist (telemetry, attributes, device metadata, command params/result/ACK) đều từ chối U+0000 bằng validation chung trước khi enqueue hoặc ghi DB.
 - Đổi URL không tự migrate dữ liệu giữa các engine. Công cụ export/import là hạng mục riêng.
 - Migrate trước khi mở listener; lỗi migration làm khởi động thất bại. Không tự downgrade schema.
 - Retention dựa trên `received_at`, xóa theo batch, không giữ lock dài.
@@ -267,7 +268,6 @@ connect_timeout_ms = 5000
 # Với database ngoài: xóa url và dùng url_env.
 # url_env = "IOT_DATABASE_URL"
 # Giá trị env ví dụ: postgres://iot:password@postgres:5432/iot
-# Hoặc: mysql://iot:password@mysql:3306/iot
 
 [telemetry]
 queue_capacity = 4096
@@ -353,9 +353,9 @@ docker run --rm --name iot-server \
 
 File config cho ví dụ Docker phải bind `0.0.0.0:8080` và `0.0.0.0:1883`; path data tương đối resolve thành `/app/data`. Image name là tên đề xuất, chưa phải image đã phát hành.
 
-Compose có ba biến thể tài liệu: SQLite, PostgreSQL, MySQL. Database server ngoài có volume và healthcheck; ứng dụng vẫn phải retry kết nối, không chỉ dựa vào startup ordering. Không nhúng password mẫu cố định vào image.
+Compose có hai biến thể tài liệu: SQLite và PostgreSQL. Database server ngoài có volume và healthcheck; ứng dụng vẫn phải retry kết nối, không chỉ dựa vào startup ordering. Không nhúng password mẫu cố định vào image.
 
-Backup SQLite dùng SQLite backup API hoặc dừng ứng dụng trước khi copy; không copy riêng file `.db` đang dùng WAL rồi coi là backup đầy đủ. PostgreSQL/MySQL dùng quy trình backup/restore của engine. Test restore trước release hỗ trợ backend đó.
+Backup SQLite dùng SQLite backup API hoặc dừng ứng dụng trước khi copy; không copy riêng file `.db` đang dùng WAL rồi coi là backup đầy đủ. PostgreSQL dùng quy trình backup/restore của engine. Test restore trước release hỗ trợ backend đó.
 
 ## 12. Tổ chức source
 
@@ -373,7 +373,6 @@ Bắt đầu bằng một Rust crate; chỉ tách workspace khi ranh giới modu
 | `src/observability/` | Log và health |
 | `migrations/sqlite/` | SQLite migrations |
 | `migrations/postgres/` | PostgreSQL migrations, giai đoạn sau |
-| `migrations/mysql/` | MySQL migrations, giai đoạn sau |
 | `web/` | Frontend source và build |
 | `tests/` | Integration, protocol và end-to-end |
 | `deploy/` | Dockerfile, Compose và config mẫu |
@@ -414,7 +413,7 @@ Kiểm thử gồm unit test validation/ACL/state machine, integration test MQTT
 3. **Luồng telemetry:** device credentials, MQTT, ACL, validate, SQL commit, application ACK và lịch sử.
 4. **Quản trị:** dashboard realtime, command, runtime config, audit và token rotation.
 5. **Độ tin cậy:** bounded resources, crash/retry, shutdown, test bảo mật và Docker/backup.
-6. **Backend bổ sung:** PostgreSQL rồi MySQL, mỗi backend qua cùng tiêu chí nghiệm thu.
+6. **Backend bổ sung:** PostgreSQL qua cùng tiêu chí nghiệm thu với SQLite.
 
 MVP hoàn tất khi A01–A17 và A19 đạt trên SQLite, tài liệu triển khai và backup/restore có thể thực hiện được. Release MVP phải có SBOM, quét dependency/OS image, image signature/provenance, alert/runbook và restore drill pass. A18 là điều kiện riêng để công bố hỗ trợ từng backend SQL tiếp theo.
 

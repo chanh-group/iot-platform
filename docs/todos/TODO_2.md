@@ -131,7 +131,7 @@ Checklist gate:
 - Runtime config PATCH, revision/atomic write và reload hot fields (Phase 3).
 - Dashboard Svelte/uPlot, asset embed release hoàn chỉnh (Phase 3).
 - Crash recovery kill -9, disk-full test, graceful MQTT drain/kick shutdown gate, security-suite tổng thể, Docker/backup/load/release (Phase 4).
-- PostgreSQL/MySQL, MQTT 5, integrated TLS, cross-device pub/sub, aggregation/projection telemetry (sau MVP hoặc Phase 5).
+- PostgreSQL, MQTT 5, integrated TLS, cross-device pub/sub, aggregation/projection telemetry (sau MVP hoặc Phase 5).
 
 ## 10. Commit
 

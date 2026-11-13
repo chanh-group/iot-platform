@@ -11,7 +11,7 @@ use std::{
 use common::{free_port, mqtt_connect, mqtt_wait_publish};
 use rumqttc::{Event, EventLoop, Packet, QoS};
 use serde_json::{Value, json};
-use sqlx::SqlitePool;
+use sqlx::{PgPool, SqlitePool};
 use tempfile::TempDir;
 use tokio::time::timeout;
 use uuid::Uuid;
@@ -93,12 +93,18 @@ struct Fixture {
     mqtt_port: u16,
     device_id: String,
     token: String,
-    pool: SqlitePool,
+    pool: TestPool,
+}
+
+enum TestPool {
+    Sqlite(SqlitePool),
+    Postgres(PgPool),
 }
 
 impl Fixture {
     async fn new() -> Self {
         let dir = tempfile::tempdir().expect("create isolated data directory");
+        let postgres_url = std::env::var("IOT_TEST_POSTGRES_URL").ok();
         let http_port = free_port();
         let mqtt_port = loop {
             let port = free_port();
@@ -107,25 +113,43 @@ impl Fixture {
             }
         };
         let config = dir.path().join("conf.toml");
+        let database_config = if postgres_url.is_some() {
+            "[database]\nurl_env = 'IOT_TEST_POSTGRES_URL'\n"
+        } else {
+            "[database]\nurl = 'sqlite://./data/iot.db'\n"
+        };
         std::fs::write(
             &config,
             format!(
                 "config_version = 1\n\
                  [server]\n\
-                 data_dir = \"./data\"\n\
+                 data_dir = './data'\n\
                  shutdown_timeout_ms = 1000\n\
                  [http]\n\
-                 listen = \"127.0.0.1:{http_port}\"\n\
+                 listen = '127.0.0.1:{http_port}'\n\
                  [mqtt]\n\
-                 listen = \"127.0.0.1:{mqtt_port}\"\n\
-                 [database]\n\
-                 url = \"sqlite://./data/iot.db\"\n\
+                 listen = '127.0.0.1:{mqtt_port}'\n\
+                 {database_config}\
                  [telemetry]\n\
                  batch_size = 1\n\
                  flush_interval_ms = 10\n"
             ),
         )
         .expect("write test config");
+
+        if let Some(url) = &postgres_url {
+            let pool = PgPool::connect(url)
+                .await
+                .expect("connect to PostgreSQL crash fixture");
+            let (database, schema): (String, String) =
+                sqlx::query_as("SELECT current_database(), current_schema()")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("verify PostgreSQL crash fixture identity");
+            assert_eq!(database, "iot_a18_test", "refusing non-fixture database");
+            assert_eq!(schema, "public", "refusing non-fixture schema");
+            pool.close().await;
+        }
 
         let migrated = Command::new(env!("CARGO_BIN_EXE_iot-server"))
             .args(["migrate", "--config"])
@@ -137,12 +161,21 @@ impl Fixture {
             "migration failed: {}",
             String::from_utf8_lossy(&migrated.stderr)
         );
-        let pool = SqlitePool::connect(&format!(
-            "sqlite://{}",
-            dir.path().join("data/iot.db").display()
-        ))
-        .await
-        .expect("connect to server database");
+        let pool = match &postgres_url {
+            Some(url) => TestPool::Postgres(
+                PgPool::connect(url)
+                    .await
+                    .expect("connect to server PostgreSQL database"),
+            ),
+            None => TestPool::Sqlite(
+                SqlitePool::connect(&format!(
+                    "sqlite://{}",
+                    dir.path().join("data/iot.db").display()
+                ))
+                .await
+                .expect("connect to server SQLite database"),
+            ),
+        };
         let device_id = Uuid::now_v7().to_string();
         let token = format!(
             "{DEVICE_TOKEN_PREFIX}{}",
@@ -165,31 +198,59 @@ impl Fixture {
     }
 }
 
-async fn seed_device(pool: &SqlitePool, device_id: &str, token: &str) {
+async fn seed_device(pool: &TestPool, device_id: &str, token: &str) {
     let now = iot_server::core::auth::now_ms();
-    sqlx::query(
-        "INSERT INTO devices (id, name, enabled, created_at, updated_at)
-         VALUES (?, ?, 1, ?, ?)",
-    )
-    .bind(device_id)
-    .bind(format!("crash-{}", &device_id[..8]))
-    .bind(now)
-    .bind(now)
-    .execute(pool)
-    .await
-    .expect("insert test device");
-    sqlx::query(
-        "INSERT INTO device_credentials
-         (id, device_id, token_hash, status, created_at)
-         VALUES (?, ?, ?, 'active', ?)",
-    )
-    .bind(Uuid::now_v7().to_string())
-    .bind(device_id)
-    .bind(iot_server::core::auth::hash_token(token).as_slice())
-    .bind(now)
-    .execute(pool)
-    .await
-    .expect("insert test device credential");
+    match pool {
+        TestPool::Sqlite(pool) => {
+            sqlx::query(
+                "INSERT INTO devices (id, name, enabled, created_at, updated_at)
+                 VALUES (?, ?, 1, ?, ?)",
+            )
+            .bind(device_id)
+            .bind(format!("crash-{device_id}"))
+            .bind(now)
+            .bind(now)
+            .execute(pool)
+            .await
+            .expect("insert test device");
+            sqlx::query(
+                "INSERT INTO device_credentials
+                 (id, device_id, token_hash, status, created_at)
+                 VALUES (?, ?, ?, 'active', ?)",
+            )
+            .bind(Uuid::now_v7().to_string())
+            .bind(device_id)
+            .bind(iot_server::core::auth::hash_token(token).as_slice())
+            .bind(now)
+            .execute(pool)
+            .await
+            .expect("insert test device credential");
+        }
+        TestPool::Postgres(pool) => {
+            sqlx::query(
+                "INSERT INTO devices (id, name, enabled, created_at, updated_at)
+                 VALUES ($1, $2, TRUE, $3, $3)",
+            )
+            .bind(device_id)
+            .bind(format!("crash-{device_id}"))
+            .bind(now)
+            .execute(pool)
+            .await
+            .expect("insert test device");
+            sqlx::query(
+                "INSERT INTO device_credentials
+                 (id, device_id, token_hash, status, created_at)
+                 VALUES ($1, $2, $3, 'active', $4)",
+            )
+            .bind(Uuid::now_v7().to_string())
+            .bind(device_id)
+            .bind(iot_server::core::auth::hash_token(token).as_slice())
+            .bind(now)
+            .execute(pool)
+            .await
+            .expect("insert test device credential");
+        }
+    }
 }
 
 impl Fixture {
@@ -208,14 +269,79 @@ impl Fixture {
     }
 
     async fn event_count(&self, event_id: &str) -> i64 {
-        sqlx::query_scalar(
-            "SELECT COUNT(*) FROM telemetry_events WHERE device_id = ? AND event_id = ?",
-        )
-        .bind(&self.device_id)
-        .bind(event_id)
-        .fetch_one(&self.pool)
-        .await
+        match &self.pool {
+            TestPool::Sqlite(pool) => {
+                sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM telemetry_events WHERE device_id = ? AND event_id = ?",
+                )
+                .bind(&self.device_id)
+                .bind(event_id)
+                .fetch_one(pool)
+                .await
+            }
+            TestPool::Postgres(pool) => {
+                sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM telemetry_events WHERE device_id = $1 AND event_id = $2",
+                )
+                .bind(&self.device_id)
+                .bind(event_id)
+                .fetch_one(pool)
+                .await
+            }
+        }
         .expect("count persisted telemetry")
+    }
+
+    async fn seed_pending_command(&self, command_id: &str, now: i64) {
+        match &self.pool {
+            TestPool::Sqlite(pool) => {
+                sqlx::query(
+                    "INSERT INTO commands
+                     (id, device_id, name, params_json, status, created_at, expires_at, next_attempt_at)
+                     VALUES (?, ?, 'restart-recovery', '{}', 'pending', ?, ?, ?)",
+                )
+                .bind(command_id)
+                .bind(&self.device_id)
+                .bind(now)
+                .bind(now + 300_000)
+                .bind(now)
+                .execute(pool)
+                .await
+                .expect("seed pending command");
+            }
+            TestPool::Postgres(pool) => {
+                sqlx::query(
+                    "INSERT INTO commands
+                     (id, device_id, name, params_json, status, created_at, expires_at, next_attempt_at)
+                     VALUES ($1, $2, 'restart-recovery', '{}'::jsonb, 'pending', $3, $4, $3)",
+                )
+                .bind(command_id)
+                .bind(&self.device_id)
+                .bind(now)
+                .bind(now + 300_000)
+                .execute(pool)
+                .await
+                .expect("seed pending command");
+            }
+        }
+    }
+
+    async fn command_status(&self, command_id: &str) -> String {
+        match &self.pool {
+            TestPool::Sqlite(pool) => {
+                sqlx::query_scalar("SELECT status FROM commands WHERE id = ?")
+                    .bind(command_id)
+                    .fetch_one(pool)
+                    .await
+            }
+            TestPool::Postgres(pool) => {
+                sqlx::query_scalar("SELECT status FROM commands WHERE id = $1")
+                    .bind(command_id)
+                    .fetch_one(pool)
+                    .await
+            }
+        }
+        .expect("read recovered command state")
     }
 }
 
@@ -427,19 +553,7 @@ async fn kill_after_ack_preserves_telemetry_and_recovers_pending_command() {
 
     let command_id = Uuid::now_v7().to_string();
     let now = iot_server::core::auth::now_ms();
-    sqlx::query(
-        "INSERT INTO commands
-         (id, device_id, name, params_json, status, created_at, expires_at, next_attempt_at)
-         VALUES (?, ?, 'restart-recovery', '{}', 'pending', ?, ?, ?)",
-    )
-    .bind(&command_id)
-    .bind(&fixture.device_id)
-    .bind(now)
-    .bind(now + 300_000)
-    .bind(now)
-    .execute(&fixture.pool)
-    .await
-    .expect("seed pending command");
+    fixture.seed_pending_command(&command_id, now).await;
 
     server.kill();
     let mut restarted = fixture.start(None).await;
@@ -469,11 +583,17 @@ async fn kill_after_ack_preserves_telemetry_and_recovers_pending_command() {
     .expect("recover pending command after restart");
     assert_eq!(command["command_id"], command_id);
     assert_eq!(fixture.event_count(&event_id).await, 1);
-    let status: String = sqlx::query_scalar("SELECT status FROM commands WHERE id = ?")
-        .bind(&command_id)
-        .fetch_one(&fixture.pool)
-        .await
-        .expect("read recovered command state");
+    let status = timeout(Duration::from_secs(5), async {
+        loop {
+            let status = fixture.command_status(&command_id).await;
+            if status == "dispatched" {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("recovered command state should commit after publishing");
     assert_eq!(status, "dispatched");
     restarted.kill();
 }

@@ -103,7 +103,7 @@ async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     let database_ok = ready
         && tokio::time::timeout(
             Duration::from_secs(1),
-            sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(&state.pool),
+            state.storage_repository.health_check(),
         )
         .await
         .is_ok_and(|result| result.is_ok());

@@ -1,4 +1,6 @@
 mod common;
+#[path = "common/mqtt_auth_postgres.rs"]
+mod postgres;
 
 use common::{PASSWORD, TestApp};
 use iot_server::core::auth;
@@ -29,16 +31,6 @@ async fn login(
 async fn me(client: &reqwest::Client, server: &TestApp) -> reqwest::Response {
     client
         .get(format!("{}/api/v1/auth/me", server.base))
-        .send()
-        .await
-        .unwrap()
-}
-
-async fn logout(client: &reqwest::Client, server: &TestApp) -> reqwest::Response {
-    client
-        .post(format!("{}/api/v1/auth/logout", server.base))
-        .header("X-IoT-CSRF", "1")
-        .header(CONTENT_TYPE, "application/json")
         .send()
         .await
         .unwrap()
@@ -87,22 +79,19 @@ async fn device_token_cannot_authenticate_http_admin_routes() {
     }
 }
 
-#[tokio::test]
-async fn login_me_logout_roundtrip_and_cookie_flags() {
-    let server = TestApp::start().await;
-    server.create_admin("admin", PASSWORD).await;
-    let client = server.client();
-
-    let response = login(&client, &server, "admin", "wrong-password").await;
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    let failed_logins: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE action = 'auth.login'")
-            .fetch_one(&server.pool)
-            .await
-            .unwrap();
-    assert_eq!(failed_logins, 0);
-
-    let response = login(&client, &server, "admin", PASSWORD).await;
+async fn login_me_logout_roundtrip(
+    base: &str,
+    client: &reqwest::Client,
+    password: &str,
+    max_age: u64,
+) -> String {
+    let response = client
+        .post(format!("{base}/api/v1/auth/login"))
+        .header("X-IoT-CSRF", "1")
+        .json(&json!({ "username": "ADMIN", "password": password }))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let cookie = response
         .headers()
@@ -114,7 +103,6 @@ async fn login_me_logout_roundtrip_and_cookie_flags() {
     assert!(cookie.contains("HttpOnly"), "{cookie}");
     assert!(cookie.contains("SameSite=Strict"), "{cookie}");
     assert!(cookie.contains("Path=/"), "{cookie}");
-    let max_age = server.config.config.auth.session_ttl_ms / 1000;
     assert!(cookie.contains(&format!("Max-Age={max_age}")), "{cookie}");
     assert!(!cookie.contains("Secure"), "{cookie}");
     let token = cookie
@@ -124,38 +112,25 @@ async fn login_me_logout_roundtrip_and_cookie_flags() {
         .strip_prefix("iot_session=")
         .unwrap()
         .to_owned();
-    let stored_hash: Vec<u8> = sqlx::query_scalar("SELECT token_hash FROM sessions")
-        .fetch_one(&server.pool)
-        .await
-        .unwrap();
-    assert_eq!(stored_hash, auth::hash_token(&token).to_vec());
-    assert_ne!(stored_hash, token.as_bytes());
-
     let body = json_body(response).await;
     assert_eq!(body["user"]["username"], "admin");
     assert!(body["expires_at"].as_i64().unwrap() > auth::now_ms());
 
-    let response = me(&client, &server).await;
+    let response = client
+        .get(format!("{base}/api/v1/auth/me"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(json_body(response).await["username"], "admin");
 
-    let actions: Vec<String> = sqlx::query_scalar("SELECT action FROM audit_events ORDER BY id")
-        .fetch_all(&server.pool)
+    let response = client
+        .post(format!("{base}/api/v1/auth/logout"))
+        .header("X-IoT-CSRF", "1")
+        .header(CONTENT_TYPE, "application/json")
+        .send()
         .await
         .unwrap();
-    assert!(actions.contains(&"admin.create".to_owned()), "{actions:?}");
-    assert!(actions.contains(&"auth.login".to_owned()), "{actions:?}");
-
-    let details: Vec<Option<String>> = sqlx::query_scalar("SELECT details_json FROM audit_events")
-        .fetch_all(&server.pool)
-        .await
-        .unwrap();
-    for details in details.into_iter().flatten() {
-        assert!(!details.contains(PASSWORD), "{details}");
-        assert!(!details.contains(&token), "{details}");
-    }
-
-    let response = logout(&client, &server).await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let cleared = response
         .headers()
@@ -166,14 +141,139 @@ async fn login_me_logout_roundtrip_and_cookie_flags() {
         .to_owned();
     assert!(cleared.contains("Max-Age=0"), "{cleared}");
 
-    let response = me(&client, &server).await;
+    let response = client
+        .get(format!("{base}/api/v1/auth/me"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    token
+}
+
+async fn failed_login(base: &str, client: &reqwest::Client) {
+    let response = client
+        .post(format!("{base}/api/v1/auth/login"))
+        .header("X-IoT-CSRF", "1")
+        .json(&json!({ "username": "admin", "password": "wrong-password" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn login_me_logout_roundtrip_and_cookie_flags() {
+    let server = TestApp::start().await;
+    server.create_admin("admin", PASSWORD).await;
+    let client = server.client();
+    failed_login(&server.base, &client).await;
+    let failed_logins: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE action = 'auth.login'")
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
+    assert_eq!(failed_logins, 0);
+    let token = login_me_logout_roundtrip(
+        &server.base,
+        &client,
+        PASSWORD,
+        server.config.config.auth.session_ttl_ms / 1000,
+    )
+    .await;
+
+    let stored_hash: Vec<u8> = sqlx::query_scalar("SELECT token_hash FROM sessions")
+        .fetch_one(&server.pool)
+        .await
+        .unwrap();
+    assert_eq!(stored_hash, auth::hash_token(&token).to_vec());
+    assert_ne!(stored_hash, token.as_bytes());
 
     let actions: Vec<String> = sqlx::query_scalar("SELECT action FROM audit_events ORDER BY id")
         .fetch_all(&server.pool)
         .await
         .unwrap();
+    assert!(actions.contains(&"admin.create".to_owned()), "{actions:?}");
+    assert!(actions.contains(&"auth.login".to_owned()), "{actions:?}");
     assert!(actions.contains(&"auth.logout".to_owned()), "{actions:?}");
+
+    let details: Vec<Option<String>> = sqlx::query_scalar("SELECT details_json FROM audit_events")
+        .fetch_all(&server.pool)
+        .await
+        .unwrap();
+    for details in details.into_iter().flatten() {
+        assert!(!details.contains(PASSWORD), "{details}");
+        assert!(!details.contains(&token), "{details}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated disposable PostgreSQL fixture; run tests/auth_postgres.sh"]
+async fn login_me_logout_roundtrip_and_cookie_flags_postgres() {
+    let server = postgres::PostgresApp::start().await;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let pool = sqlx::PgPool::connect(&std::env::var("IOT_TEST_POSTGRES_URL").unwrap())
+        .await
+        .unwrap();
+    let successful_logins_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE action = 'auth.login'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    failed_login(server.base_url(), &client).await;
+    let successful_logins_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE action = 'auth.login'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(successful_logins_after, successful_logins_before);
+    let token = login_me_logout_roundtrip(
+        server.base_url(),
+        &client,
+        "mqtt-auth-test-password",
+        24 * 60 * 60,
+    )
+    .await;
+
+    let failed_logins: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE action = 'auth.login'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        failed_logins,
+        successful_logins_before + 1,
+        "only successful login is audited"
+    );
+
+    let stored_hash: Vec<u8> = sqlx::query_scalar(
+        "SELECT token_hash FROM sessions ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored_hash, auth::hash_token(&token).to_vec());
+    assert_ne!(stored_hash, token.as_bytes());
+
+    let actions: Vec<String> = sqlx::query_scalar("SELECT action FROM audit_events ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(actions.contains(&"admin.create".to_owned()), "{actions:?}");
+    assert!(actions.contains(&"auth.login".to_owned()), "{actions:?}");
+    assert!(actions.contains(&"auth.logout".to_owned()), "{actions:?}");
+
+    let details: Vec<Option<Value>> = sqlx::query_scalar("SELECT details_json FROM audit_events")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    for details in details.into_iter().flatten() {
+        let details = details.to_string();
+        assert!(!details.contains("mqtt-auth-test-password"), "{details}");
+        assert!(!details.contains(&token), "{details}");
+    }
 }
 
 #[tokio::test]
@@ -198,10 +298,13 @@ async fn csrf_content_type_and_origin_are_enforced() {
     let server = TestApp::start().await;
     server.create_admin("admin", PASSWORD).await;
     let client = server.client();
+    assert_csrf_content_type_and_origin(server.base.as_str(), &client, PASSWORD).await;
+}
 
+async fn assert_csrf_content_type_and_origin(base: &str, client: &reqwest::Client, password: &str) {
     let response = client
-        .post(login_url(&server))
-        .json(&json!({ "username": "admin", "password": PASSWORD }))
+        .post(format!("{base}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": password }))
         .send()
         .await
         .unwrap();
@@ -209,7 +312,7 @@ async fn csrf_content_type_and_origin_are_enforced() {
     assert_eq!(json_body(response).await["code"], "csrf_failed");
 
     let response = client
-        .post(login_url(&server))
+        .post(format!("{base}/api/v1/auth/login"))
         .header("X-IoT-CSRF", "1")
         .header(CONTENT_TYPE, "text/plain")
         .body(r#"{"username":"admin","password":"x"}"#)
@@ -220,10 +323,10 @@ async fn csrf_content_type_and_origin_are_enforced() {
     assert_eq!(json_body(response).await["code"], "unsupported_media_type");
 
     let response = client
-        .post(login_url(&server))
+        .post(format!("{base}/api/v1/auth/login"))
         .header("X-IoT-CSRF", "1")
         .header(ORIGIN, "http://evil.example")
-        .json(&json!({ "username": "admin", "password": PASSWORD }))
+        .json(&json!({ "username": "admin", "password": password }))
         .send()
         .await
         .unwrap();
@@ -231,27 +334,47 @@ async fn csrf_content_type_and_origin_are_enforced() {
     assert_eq!(json_body(response).await["code"], "csrf_failed");
 
     let response = client
-        .post(login_url(&server))
+        .post(format!("{base}/api/v1/auth/login"))
         .header("X-IoT-CSRF", "1")
-        .header(ORIGIN, &server.base)
-        .json(&json!({ "username": "admin", "password": PASSWORD }))
+        .header(ORIGIN, base)
+        .json(&json!({ "username": "admin", "password": password }))
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
-    let response = me(&client, &server).await;
+    let response = client
+        .get(format!("{base}/api/v1/auth/me"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
     let response = client
-        .post(format!("{}/api/v1/auth/logout", server.base))
+        .post(format!("{base}/api/v1/auth/logout"))
         .header(CONTENT_TYPE, "application/json")
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    let response = me(&client, &server).await;
+    let response = client
+        .get(format!("{base}/api/v1/auth/me"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+#[ignore = "requires isolated disposable PostgreSQL fixture; run tests/auth_postgres.sh"]
+async fn csrf_content_type_and_origin_are_enforced_postgres() {
+    let server = postgres::PostgresApp::start().await;
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    assert_csrf_content_type_and_origin(server.base_url(), &client, "mqtt-auth-test-password")
+        .await;
 }
 
 #[tokio::test]

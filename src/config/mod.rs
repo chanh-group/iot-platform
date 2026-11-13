@@ -4,6 +4,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 pub mod config_error;
+pub mod database;
 pub mod load;
 pub mod paths;
 pub mod redact;
@@ -17,14 +18,35 @@ pub use redact::redact;
 pub use schema::{Config, LogFormat, LogLevel};
 pub use validate::validate;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseBackend {
+    Sqlite,
+    Postgres,
+}
+
+impl DatabaseBackend {
+    #[must_use]
+    pub fn from_url(url: &str) -> Option<Self> {
+        if url.starts_with("sqlite://") {
+            Some(Self::Sqlite)
+        } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+            Some(Self::Postgres)
+        } else {
+            None
+        }
+    }
+}
+
 /// Effective configuration after path/env resolution and runtime overlay.
 pub struct LoadedConfig {
     /// Parsed, overlaid, and validated configuration.
     pub config: Config,
     /// Absolute, lexically normalized data dir.
     pub data_dir: PathBuf,
-    /// Absolute `sqlite://` URL after `url_env` resolution.
+    /// Effective database URL after `url_env` resolution.
     pub database_url: String,
+    /// Backend selected from the URL scheme.
+    pub database_backend: DatabaseBackend,
     /// Absolute path of `runtime.toml`.
     pub runtime_settings_path: PathBuf,
     /// Secret from `metrics_bearer_token_env`; never serialize or log.

@@ -1,4 +1,6 @@
 mod common;
+#[path = "common/mqtt_auth_postgres.rs"]
+mod mqtt_auth_postgres;
 
 use std::time::Duration;
 
@@ -341,6 +343,167 @@ async fn mqtt_failed_ack_persists_result_and_error_after_acl_allow() {
             .unwrap();
     assert!(row.0.is_some());
     assert_eq!(row.1.as_deref(), Some(r#"{"attempt":2}"#));
+    assert_eq!(row.2.as_deref(), Some("relay did not respond"));
+}
+
+#[tokio::test]
+#[ignore = "requires tests/command_ack_postgres.sh"]
+async fn mqtt_failed_ack_persists_result_and_error_after_acl_allow_postgres() {
+    let app = mqtt_auth_postgres::PostgresApp::start().await;
+    let pool = sqlx::PgPool::connect(&std::env::var("IOT_TEST_POSTGRES_URL").unwrap())
+        .await
+        .unwrap();
+    let device = app.create_device("command-ack-postgres").await;
+    let other_device = app.create_device("command-ack-spoof-postgres").await;
+    let (client, mut eventloop, _) =
+        mqtt_connect(app.mqtt_addr(), &device.id, &device.id, &device.token, true).await;
+    let command_topic = format!("devices/{}/commands", device.id);
+    assert_eq!(
+        mqtt_subscribe(&client, &mut eventloop, &command_topic, QoS::AtLeastOnce).await,
+        SubscribeReasonCode::Success(QoS::AtLeastOnce)
+    );
+
+    let command_id = Uuid::now_v7().to_string();
+    let created_at = auth::now_ms();
+    sqlx::query(
+        "INSERT INTO commands (
+            id, device_id, name, params_json, status, created_at, expires_at, next_attempt_at
+         ) VALUES ($1, $2, 'reboot', '{}', 'pending', $3, $4, $3)",
+    )
+    .bind(&command_id)
+    .bind(&device.id)
+    .bind(created_at)
+    .bind(created_at + 60_000)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let command = mqtt_wait_publish(&mut eventloop, Duration::from_secs(4)).await;
+    let command_payload: Value = serde_json::from_slice(&command.payload).unwrap();
+    assert_eq!(command_payload["command_id"], command_id);
+
+    let (other_client, mut other_eventloop, _) = mqtt_connect(
+        app.mqtt_addr(),
+        &other_device.id,
+        &other_device.id,
+        &other_device.token,
+        true,
+    )
+    .await;
+    publish_ack(
+        &other_client,
+        &mut other_eventloop,
+        &format!("devices/{}/commands/ack", other_device.id),
+        &json!({"command_id":command_id,"status":"succeeded","result":{"spoofed":true}}),
+    )
+    .await;
+    let status: String = sqlx::query_scalar("SELECT status FROM commands WHERE id = $1")
+        .bind(&command_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "dispatched");
+    let ack_topic = format!("devices/{}/commands/ack", device.id);
+    publish_ack(
+        &client,
+        &mut eventloop,
+        &ack_topic,
+        &json!({"command_id":command_id,"status":"pending"}),
+    )
+    .await;
+    let status: String = sqlx::query_scalar("SELECT status FROM commands WHERE id = $1")
+        .bind(&command_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "dispatched");
+
+    sqlx::query("CREATE SEQUENCE command_ack_failure_seen")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE FUNCTION command_ack_fail_terminal_update() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             IF NEW.status = 'failed' THEN
+                 PERFORM nextval('command_ack_failure_seen');
+                 RAISE EXCEPTION 'injected command ACK persistence failure';
+             END IF;
+             RETURN NEW;
+         END
+         $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER command_ack_fail_terminal_update
+         BEFORE UPDATE ON commands FOR EACH ROW EXECUTE FUNCTION command_ack_fail_terminal_update()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let failed_ack = json!({
+        "command_id": command_id,
+        "status": "failed",
+        "result": {"attempt": 2},
+        "error": "relay did not respond"
+    });
+    publish_ack(&client, &mut eventloop, &ack_topic, &failed_ack).await;
+    // PUBACK only confirms MQTT transport; the sequence proves the DB worker ran the trigger.
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let seen: bool = sqlx::query_scalar("SELECT is_called FROM command_ack_failure_seen")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            if seen {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("ACK worker should reach the injected PostgreSQL trigger failure");
+    let state: (String, Option<i64>) =
+        sqlx::query_as("SELECT status, completed_at FROM commands WHERE id = $1")
+            .bind(&command_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, ("dispatched".to_owned(), None));
+
+    sqlx::query("DROP TRIGGER command_ack_fail_terminal_update ON commands")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP FUNCTION command_ack_fail_terminal_update()")
+        .execute(&pool)
+        .await
+        .unwrap();
+    publish_ack(&client, &mut eventloop, &ack_topic, &failed_ack).await;
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let status: String = sqlx::query_scalar("SELECT status FROM commands WHERE id = $1")
+                .bind(&command_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            if status == "failed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("valid failed ACK should be persisted after removing trigger");
+    let row: (Option<i64>, Option<Value>, Option<String>) =
+        sqlx::query_as("SELECT completed_at, result_json, error FROM commands WHERE id = $1")
+            .bind(&command_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(row.0.is_some());
+    assert_eq!(row.1, Some(json!({"attempt":2})));
     assert_eq!(row.2.as_deref(), Some("relay did not respond"));
 }
 

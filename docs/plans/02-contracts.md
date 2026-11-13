@@ -170,7 +170,7 @@ Quy tắc:
 | `ts` | Tùy chọn; Unix ms; thiếu thì dùng `received_at`; không được lệch quá khứ `max_past_skew_ms` hoặc tương lai `max_future_skew_ms` |
 | `values` | Bắt buộc; object phẳng; 1..128 key |
 | key | 1..64 ký tự `[A-Za-z0-9_.:-]`, không bắt đầu bằng `$` |
-| value | number hữu hạn, boolean, hoặc string ≤ 4 096 byte; **không** null/object/array |
+| value | number hữu hạn, boolean, hoặc string ≤ 4 096 byte không chứa U+0000; **không** null/object/array |
 | payload | JSON object, UTF-8, không trailing data; ≤ `max_payload_bytes` |
 
 - `event_id` bắt buộc cho mọi telemetry trong MVP, kể cả QoS 0.
@@ -265,7 +265,7 @@ Device ACK `devices/{id}/commands/ack`, QoS 0/1:
 ```
 
 - `status` chỉ `succeeded` hoặc `failed`.
-- `result` là JSON bất kỳ ≤ 16 384 byte; `error` ≤ 512 ký tự; vượt giới hạn → ACK bị bỏ qua + log.
+- `result` là JSON bất kỳ ≤ 16 384 byte, không có U+0000 trong key/string; `error` ≤ 512 ký tự và không có U+0000; vi phạm → ACK bị bỏ qua + log.
 - Server kiểm tra `device_id` của principal khớp command; ACK lạc device bị bỏ qua + log.
 - ACK trùng không đổi terminal state.
 - ACK sau `expires_at` được lưu vào `late_ack_at`/`late_ack_json` để chẩn đoán; command vẫn `expired`.
@@ -479,7 +479,7 @@ Không có bảng `schema_migrations` riêng, không có bảng projection lates
 
 - `BEGIN IMMEDIATE` chỉ dùng cho telemetry batch và các mutation cần khóa ghi ngay; transaction phải ngắn, không chờ network/broker trong transaction.
 - Không giữ transaction khi publish MQTT/HTTP response.
-- `internal_id` là cursor ổn định; không dùng `ts` đơn lẻ làm khóa.
+- `internal_id` là ID ổn định và tie-breaker cho event-time cursor; không dùng `ts` đơn lẻ làm khóa. Trong mode reconnect, `internal_id` còn phải tạo một prefix theo thứ tự commit; không giả định ID từ sequence/identity/auto-increment tự nó có thứ tự commit.
 - `event_id` unique theo device; `payload_sha256` là SHA-256 raw payload.
 - `commands.next_attempt_at` cho phép dispatcher query due mà không scan toàn bảng.
 - `idempotency_key` unique theo device; NULL được phép lặp.
@@ -489,7 +489,7 @@ Không có bảng `schema_migrations` riêng, không có bảng projection lates
 | Dữ liệu | Chính sách MVP |
 | --- | --- |
 | `telemetry_events` | Xóa theo `received_at < now - retention_days`; batch 5 000; chạy mỗi giờ; nghỉ giữa batch |
-| `sessions` | Xóa session hết hạn hoặc revoked quá 7 ngày; mỗi giờ |
+| `sessions` | Xóa session hết hạn hoặc revoked quá 7 ngày; mỗi giờ, tối đa 5 000 row mỗi batch và nghỉ 10 ms giữa các batch |
 | `commands` | Giữ vô thời hạn (kể cả expired) |
 | `audit_events` | Giữ vô thời hạn |
 | `device_attributes` | Giữ latest vô thời hạn |
@@ -499,6 +499,18 @@ Không có bảng `schema_migrations` riêng, không có bảng projection lates
 - Xóa telemetry không tự `VACUUM`; dung lượng file có thể không giảm. Tài liệu vận hành ghi rõ backup/`VACUUM` offline.
 - Khi disk full/DB lỗi: worker dừng ACK thành công, retry backoff, readiness false.
 - `last_seen_at` chỉ ghi khi connect/disconnect (không ghi mỗi telemetry) để giảm write amplification.
+
+### 3.7. Backend PostgreSQL (P5-02)
+
+- PostgreSQL 18.6 là phiên bản triển khai đầu tiên theo ADR-010; SQLx 0.9.0 dùng driver `postgres` và Rustls. SQLite vẫn là mặc định và không cần server ngoài.
+- Backend được chọn từ URL `database.url`/`database.url_env`: `sqlite://` hoặc `postgres://`/`postgresql://`. Hai trường cấu hình loại trừ nhau; URL env thiếu, URL không hợp lệ hoặc scheme chưa hỗ trợ làm startup fail, không fallback. Secret chỉ được resolve từ environment theo tên đã cấu hình; URL đầy đủ không xuất hiện trong log/API.
+- PostgreSQL dùng pool hữu hạn, connect/acquire timeout và tối đa 5 lần retry startup với backoff 100/200/400/800 ms. Migrate trước listener bằng migration directory riêng và `_sqlx_migrations`; migration failure làm startup fail, không xóa DB, không auto downgrade.
+- PostgreSQL connection URL phải chỉ rõ `sslmode=verify-full`; chỉ chấp nhận `sslmode=disable` khi operator cấu hình rõ cho DB local/cô lập. Không dùng mặc định SQLx `prefer` hoặc `PGSSLMODE` để quyết định chính sách.
+- Binding dùng signed `BIGINT` cho thời gian và telemetry ID, UUID canonical dạng `TEXT`, hash dạng `BYTEA`, boolean `BOOLEAN`; JSON dùng `JSONB`. Mọi key/string trong JSON được persist đều từ chối U+0000 bằng validation chung trước enqueue/ghi, bảo đảm round-trip đồng nhất cả SQLite và PostgreSQL. Tên device unique/search theo ASCII case-insensitive semantics của SQLite, không phụ thuộc locale; FK, cascade, credential uniqueness và các ràng buộc domain giữ nguyên.
+- Transaction mặc định `READ COMMITTED`. Audit atomic với mutation trong cùng repository operation. Telemetry allocator dùng một hàng trong DB được khóa `FOR UPDATE` trong transaction tới commit/rollback; ID allocator update và event insert cùng transaction. Sequence/identity riêng không chứng minh được committed-prefix. Gap do duplicate/conflict được phép nếu không transaction tương lai có thể lấp ID dưới checkpoint.
+- PostgreSQL URL giữ nguyên tham số SQLx sau khi validation chính sách; yêu cầu `sslmode=verify-full` hoặc `sslmode=disable` được cấu hình rõ. `check` parse URL/options nhưng không kết nối DB.
+- Session cleanup production chạy mỗi giờ, theo batch tối đa 5 000 row/lượt với nghỉ 10 ms giữa các batch; lỗi được ghi log/metric, không làm chết process. SQLite và mỗi backend phải kiểm thử cutoff, batch cap, scheduler và cancellation.
+- Đây là mapping PostgreSQL P5-02, không thay thế test/A18 evidence; PostgreSQL chỉ được công bố hỗ trợ sau khi toàn bộ gate backend đạt.
 
 ### 3.5. Truy vấn chuẩn
 
@@ -629,7 +641,7 @@ Query: `limit`, `cursor`, `q` (tùy chọn, 2..64 ký tự, tìm trong name/id),
 ```
 
 - `name`: 1..64 ký tự Unicode, trim, không control char; unique case-insensitive (ASCII).
-- `metadata`: object ≤ 8 192 byte, depth ≤ 8; mặc định `{}`.
+- `metadata`: object ≤ 8 192 byte, depth ≤ 8, không chứa U+0000 trong key/string; mặc định `{}`.
 - `enabled`: mặc định true.
 - Token chỉ xuất hiện trong response này; không log.
 - Trùng tên → `409 device_name_conflict`.
@@ -671,7 +683,11 @@ Query: `limit`, `cursor`, `q` (tùy chọn, 2..64 ký tự, tìm trong name/id),
 
 Query lịch sử theo event time: bắt buộc `from`, `to` (ms, `from < to`, range ≤ 31 ngày). Tùy chọn: `limit` 1..1000 (mặc định 100), `cursor`, `keys` (comma-separated, tối đa 16 key).
 
-Backfill sau WebSocket reconnect dùng mode riêng: gửi `after_id` (commit checkpoint `internal_id`, exclusive: chỉ trả ID lớn hơn) thay cho `from`/`to`. **Mỗi lần mở device để theo dõi**, client gọi `after_id=0&limit=1` trước khi subscribe, lưu `through_id` làm baseline và không tiếp tục cursor lịch sử cũ; sau ACK có chứa đúng `device:{id}`, gọi lại từ baseline để lấy event commit trong lúc mở channel. Nếu re-open sau thời gian không theo dõi, chụp baseline mới để không quét lịch sử cũ. Trang đầu chụp `through_id` là SQLite AUTOINCREMENT high-water mark đã commit (ít nhất bằng `after_id`); response trả `through_id`. Server lọc `after_id < internal_id <= through_id`, sort theo `internal_id`; cursor giữ nguyên checkpoint, high-water mark, device và keys. `after_id` lớn hơn high-water mark hiện tại bị từ chối. Sau khi lấy hết cursor, client chỉ tiến checkpoint tới `through_id` đã quét xong. Không dùng clock hoặc `received_at` để tiến checkpoint; batch chưa commit không thể nằm dưới high-water mark nhìn thấy. Không có giới hạn 31 ngày cho mode này. Không gửi đồng thời `after_id` với `from`/`to`.
+Backfill sau WebSocket reconnect dùng mode riêng: gửi `after_id` (commit checkpoint `internal_id`, exclusive: chỉ trả ID lớn hơn) thay cho `from`/`to`. **Mỗi lần mở device để theo dõi**, client gọi `after_id=0&limit=1` trước khi subscribe, lưu `through_id` làm baseline và không tiếp tục cursor lịch sử cũ; sau ACK có chứa đúng `device:{id}`, gọi lại từ baseline để lấy event commit trong lúc mở channel. Nếu re-open sau thời gian không theo dõi, chụp baseline mới để không quét lịch sử cũ.
+
+`through_id` là một **committed-prefix checkpoint**: tại snapshot trả về, mọi telemetry row có `internal_id <= through_id` đã commit hoặc là khoảng trống không thể được lấp bởi một transaction commit trong tương lai; mọi row commit sau snapshot phải có ID lớn hơn checkpoint. Checkpoint không giảm khi retention xóa row. SQLite hiện đạt điều này nhờ một writer telemetry, `BEGIN IMMEDIATE` tuần tự hóa writer và AUTOINCREMENT high-water mark transaction-visible. Backend khác phải cấp ID trong transaction dưới một serialization point được giữ tới commit (ví dụ một allocator row bị khóa cùng transaction); không dùng sequence/identity/auto-increment riêng lẻ làm bằng chứng commit-order. Insert batch và cấp ID phải nguyên tử; rollback không được để một ID dưới checkpoint có thể xuất hiện/commit về sau. SQLite `INSERT OR IGNORE` có thể tiêu thụ giá trị AUTOINCREMENT cho duplicate/conflict dù không tạo telemetry row; vì vậy `through_id` được phép tiến qua khoảng trống kể cả khi backfill trả rỗng. Duplicate/conflict không phát sinh row hoặc `stored`/`duplicate` event. Test vector: retry cùng raw bytes phải trả `duplicate`; cùng ID/bytes khác phải trả `conflict`; cả hai không có row, checkpoint có thể tiến trong trang rỗng; row insert mới sau đó phải nằm sau checkpoint và được backfill. Khoảng trống chỉ an toàn khi committed-prefix invariant bảo đảm không transaction tương lai nào có thể lấp ID đã nằm dưới checkpoint.
+
+Trang đầu chụp `through_id` (ít nhất bằng `after_id`); response trả `through_id`. Server lọc `after_id < internal_id <= through_id`, sort theo `internal_id`; cursor giữ nguyên checkpoint, high-water mark, device và keys. `after_id` lớn hơn high-water mark hiện tại bị từ chối. Sau khi lấy hết cursor, client chỉ tiến checkpoint tới `through_id` đã quét xong. Không dùng clock hoặc `received_at` để tiến checkpoint. Mỗi engine phải có test interleaving có điều khiển: T1 cấp ID rồi dừng trước commit; T2 thử insert/commit và chụp checkpoint; xác minh không thể công bố checkpoint khiến T1 bị bỏ sót; sau đó commit/rollback T1 và tiếp tục backfill, chứng minh mọi row đã commit sau checkpoint đều được trả đúng một lần. Không có giới hạn 31 ngày cho mode này. Không gửi đồng thời `after_id` với `from`/`to`.
 
 ```json
 {
@@ -744,7 +760,7 @@ Query: `limit` mặc định 50, từ 1 đến 200; `cursor` tùy chọn. Sort `
 ```
 
 - `name`: 1..64, `^[a-z][a-z0-9_.-]{0,63}$`.
-- `params`: object ≤ 16 384 byte; mặc định `{}`.
+- `params`: object ≤ 16 384 byte, không chứa U+0000 trong key/string; mặc định `{}`.
 - `ttl_ms`: 1 000..`commands.max_ttl_ms`; mặc định `commands.default_ttl_ms`.
 - `idempotency_key`: tùy chọn, 1..128 printable ASCII; unique theo device.
 - 202:
@@ -866,7 +882,7 @@ Query: `limit` (mặc định 50, max 200), `cursor`, `status` (một giá trị
 - Mặc định tắt (`[http] metrics = false` → 404).
 - Khi bật, **không** dùng session cookie: bắt buộc `http.metrics_bearer_token_env` trỏ tới environment variable có token ngẫu nhiên tối thiểu 32 byte. Yêu cầu `Authorization: Bearer <token>`; thiếu/sai trả 401. Token không bao giờ xuất hiện trong API, log hay `GET /config`.
 - Production đặt endpoint sau reverse proxy/mTLS hoặc network policy chỉ cho Prometheus. Không bật metrics nếu không có một trong các lớp mạng đó.
-- Tên metric tối thiểu: `iot_mqtt_connections_active`, `iot_mqtt_kick_failures_total`, `iot_ingest_accepted_total`, `iot_ingest_rejected_total{reason}`, `iot_retained_cap_rejected_total`, `iot_telemetry_queue_depth`, `iot_telemetry_commit_seconds` (histogram), `iot_telemetry_commit_errors_total`, `iot_telemetry_retention_errors_total`, `iot_audit_write_errors_total`, `iot_commands_pending`, `iot_commands_expired_total`, `iot_command_ack_dropped_total`, `iot_command_ack_invalid_total`, `iot_command_ack_storage_errors_total`, `iot_command_publish_errors_total`, `iot_command_storage_errors_total`, `iot_command_dispatch_wake_dropped_total`, `iot_ws_clients`, `iot_ws_dropped_total`.
+- Tên metric tối thiểu: `iot_mqtt_connections_active`, `iot_mqtt_kick_failures_total`, `iot_ingest_accepted_total`, `iot_ingest_rejected_total{reason}`, `iot_retained_cap_rejected_total`, `iot_telemetry_queue_depth`, `iot_telemetry_commit_seconds` (histogram), `iot_telemetry_commit_errors_total`, `iot_telemetry_retention_errors_total`, `iot_session_cleanup_errors_total`, `iot_audit_write_errors_total`, `iot_commands_pending`, `iot_commands_expired_total`, `iot_command_ack_dropped_total`, `iot_command_ack_invalid_total`, `iot_command_ack_storage_errors_total`, `iot_command_publish_errors_total`, `iot_command_storage_errors_total`, `iot_command_dispatch_wake_dropped_total`, `iot_ws_clients`, `iot_ws_dropped_total`.
 - `iot_mqtt_presence_hook_inflight` là số hook connect/disconnect presence đang chạy; `iot_mqtt_presence_hook_inflight_max` là giá trị lớn nhất từ khi process khởi động. Không gắn nhãn device.
 - `iot_commands_pending` là gauge số command hiện ở trạng thái `pending` hoặc `dispatched`; `iot_commands_expired_total` là counter process-local cho transition sang `expired`.
 - `iot_audit_write_errors_total` tăng khi insert audit lỗi; audit config runtime cũng đếm lỗi begin/commit transaction, không đếm trùng lỗi insert.
@@ -1129,7 +1145,7 @@ format = "json"
 - `data_dir`: tạo khi `run`/`migrate`/`admin create`; `check` không tạo.
 - SQLite path: bỏ prefix `sqlite://`, resolve theo base; phải nằm trong `data_dir`; không query string, không `:memory:`. File được tạo nếu thiếu (`create_if_missing`).
 - `runtime.settings_path` phải nằm trong `data_dir` sau resolve; parent được tạo khi `run`/PATCH.
-- `database.url_env` khi resolve vẫn phải là SQLite trong MVP; `postgres`/`mysql` → `unsupported_database` (Phase 5).
+- Trong MVP, `database.url_env` khi resolve phải là SQLite; PostgreSQL được bổ sung ở Phase 5 theo §3.7. Scheme khác không được hỗ trợ.
 - `http.listen != mqtt.listen`.
 - `telemetry.batch_size <= telemetry.queue_capacity`; `default_ttl_ms <= max_ttl_ms`; `retry_initial_ms <= retry_max_ms`; `max_payload_bytes <= max_packet_bytes`.
 - `mqtt.max_client_id_len >= 36`.

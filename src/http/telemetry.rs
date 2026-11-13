@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::core::domain_error::DomainError;
-use crate::storage::sqlite::{attributes, telemetry_query};
+use crate::core::telemetry::{TelemetryHistoryRange, filtered_values};
 
 use super::AppState;
 use super::api_error::ApiError;
@@ -103,7 +103,9 @@ pub async fn history(
     if !(1..=MAX_LIMIT).contains(&limit) {
         return Err(validation_error(&request_id, "limit must be 1..=1000"));
     }
-    if !telemetry_query::device_exists(&state.pool, &device_id)
+    if !state
+        .telemetry_repository
+        .device_exists(&device_id)
         .await
         .map_err(|error| internal_error(error, &request_id))?
     {
@@ -116,7 +118,9 @@ pub async fn history(
     }
 
     let to = if time_basis == HistoryTimeBasis::CommitId {
-        let committed_through = telemetry_query::committed_through(&state.pool)
+        let committed_through = state
+            .telemetry_repository
+            .committed_through()
             .await
             .map_err(|error| internal_error(error, &request_id))?;
         if from > committed_through
@@ -160,20 +164,21 @@ pub async fn history(
             Ok((cursor.after_time, cursor.after_id))
         })
         .transpose()?;
-    let rows = telemetry_query::history(
-        &state.pool,
-        &device_id,
-        telemetry_query::HistoryRange {
-            from,
-            to,
-            commit_order: time_basis == HistoryTimeBasis::CommitId,
-        },
-        after,
-        &keys,
-        limit + 1,
-    )
-    .await
-    .map_err(|error| internal_error(error, &request_id))?;
+    let rows = state
+        .telemetry_repository
+        .history(
+            &device_id,
+            TelemetryHistoryRange {
+                from,
+                to,
+                commit_order: time_basis == HistoryTimeBasis::CommitId,
+            },
+            after,
+            &keys,
+            limit + 1,
+        )
+        .await
+        .map_err(|error| internal_error(error, &request_id))?;
 
     let has_more = rows.len() as i64 > limit;
     let rows: Vec<_> = rows.into_iter().take(limit as usize).collect();
@@ -205,7 +210,7 @@ pub async fn history(
     let items: Vec<Value> = rows
         .into_iter()
         .map(|row| {
-            let values = telemetry_query::filtered_values(&row.values_json, &keys)
+            let values = filtered_values(&row.values_json, &keys)
                 .map_err(|error| internal_error(error, &request_id))?;
             Ok(json!({
                 "internal_id": row.internal_id,
@@ -263,9 +268,11 @@ pub async fn attributes(
             Ok(cursor.key)
         })
         .transpose()?;
-    if !telemetry_query::device_exists(&state.pool, &device_id)
+    if !state
+        .telemetry_repository
+        .device_exists(&device_id)
         .await
-        .map_err(|error| storage_error(error, &request_id))?
+        .map_err(|_| storage_unavailable(&request_id))?
     {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
@@ -274,9 +281,11 @@ pub async fn attributes(
             request_id,
         ));
     }
-    let mut rows = attributes::latest(&state.pool, &device_id, after.as_deref(), limit + 1)
+    let mut rows = state
+        .attributes_repository
+        .latest(&device_id, after.as_deref(), limit + 1)
         .await
-        .map_err(|error| storage_error(error, &request_id))?;
+        .map_err(|_| storage_unavailable(&request_id))?;
     let has_more = rows.len() > limit as usize;
     rows.truncate(limit as usize);
     let next_cursor = if has_more {
@@ -285,7 +294,7 @@ pub async fn attributes(
                 serde_json::to_vec(&AttributeCursor {
                     v: 1,
                     device_id: device_id.clone(),
-                    key: row.0.clone(),
+                    key: row.key.clone(),
                 })
                 .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
                 .map_err(|error| internal_error(error, &request_id))
@@ -296,10 +305,10 @@ pub async fn attributes(
     };
     let items = rows
         .into_iter()
-        .map(|(key, value, device_ts, updated_at)| {
-            let value: Value = serde_json::from_str(&value)
+        .map(|row| {
+            let value: Value = serde_json::from_str(&row.value_json)
                 .map_err(|error| internal_error(error, &request_id))?;
-            Ok(json!({ "key": key, "value": value, "device_ts": device_ts, "updated_at": updated_at }))
+            Ok(json!({ "key": row.key, "value": value, "device_ts": row.device_ts, "updated_at": row.updated_at }))
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
     Ok(Json(json!({ "items": items, "next_cursor": next_cursor })))
@@ -314,7 +323,9 @@ pub async fn latest(
 ) -> Result<Json<Value>, ApiError> {
     let Query(query) = query.map_err(|_| validation_error(&request_id, "invalid query"))?;
     let keys = parse_keys(query.keys.as_deref(), &request_id)?;
-    if !telemetry_query::device_exists(&state.pool, &device_id)
+    if !state
+        .telemetry_repository
+        .device_exists(&device_id)
         .await
         .map_err(|error| internal_error(error, &request_id))?
     {
@@ -325,13 +336,15 @@ pub async fn latest(
             request_id,
         ));
     }
-    let rows = telemetry_query::latest(&state.pool, &device_id, &keys)
+    let rows = state
+        .telemetry_repository
+        .latest(&device_id, &keys)
         .await
         .map_err(|error| internal_error(error, &request_id))?;
     let items: Vec<Value> = rows
         .into_iter()
         .map(|row| {
-            let values = telemetry_query::filtered_values(&row.values_json, &[])
+            let values = filtered_values(&row.values_json, &[])
                 .map_err(|error| internal_error(error, &request_id))?;
             let value = values.get(&row.key).cloned().unwrap_or(Value::Null);
             Ok(json!({
@@ -410,8 +423,7 @@ fn internal_error(error: impl Into<anyhow::Error>, request_id: &str) -> ApiError
     ApiError::from_domain(DomainError::Internal(error.into()), request_id.to_owned())
 }
 
-fn storage_error(error: sqlx::Error, request_id: &str) -> ApiError {
-    tracing::warn!(%error, "attribute storage unavailable");
+fn storage_unavailable(request_id: &str) -> ApiError {
     ApiError::from_domain(
         DomainError::Unavailable("storage unavailable".to_owned()),
         request_id.to_owned(),

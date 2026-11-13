@@ -21,14 +21,20 @@ use crate::core::device_channel::DeviceChannel;
 use crate::core::events::EventBus;
 use crate::core::presence::Presence;
 use crate::core::telemetry::{self, TelemetryPayload};
-use crate::http::{AppState, ServiceReadiness, router};
-use crate::mqtt::server::MqttServer;
+use crate::http::{AppRepositories, AppState, ServiceReadiness, router};
+use crate::mqtt::server::{MqttRepositories, MqttServer};
 use crate::observability::logging;
 use crate::runtime::data_dir_lock::DataDirLock;
 use crate::runtime::retention;
 use crate::runtime::{EXIT_CONFIG, EXIT_LOCK, EXIT_MIGRATION, EXIT_RUNTIME, shutdown};
+use crate::storage::runtime::StorageRuntime;
+#[cfg(test)]
+use crate::storage::sqlite::attributes::SqliteAttributesRepository;
+#[cfg(test)]
 use crate::storage::sqlite::commands::SqliteCommandRepository;
-use crate::storage::sqlite::telemetry::SqliteTelemetryRepository;
+#[cfg(test)]
+use crate::storage::sqlite::devices::SqliteDeviceRepository;
+#[cfg(test)]
 use crate::storage::sqlite::{migrate, pool};
 #[cfg(test)]
 use tokio::sync::{Notify, oneshot};
@@ -94,17 +100,17 @@ async fn run_inner(
         return ExitCode::FAILURE;
     }
 
-    let pool = match pool::connect(&loaded).await {
-        Ok(pool) => pool,
+    let storage = match StorageRuntime::connect(&loaded).await {
+        Ok(storage) => storage,
         Err(error) => {
             tracing::error!(%error, "cannot open database");
             return ExitCode::from(EXIT_MIGRATION);
         }
     };
 
-    if let Err(error) = migrate::run(&pool).await {
+    if let Err(error) = storage.migrate().await {
         tracing::error!(%error, "migration failed");
-        pool.close().await;
+        storage.close().await;
         return ExitCode::from(EXIT_MIGRATION);
     }
 
@@ -112,16 +118,25 @@ async fn run_inner(
     let events = EventBus::new();
     let telemetry_ready = Arc::new(AtomicBool::new(true));
     let telemetry_cancel = CancellationToken::new();
+    let admin_repository = Arc::clone(&storage.repositories.admin);
+    let command_repository = Arc::clone(&storage.repositories.commands);
+    let device_repository = Arc::clone(&storage.repositories.devices);
+    let attributes_repository = Arc::clone(&storage.repositories.attributes);
+    let storage_repository = Arc::clone(&storage.repositories.storage);
+    let telemetry_repository = Arc::clone(&storage.repositories.telemetry);
+    let telemetry_read_repository = Arc::clone(&storage.repositories.telemetry_read);
+    let telemetry_retention_repository = Arc::clone(&storage.repositories.telemetry_retention);
+    let session_repository = Arc::clone(&storage.repositories.sessions);
     let limits = match TelemetryPayload::try_from(telemetry_config) {
         Ok(limits) => limits,
         Err(error) => {
             tracing::error!(%error, "invalid telemetry limits");
-            pool.close().await;
+            storage.close().await;
             return ExitCode::from(EXIT_MIGRATION);
         }
     };
     let (ingest, mut ingest_task) = telemetry::spawn_worker(
-        Arc::new(SqliteTelemetryRepository::new(pool.clone())),
+        Arc::clone(&telemetry_repository),
         events.clone(),
         telemetry_config.queue_capacity as usize,
         telemetry_config.max_batch_bytes as usize,
@@ -139,7 +154,11 @@ async fn run_inner(
         MqttServer::start_with_ingest_and_test_kickers(
             &loaded.config.mqtt,
             Arc::clone(&mqtt_ready),
-            pool.clone(),
+            MqttRepositories {
+                devices: Arc::clone(&device_repository),
+                commands: Arc::clone(&command_repository),
+                attributes: Arc::clone(&attributes_repository),
+            },
             Arc::clone(&presence),
             (
                 ingest.clone(),
@@ -154,11 +173,17 @@ async fn run_inner(
         MqttServer::start_with_ingest(
             &loaded.config.mqtt,
             Arc::clone(&mqtt_ready),
-            pool.clone(),
+            MqttRepositories {
+                devices: Arc::clone(&device_repository),
+                commands: Arc::clone(&command_repository),
+                attributes: Arc::clone(&attributes_repository),
+            },
             Arc::clone(&presence),
-            ingest.clone(),
-            limits,
-            telemetry_config.queue_capacity as usize,
+            (
+                ingest.clone(),
+                limits,
+                telemetry_config.queue_capacity as usize,
+            ),
         )
         .await
     };
@@ -166,11 +191,17 @@ async fn run_inner(
     let mqtt_start = MqttServer::start_with_ingest(
         &loaded.config.mqtt,
         Arc::clone(&mqtt_ready),
-        pool.clone(),
+        MqttRepositories {
+            devices: Arc::clone(&device_repository),
+            commands: Arc::clone(&command_repository),
+            attributes: Arc::clone(&attributes_repository),
+        },
         Arc::clone(&presence),
-        ingest.clone(),
-        limits,
-        telemetry_config.queue_capacity as usize,
+        (
+            ingest.clone(),
+            limits,
+            telemetry_config.queue_capacity as usize,
+        ),
     )
     .await;
 
@@ -181,7 +212,7 @@ async fn run_inner(
             telemetry_cancel.cancel();
             drop(ingest);
             ingest_task.abort();
-            pool.close().await;
+            storage.close().await;
             return ExitCode::FAILURE;
         }
     };
@@ -202,7 +233,7 @@ async fn run_inner(
             telemetry_cancel.cancel();
             drop(ingest);
             ingest_task.abort();
-            pool.close().await;
+            storage.close().await;
             return ExitCode::FAILURE;
         }
     };
@@ -214,7 +245,7 @@ async fn run_inner(
             telemetry_cancel.cancel();
             drop(ingest);
             ingest_task.abort();
-            pool.close().await;
+            storage.close().await;
             return ExitCode::FAILURE;
         }
     };
@@ -225,7 +256,7 @@ async fn run_inner(
     let command_ready = Arc::new(AtomicBool::new(false));
     let command_cancel = CancellationToken::new();
     let mut command_task = spawn_dispatcher(
-        Arc::new(SqliteCommandRepository::new(pool.clone())),
+        Arc::clone(&command_repository),
         mqtt.device_channel(),
         loaded.config.commands.clone(),
         mqtt.pending_command_acks(),
@@ -234,7 +265,14 @@ async fn run_inner(
         Arc::clone(&command_ready),
     );
     let state = AppState::new(
-        pool.clone(),
+        AppRepositories {
+            commands: Arc::clone(&command_repository),
+            admin: Arc::clone(&admin_repository),
+            devices: Arc::clone(&device_repository),
+            attributes: Arc::clone(&attributes_repository),
+            telemetry: Arc::clone(&telemetry_read_repository),
+            storage: Arc::clone(&storage_repository),
+        },
         Arc::new(loaded),
         ServiceReadiness {
             mqtt: Arc::clone(&mqtt_ready),
@@ -247,7 +285,8 @@ async fn run_inner(
     );
     let retention_cancel = CancellationToken::new();
     let mut retention_task = retention::spawn(
-        pool.clone(),
+        Arc::clone(&telemetry_retention_repository),
+        Arc::clone(&session_repository),
         state.config.runtime_config.clone(),
         retention_cancel.clone(),
     );
@@ -290,7 +329,7 @@ async fn run_inner(
             telemetry_cancel.cancel();
             drop(ingest);
             ingest_task.abort();
-            state.pool.close().await;
+            storage.close().await;
             return ExitCode::FAILURE;
         }
     };
@@ -307,7 +346,7 @@ async fn run_inner(
             telemetry_cancel.cancel();
             drop(ingest);
             ingest_task.abort();
-            state.pool.close().await;
+            storage.close().await;
             return ExitCode::FAILURE;
         }
     };
@@ -347,7 +386,8 @@ async fn run_inner(
                     .telemetry_retention_errors_total
                     .inc();
                 retention_task = retention::spawn(
-                    pool.clone(),
+                    Arc::clone(&telemetry_retention_repository),
+                    Arc::clone(&session_repository),
                     state.config.runtime_config.clone(),
                     retention_cancel.clone(),
                 );
@@ -398,7 +438,7 @@ async fn run_inner(
                 ingest_task.abort();
             }
             let _ = stop_mqtt_workers(&mut mqtt, shutdown_remaining(deadline)).await;
-            state.pool.close().await;
+            storage.close().await;
             return ExitCode::FAILURE;
         }
         TaskExit::Mqtt(result) => {
@@ -430,7 +470,7 @@ async fn run_inner(
             let _ = stop_mqtt_workers(&mut mqtt, shutdown_remaining(deadline)).await;
             let outcome =
                 shutdown::http(&state.ready, &cancel, server, shutdown_remaining(deadline)).await;
-            state.pool.close().await;
+            storage.close().await;
             if let Err(error) = outcome {
                 tracing::error!(%error, "http shutdown after mqtt failure failed");
             }
@@ -463,7 +503,7 @@ async fn run_inner(
             )
             .await;
             drop(ingest);
-            state.pool.close().await;
+            storage.close().await;
             drop(lock);
             return exit;
         }
@@ -491,7 +531,7 @@ async fn run_inner(
             let _ = stop_mqtt_workers(&mut mqtt, shutdown_remaining(deadline)).await;
             let _ =
                 shutdown::http(&state.ready, &cancel, server, shutdown_remaining(deadline)).await;
-            state.pool.close().await;
+            storage.close().await;
             drop(lock);
             return ExitCode::FAILURE;
         }
@@ -540,7 +580,7 @@ async fn run_inner(
     drop(ingest);
     let mqtt_workers_stopped = stop_mqtt_workers(&mut mqtt, shutdown_remaining(deadline)).await;
     let outcome = shutdown::wait_http(server, shutdown_remaining(deadline)).await;
-    state.pool.close().await;
+    storage.close().await;
     drop(lock);
 
     match (
@@ -601,10 +641,11 @@ async fn stop_mqtt_workers(mqtt: &mut MqttServer, timeout: Duration) -> bool {
     let telemetry_acks_drained = mqtt
         .drain_telemetry_ack_worker(shutdown_remaining(deadline))
         .await;
+    // shortcut: 50 ms is not remote delivery confirmation; add broker ACK tracking if shutdown must guarantee client receipt.
+    tokio::time::sleep(shutdown_remaining(deadline).min(Duration::from_millis(50))).await;
     let sessions_kicked = mqtt
         .kick_connected_sessions(shutdown_remaining(deadline))
         .await;
-    tokio::time::sleep(shutdown_remaining(deadline).min(Duration::from_millis(50))).await;
     mqtt.stop_listener().await;
     let workers_drained = mqtt.drain_workers(shutdown_remaining(deadline)).await;
     telemetry_acks_drained && sessions_kicked && workers_drained
@@ -797,10 +838,15 @@ mod tests {
                 ..crate::config::schema::MqttConfig::default()
             };
             let mqtt_ready = Arc::new(AtomicBool::new(false));
+            let pool = sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap();
             let mut mqtt = MqttServer::start(
                 &config,
                 Arc::clone(&mqtt_ready),
-                sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap(),
+                MqttRepositories {
+                    devices: Arc::new(SqliteDeviceRepository::new(pool.clone())),
+                    commands: Arc::new(SqliteCommandRepository::new(pool.clone())),
+                    attributes: Arc::new(SqliteAttributesRepository::new(pool)),
+                },
                 Arc::new(Presence::new()),
             )
             .await

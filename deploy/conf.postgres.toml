@@ -1,0 +1,17 @@
+config_version = 1
+
+[server]
+data_dir = "/app/data"
+
+[http]
+listen = "0.0.0.0:8080"
+# Local Compose only; enable when serving through HTTPS.
+cookie_secure = false
+
+[mqtt]
+listen = "0.0.0.0:1883"
+
+[database]
+url_env = "IOT_DATABASE_URL"
+max_connections = 5
+connect_timeout_ms = 5000

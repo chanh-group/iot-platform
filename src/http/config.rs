@@ -9,9 +9,7 @@ use serde_json::{Value, json};
 
 use crate::config;
 use crate::config::runtime::{RuntimeConfigError, RuntimeSnapshot};
-use crate::observability::metrics::Metrics;
 use crate::observability::request_id::RequestId;
-use crate::storage::sqlite::audit;
 
 use super::AppState;
 use super::api_error::ApiError;
@@ -119,38 +117,22 @@ async fn audit_config_update(
     snapshot: &RuntimeSnapshot,
     changed_fields: &[String],
 ) {
-    let details = json!({
-        "old_revision": old_revision,
-        "new_revision": snapshot.revision,
-        "paths": changed_fields,
-    })
-    .to_string();
     let remote_ip = peer.ip().to_string();
-    let event = audit::AuditEvent {
-        actor_type: "admin",
-        actor_id: Some(actor_id),
-        action: "config.update",
-        target_type: Some("config"),
-        target_id: Some("runtime"),
-        request_id: Some(request_id),
-        remote_ip: Some(&remote_ip),
-        details_json: Some(&details),
-    };
-    let mut transaction = match state.pool.begin().await {
-        Ok(transaction) => transaction,
-        Err(error) => {
-            Metrics::global().audit_write_errors_total.inc();
-            tracing::error!(%error, "config update audit transaction could not start");
-            return;
-        }
-    };
-    if let Err(error) = audit::insert(&mut transaction, crate::core::auth::now_ms(), &event).await {
-        tracing::error!(%error, "config update audit insert failed after runtime snapshot publication");
-        return;
-    }
-    if let Err(error) = transaction.commit().await {
-        Metrics::global().audit_write_errors_total.inc();
-        tracing::error!(%error, "config update audit transaction commit failed");
+    if state
+        .storage_repository
+        .audit_config_update(crate::core::storage::ConfigAudit {
+            occurred_at: crate::core::auth::now_ms(),
+            actor_id,
+            request_id,
+            remote_ip: &remote_ip,
+            old_revision,
+            new_revision: snapshot.revision,
+            changed_fields,
+        })
+        .await
+        .is_err()
+    {
+        tracing::error!("config update audit failed after runtime snapshot publication");
     }
 }
 

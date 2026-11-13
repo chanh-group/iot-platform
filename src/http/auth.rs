@@ -11,12 +11,9 @@ use axum_extra::extract::cookie::CookieJar;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::core::auth;
+use crate::core::auth::{self, AdminSession, NewAdminSession};
 use crate::core::domain_error::DomainError;
 use crate::observability::request_id::RequestId;
-use crate::storage::sqlite::audit::{self, AuditEvent};
-use crate::storage::sqlite::sessions::{self, Session};
-use crate::storage::sqlite::users;
 
 use super::AppState;
 use super::api_error::ApiError;
@@ -33,7 +30,7 @@ pub struct LoginRequest {
 }
 
 /// Extracted session for routes that require an authenticated admin.
-pub struct AuthSession(pub Session);
+pub struct AuthSession(pub AdminSession);
 
 impl FromRequestParts<AppState> for AuthSession {
     type Rejection = ApiError;
@@ -57,10 +54,12 @@ impl FromRequestParts<AppState> for AuthSession {
         };
 
         let token_hash = auth::hash_token(&token);
-        let session = sessions::verify(&state.pool, &token_hash, auth::now_ms())
+        let session = state
+            .admin_repository
+            .verify_session(&token_hash, auth::now_ms())
             .await
-            .map_err(|error| {
-                tracing::warn!(%error, "session storage unavailable");
+            .map_err(|_| {
+                tracing::warn!("session storage unavailable");
                 ApiError::from_domain(
                     DomainError::Unavailable("storage unavailable".to_owned()),
                     request_id.clone(),
@@ -95,7 +94,9 @@ pub async fn login(
         return Ok(response);
     }
 
-    let user = users::find_by_username(&state.pool, &payload.username)
+    let user = state
+        .admin_repository
+        .find_user(&payload.username)
         .await
         .map_err(|error| internal(error, &request_id))?;
     let Some(user) = user else {
@@ -139,40 +140,17 @@ pub async fn login(
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
 
-    let mut tx = state
-        .pool
-        .begin()
-        .await
-        .map_err(|error| internal(error, &request_id))?;
-    sessions::create(
-        &mut tx,
-        &user.id,
-        &token_hash,
-        now,
-        expires_at,
-        Some(&remote_ip),
-        user_agent.as_deref(),
-    )
-    .await
-    .map_err(|error| internal(error, &request_id))?;
-    let details = json!({ "username": user.username }).to_string();
-    audit::insert(
-        &mut tx,
-        now,
-        &AuditEvent {
-            actor_type: "admin",
-            actor_id: Some(&user.id),
-            action: "auth.login",
-            target_type: Some("user"),
-            target_id: Some(&user.id),
-            request_id: Some(&request_id),
-            remote_ip: Some(&remote_ip),
-            details_json: Some(&details),
-        },
-    )
-    .await
-    .map_err(|error| internal(error, &request_id))?;
-    tx.commit()
+    state
+        .admin_repository
+        .create_session_and_audit(NewAdminSession {
+            user: &user,
+            token_hash: &token_hash,
+            now,
+            expires_at,
+            remote_ip: &remote_ip,
+            user_agent: user_agent.as_deref(),
+            request_id: &request_id,
+        })
         .await
         .map_err(|error| internal(error, &request_id))?;
 
@@ -198,31 +176,9 @@ pub async fn logout(
 ) -> Result<Response, ApiError> {
     let now = auth::now_ms();
     let remote_ip = peer.ip().to_string();
-    let mut tx = state
-        .pool
-        .begin()
-        .await
-        .map_err(|error| internal(error, &request_id))?;
-    sessions::revoke(&mut tx, &session.id, now)
-        .await
-        .map_err(|error| internal(error, &request_id))?;
-    audit::insert(
-        &mut tx,
-        now,
-        &AuditEvent {
-            actor_type: "admin",
-            actor_id: Some(&session.user_id),
-            action: "auth.logout",
-            target_type: Some("session"),
-            target_id: Some(&session.id),
-            request_id: Some(&request_id),
-            remote_ip: Some(&remote_ip),
-            details_json: None,
-        },
-    )
-    .await
-    .map_err(|error| internal(error, &request_id))?;
-    tx.commit()
+    state
+        .admin_repository
+        .revoke_session_and_audit(&session, now, &request_id, &remote_ip)
         .await
         .map_err(|error| internal(error, &request_id))?;
     state.events.publish_session_revocation(&session.id);

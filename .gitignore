@@ -5,4 +5,6 @@ web/node_modules/
 web/dist/
 *.log
 .env
+/deploy/secrets/
+/deploy/secrets/
 skills

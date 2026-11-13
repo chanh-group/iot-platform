@@ -16,8 +16,8 @@ use iot_server::core::command::spawn_dispatcher;
 use iot_server::core::events::EventBus;
 use iot_server::core::presence::Presence;
 use iot_server::core::telemetry::{self as telemetry_core, TelemetryPayload};
-use iot_server::http::{AppState, ServiceReadiness, router};
-use iot_server::mqtt::server::MqttServer;
+use iot_server::http::{AppRepositories, AppState, ServiceReadiness, router};
+use iot_server::mqtt::server::{MqttRepositories, MqttServer};
 use iot_server::runtime::data_dir_lock::DataDirLock;
 use iot_server::storage::sqlite::commands::SqliteCommandRepository;
 use iot_server::storage::sqlite::telemetry::SqliteTelemetryRepository;
@@ -266,7 +266,19 @@ impl TestApp {
         let mqtt = MqttServer::start(
             &config,
             readiness,
-            self.pool.clone(),
+            MqttRepositories {
+                devices: Arc::new(
+                    iot_server::storage::sqlite::devices::SqliteDeviceRepository::new(
+                        self.pool.clone(),
+                    ),
+                ),
+                commands: Arc::new(SqliteCommandRepository::new(self.pool.clone())),
+                attributes: Arc::new(
+                    iot_server::storage::sqlite::attributes::SqliteAttributesRepository::new(
+                        self.pool.clone(),
+                    ),
+                ),
+            },
             Arc::clone(&self.presence),
         )
         .await
@@ -512,11 +524,19 @@ impl TestAppBuilder {
         let mut mqtt = MqttServer::start_with_ingest(
             &mqtt_config,
             Arc::clone(&mqtt_ready),
-            pool.clone(),
+            MqttRepositories {
+                devices: Arc::new(
+                    iot_server::storage::sqlite::devices::SqliteDeviceRepository::new(pool.clone()),
+                ),
+                commands: Arc::new(SqliteCommandRepository::new(pool.clone())),
+                attributes: Arc::new(
+                    iot_server::storage::sqlite::attributes::SqliteAttributesRepository::new(
+                        pool.clone(),
+                    ),
+                ),
+            },
             Arc::clone(&presence),
-            ingest,
-            limits,
-            telemetry.queue_capacity as usize,
+            (ingest, limits, telemetry.queue_capacity as usize),
         )
         .await
         .unwrap();
@@ -533,7 +553,24 @@ impl TestAppBuilder {
             Arc::clone(&command_ready),
         );
         let state = AppState::new(
-            pool.clone(),
+            AppRepositories {
+                commands: Arc::new(SqliteCommandRepository::new(pool.clone())),
+                admin: Arc::new(
+                    iot_server::storage::sqlite::admin::SqliteAdminRepository::new(pool.clone()),
+                ),
+                devices: Arc::new(
+                    iot_server::storage::sqlite::devices::SqliteDeviceRepository::new(pool.clone()),
+                ),
+                attributes: Arc::new(
+                    iot_server::storage::sqlite::attributes::SqliteAttributesRepository::new(
+                        pool.clone(),
+                    ),
+                ),
+                telemetry: Arc::new(SqliteTelemetryRepository::new(pool.clone())),
+                storage: Arc::new(
+                    iot_server::storage::sqlite::system::SqliteSystemRepository::new(pool.clone()),
+                ),
+            },
             Arc::clone(&loaded),
             ServiceReadiness {
                 mqtt: mqtt_ready,

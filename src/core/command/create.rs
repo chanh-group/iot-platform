@@ -47,6 +47,11 @@ pub fn validate_create(
             field: "params".to_owned(),
             reason: "must be an object".to_owned(),
         });
+    } else if crate::core::json::contains_nul(&request.params) {
+        errors.push(FieldError {
+            field: "params".to_owned(),
+            reason: "must not contain U+0000".to_owned(),
+        });
     } else if params_json
         .as_ref()
         .is_none_or(|encoded| encoded.len() > MAX_PARAMS_BYTES)
@@ -168,6 +173,7 @@ mod tests {
             r#"{"name":"Reboot"}"#,
             r#"{"name":"1reboot"}"#,
             r#"{"name":"reboot","params":null}"#,
+            r#"{"name":"reboot","params":{"x":"\u0000"}}"#,
             r#"{"name":"reboot","ttl_ms":999}"#,
             r#"{"name":"reboot","ttl_ms":86400001}"#,
             r#"{"name":"reboot","idempotency_key":"bad\tkey"}"#,

@@ -14,14 +14,13 @@ use serde::Deserialize;
 use super::presence::ConnectionLimiter;
 use super::server_publish::AckHandle;
 use crate::core::acl;
-use crate::core::attributes;
+use crate::core::attributes::{self, AttributeHandle};
 use crate::core::auth;
 use crate::core::command::CommandAckHandle;
 use crate::core::events::EventBus;
 use crate::core::telemetry::{
     self, IngestHandle, IngestSubmitError, TelemetryError, TelemetryPayload,
 };
-use crate::storage::sqlite::attributes::AttributeHandle;
 
 /// Publish/subscribe ACL handlers for authenticated device sessions.
 #[derive(Clone)]

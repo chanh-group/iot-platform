@@ -1,6 +1,120 @@
 //! Device mutation validation (`02` §4.3).
 
 use serde_json::Value;
+use thiserror::Error;
+
+#[derive(Debug, Clone)]
+pub struct DeviceRow {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub metadata_json: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub last_seen_at: Option<i64>,
+    pub credential_id: Option<String>,
+    pub credential_created_at: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActiveCredential {
+    pub credential_id: String,
+    pub token_hash: Vec<u8>,
+    pub device_enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeviceKickState {
+    pub enabled: bool,
+    pub active_credential_id: Option<String>,
+}
+
+pub struct NewDevice<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+    pub metadata_json: &'a str,
+    pub enabled: bool,
+    pub created_at: i64,
+    pub credential_id: &'a str,
+    pub token_hash: &'a [u8],
+}
+
+pub struct DeviceAudit<'a> {
+    pub actor_id: &'a str,
+    pub request_id: &'a str,
+    pub remote_ip: &'a str,
+}
+
+pub struct DeviceCredentialRotation<'a> {
+    pub device_id: &'a str,
+    pub expected_credential_id: &'a str,
+    pub new_credential_id: &'a str,
+    pub token_hash: &'a [u8],
+    pub now: i64,
+    pub audit: DeviceAudit<'a>,
+}
+
+#[derive(Debug, Error)]
+pub enum DeviceRepositoryError {
+    #[error("device not found")]
+    NotFound,
+    #[error("device name already exists")]
+    NameConflict,
+    #[error("active credential changed during rotation")]
+    CredentialChanged,
+    #[error("device storage unavailable")]
+    Storage(#[source] anyhow::Error),
+}
+
+#[async_trait::async_trait]
+pub trait DeviceRepository: Send + Sync {
+    async fn get(&self, id: &str) -> Result<Option<DeviceRow>, DeviceRepositoryError>;
+
+    async fn list(
+        &self,
+        q: Option<&str>,
+        enabled: Option<bool>,
+        after: Option<(i64, &str)>,
+        limit: i64,
+    ) -> Result<Vec<DeviceRow>, DeviceRepositoryError>;
+
+    async fn active_credential(
+        &self,
+        device_id: &str,
+    ) -> Result<Option<ActiveCredential>, DeviceRepositoryError>;
+
+    async fn update_last_seen(
+        &self,
+        device_id: &str,
+        now: i64,
+    ) -> Result<(), DeviceRepositoryError>;
+
+    async fn kick_state(
+        &self,
+        device_id: &str,
+    ) -> Result<Option<DeviceKickState>, DeviceRepositoryError>;
+
+    async fn create(
+        &self,
+        device: &NewDevice<'_>,
+        audit: &DeviceAudit<'_>,
+    ) -> Result<(), DeviceRepositoryError>;
+
+    async fn patch(
+        &self,
+        device_id: &str,
+        patch: DevicePatch,
+        now: i64,
+        audit: &DeviceAudit<'_>,
+        after_commit: Box<dyn FnOnce() + Send>,
+    ) -> Result<DeviceRow, DeviceRepositoryError>;
+
+    async fn rotate_credential(
+        &self,
+        request: DeviceCredentialRotation<'_>,
+        after_commit: Box<dyn FnOnce() + Send>,
+    ) -> Result<(), DeviceRepositoryError>;
+}
 
 use super::domain_error::FieldError;
 
@@ -30,6 +144,12 @@ pub fn validate_metadata(value: &Value) -> Result<String, FieldError> {
         return Err(FieldError {
             field: "metadata".to_owned(),
             reason: "must be an object".to_owned(),
+        });
+    }
+    if crate::core::json::contains_nul(value) {
+        return Err(FieldError {
+            field: "metadata".to_owned(),
+            reason: "must not contain U+0000".to_owned(),
         });
     }
     if json_depth(value) > MAX_METADATA_DEPTH {
@@ -143,6 +263,7 @@ mod tests {
         assert!(validate_metadata(&json!({"x": "x".repeat(8_184)})).is_ok());
         assert!(validate_metadata(&json!({"x": "x".repeat(8_185)})).is_err());
         assert!(validate_metadata(&json!({"x": "x".repeat(MAX_METADATA_BYTES)})).is_err());
+        assert!(validate_metadata(&json!({"nested": ["\0"]})).is_err());
         assert!(
             validate_metadata(&json!({"a":{"b":{"c":{"d":{"e":{"f":{"g":{"h":0}}}}}}}})).is_ok()
         );

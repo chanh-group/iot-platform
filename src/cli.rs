@@ -7,11 +7,10 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use crate::config::{self, LoadedConfig};
-use crate::core::auth;
+use crate::core::auth::{self, AdminCreateError};
 use crate::runtime::data_dir_lock::DataDirLock;
 use crate::runtime::{EXIT_CONFIG, EXIT_LOCK, EXIT_MIGRATION, supervisor};
-use crate::storage::sqlite::users::{self, CreateAdminError};
-use crate::storage::sqlite::{migrate, pool};
+use crate::storage::runtime::StorageRuntime;
 
 const EXIT_ADMIN_EXISTS: u8 = 6;
 
@@ -202,22 +201,20 @@ async fn admin_create_async(
         }
     };
 
-    let pool = match pool::connect(&loaded).await {
-        Ok(pool) => pool,
+    let storage = match StorageRuntime::connect(&loaded).await {
+        Ok(storage) => storage,
         Err(error) => {
             eprintln!("iot-server: cannot open database: {error}");
             return ExitCode::FAILURE;
         }
     };
 
-    let result = async {
-        let mut tx = pool.begin().await?;
-        let user = users::create_admin(&mut tx, &username, &password_hash, auth::now_ms()).await?;
-        tx.commit().await?;
-        Ok::<_, CreateAdminError>(user)
-    }
-    .await;
-    pool.close().await;
+    let result = storage
+        .repositories
+        .admin
+        .create_admin(&username, &password_hash, auth::now_ms())
+        .await;
+    storage.close().await;
 
     match result {
         Ok(user) => {
@@ -225,11 +222,11 @@ async fn admin_create_async(
             println!("created admin '{username}'");
             ExitCode::SUCCESS
         }
-        Err(CreateAdminError::AlreadyExists) => {
+        Err(AdminCreateError::AlreadyExists) => {
             eprintln!("iot-server: an admin user already exists");
             ExitCode::from(EXIT_ADMIN_EXISTS)
         }
-        Err(CreateAdminError::Database(error)) => {
+        Err(AdminCreateError::Storage(error)) => {
             eprintln!("iot-server: cannot create admin: {error}");
             ExitCode::FAILURE
         }
@@ -245,16 +242,16 @@ async fn migrate_async(loaded: LoadedConfig) -> ExitCode {
         }
     };
 
-    let pool = match pool::connect(&loaded).await {
-        Ok(pool) => pool,
+    let storage = match StorageRuntime::connect(&loaded).await {
+        Ok(storage) => storage,
         Err(error) => {
             eprintln!("iot-server: cannot open database: {error}");
             return ExitCode::from(EXIT_MIGRATION);
         }
     };
 
-    let result = migrate::run(&pool).await;
-    pool.close().await;
+    let result = storage.migrate().await;
+    storage.close().await;
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

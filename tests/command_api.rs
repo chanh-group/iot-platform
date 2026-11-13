@@ -37,6 +37,69 @@ async fn create_command(
         .unwrap()
 }
 
+async fn assert_command_audit_failure(http: &reqwest::Client, base: &str, device_id: &str) {
+    let response = http
+        .post(format!("{base}/api/v1/devices/{device_id}/commands"))
+        .header("X-IoT-CSRF", "1")
+        .header("X-Request-ID", "command-api-123")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(r#"{"name":"reboot","idempotency_key":"audit-failure"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["code"],
+        "storage_unavailable"
+    );
+}
+
+async fn assert_raw_request_idempotency(http: &reqwest::Client, base: &str, device_id: &str) {
+    let request =
+        r#"{"name":"reboot","params":{"n":1},"ttl_ms":60000,"idempotency_key":"same-key"}"#;
+
+    let first = http
+        .post(format!("{base}/api/v1/devices/{device_id}/commands"))
+        .header("X-IoT-CSRF", "1")
+        .header("X-Request-ID", "command-api-123")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(request.to_owned())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), reqwest::StatusCode::ACCEPTED);
+    let first_body: Value = first.json().await.unwrap();
+    let replay = http
+        .post(format!("{base}/api/v1/devices/{device_id}/commands"))
+        .header("X-IoT-CSRF", "1")
+        .header("X-Request-ID", "command-api-123")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(request.to_owned())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(replay.headers()["idempotent-replayed"], "true");
+    let replay_body: Value = replay.json().await.unwrap();
+    assert_eq!(replay_body["command_id"], first_body["command_id"]);
+
+    let same_value_different_bytes = "{\n \"idempotency_key\":\"same-key\", \"ttl_ms\":60000, \"params\":{\"n\":1}, \"name\":\"reboot\"\n}";
+    let conflict = http
+        .post(format!("{base}/api/v1/devices/{device_id}/commands"))
+        .header("X-IoT-CSRF", "1")
+        .header("X-Request-ID", "command-api-123")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(same_value_different_bytes)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        conflict.json::<Value>().await.unwrap()["code"],
+        "idempotency_conflict"
+    );
+}
+
 #[tokio::test]
 async fn create_commits_command_and_redacted_audit_before_returning_202() {
     let app = TestApp::start().await;
@@ -213,25 +276,7 @@ async fn idempotency_uses_raw_request_bytes_and_does_not_audit_replays() {
     let app = TestApp::start().await;
     let device = app.create_device("command-idempotency", true).await;
     let http = admin_client(&app, "command-idempotency-admin").await;
-    let request =
-        r#"{"name":"reboot","params":{"n":1},"ttl_ms":60000,"idempotency_key":"same-key"}"#;
-
-    let first = create_command(&http, &app, &device.id, request).await;
-    assert_eq!(first.status(), reqwest::StatusCode::ACCEPTED);
-    let first_body: Value = first.json().await.unwrap();
-    let replay = create_command(&http, &app, &device.id, request).await;
-    assert_eq!(replay.status(), reqwest::StatusCode::ACCEPTED);
-    assert_eq!(replay.headers()["idempotent-replayed"], "true");
-    let replay_body: Value = replay.json().await.unwrap();
-    assert_eq!(replay_body["command_id"], first_body["command_id"]);
-
-    let same_value_different_bytes = "{\n \"idempotency_key\":\"same-key\", \"ttl_ms\":60000, \"params\":{\"n\":1}, \"name\":\"reboot\"\n}";
-    let conflict = create_command(&http, &app, &device.id, same_value_different_bytes).await;
-    assert_eq!(conflict.status(), reqwest::StatusCode::CONFLICT);
-    assert_eq!(
-        conflict.json::<Value>().await.unwrap()["code"],
-        "idempotency_conflict"
-    );
+    assert_raw_request_idempotency(&http, &app.base, &device.id).await;
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM commands WHERE device_id = ? AND idempotency_key = 'same-key'",
@@ -247,6 +292,47 @@ async fn idempotency_uses_raw_request_bytes_and_does_not_audit_replays() {
             "SELECT COUNT(*) FROM audit_events WHERE action = 'command.create'",
         )
         .fetch_one(&app.pool)
+        .await
+        .unwrap(),
+        1
+    );
+}
+
+#[path = "common/mqtt_auth_postgres.rs"]
+mod mqtt_auth_postgres;
+
+#[tokio::test]
+#[ignore = "requires tests/command_api_postgres.sh"]
+async fn idempotency_uses_raw_request_bytes_and_does_not_audit_replays_postgres() {
+    let app = mqtt_auth_postgres::PostgresApp::start().await;
+    let device = app.create_device("command-idempotency").await;
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(reqwest::header::COOKIE, app.admin_cookie().parse().unwrap());
+    let http = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap();
+    let base = app.base_url();
+    assert_raw_request_idempotency(&http, base, &device.id).await;
+
+    let pool = sqlx::PgPool::connect(&std::env::var("IOT_TEST_POSTGRES_URL").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM commands WHERE device_id = $1 AND idempotency_key = 'same-key'",
+        )
+        .bind(&device.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'command.create'",
+        )
+        .fetch_one(&pool)
         .await
         .unwrap(),
         1
@@ -302,15 +388,84 @@ async fn command_list_paginates_filters_and_detail_is_scoped_to_contract_fields(
     let app = TestApp::start().await;
     let device = app.create_device("command-list", true).await;
     let http = admin_client(&app, "command-list-admin").await;
+    let ids = create_three_commands(&http, &app.base, &device.id).await;
+    sqlx::query("UPDATE commands SET created_at = ? WHERE device_id = ?")
+        .bind(auth::now_ms() - 1_000)
+        .bind(&device.id)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE commands SET status = 'dispatched', dispatched_at = ? WHERE id = ?")
+        .bind(auth::now_ms())
+        .bind(&ids[0])
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let expected_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM commands WHERE device_id = ? ORDER BY created_at DESC, id DESC",
+    )
+    .bind(&device.id)
+    .fetch_all(&app.pool)
+    .await
+    .unwrap();
+    assert_command_list_contract(&http, &app.base, &device.id, &ids, &expected_ids).await;
+}
+
+#[tokio::test]
+#[ignore = "requires tests/command_list_postgres.sh"]
+async fn command_list_paginates_filters_and_detail_is_scoped_to_contract_fields_postgres() {
+    let app = mqtt_auth_postgres::PostgresApp::start().await;
+    let device = app.create_device("command-list").await;
+    let http = postgres_admin_client(app.admin_cookie());
+    let ids = create_three_commands(&http, app.base_url(), &device.id).await;
+    let pool = sqlx::PgPool::connect(&std::env::var("IOT_TEST_POSTGRES_URL").unwrap())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE commands SET created_at = $1 WHERE device_id = $2")
+        .bind(auth::now_ms() - 1_000)
+        .bind(&device.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE commands SET status = 'dispatched', dispatched_at = $1 WHERE id = $2")
+        .bind(auth::now_ms())
+        .bind(&ids[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+    let expected_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM commands WHERE device_id = $1 ORDER BY created_at DESC, id DESC",
+    )
+    .bind(&device.id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_command_list_contract(&http, app.base_url(), &device.id, &ids, &expected_ids).await;
+}
+
+fn postgres_admin_client(cookie: &str) -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(reqwest::header::COOKIE, cookie.parse().unwrap());
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap()
+}
+
+async fn create_three_commands(http: &reqwest::Client, base: &str, device_id: &str) -> Vec<String> {
     let mut ids = Vec::new();
     for index in 0..3 {
-        let response = create_command(
-            &http,
-            &app,
-            &device.id,
-            &format!(r#"{{"name":"reboot","idempotency_key":"key-{index}"}}"#),
-        )
-        .await;
+        let response = http
+            .post(format!("{base}/api/v1/devices/{device_id}/commands"))
+            .header("X-IoT-CSRF", "1")
+            .header("X-Request-ID", "command-api-123")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(format!(
+                r#"{{"name":"reboot","idempotency_key":"key-{index}"}}"#
+            ))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
         ids.push(
             response.json::<Value>().await.unwrap()["command_id"]
@@ -319,14 +474,17 @@ async fn command_list_paginates_filters_and_detail_is_scoped_to_contract_fields(
                 .to_owned(),
         );
     }
-    sqlx::query("UPDATE commands SET created_at = ? WHERE device_id = ?")
-        .bind(auth::now_ms() - 1_000)
-        .bind(&device.id)
-        .execute(&app.pool)
-        .await
-        .unwrap();
+    ids
+}
 
-    let list_url = format!("{}/api/v1/devices/{}/commands", app.base, device.id);
+async fn assert_command_list_contract(
+    http: &reqwest::Client,
+    base: &str,
+    device_id: &str,
+    ids: &[String],
+    expected_ids: &[String],
+) {
+    let list_url = format!("{base}/api/v1/devices/{device_id}/commands");
     let first: Value = http
         .get(&list_url)
         .query(&[("limit", "2")])
@@ -355,21 +513,7 @@ async fn command_list_paginates_filters_and_detail_is_scoped_to_contract_fields(
         .map(|item| item["id"].as_str().unwrap().to_owned())
         .collect();
     page_ids.push(second["items"][0]["id"].as_str().unwrap().to_owned());
-    let expected_ids: Vec<String> = sqlx::query_scalar(
-        "SELECT id FROM commands WHERE device_id = ? ORDER BY created_at DESC, id DESC",
-    )
-    .bind(&device.id)
-    .fetch_all(&app.pool)
-    .await
-    .unwrap();
     assert_eq!(page_ids, expected_ids);
-
-    sqlx::query("UPDATE commands SET status = 'dispatched', dispatched_at = ? WHERE id = ?")
-        .bind(auth::now_ms())
-        .bind(&ids[0])
-        .execute(&app.pool)
-        .await
-        .unwrap();
     let filtered: Value = http
         .get(&list_url)
         .query(&[("status", "dispatched")])
@@ -395,7 +539,7 @@ async fn command_list_paginates_filters_and_detail_is_scoped_to_contract_fields(
     );
 
     let detail: Value = http
-        .get(format!("{}/api/v1/commands/{}", app.base, ids[0]))
+        .get(format!("{base}/api/v1/commands/{}", ids[0]))
         .send()
         .await
         .unwrap()
@@ -408,7 +552,7 @@ async fn command_list_paginates_filters_and_detail_is_scoped_to_contract_fields(
     assert!(detail.get("request_sha256").is_none());
 
     let missing = http
-        .get(format!("{}/api/v1/commands/{}", app.base, Uuid::now_v7()))
+        .get(format!("{base}/api/v1/commands/{}", Uuid::now_v7()))
         .send()
         .await
         .unwrap();
@@ -421,7 +565,7 @@ async fn command_list_paginates_filters_and_detail_is_scoped_to_contract_fields(
     let missing_device = http
         .get(format!(
             "{}/api/v1/devices/019c0000-0000-7000-8000-000000000000/commands",
-            app.base
+            base
         ))
         .send()
         .await
@@ -497,6 +641,87 @@ async fn concurrent_creates_do_not_exceed_pending_queue_limit() {
     );
 }
 
+#[tokio::test]
+#[ignore = "requires tests/command_api_postgres.sh"]
+async fn concurrent_creates_do_not_exceed_pending_queue_limit_postgres() {
+    let app = mqtt_auth_postgres::PostgresApp::start().await;
+    let device = app.create_device("command-limit").await;
+    let http = postgres_admin_client(app.admin_cookie());
+    let pool = sqlx::PgPool::connect(&std::env::var("IOT_TEST_POSTGRES_URL").unwrap())
+        .await
+        .unwrap();
+    let limit = 100_i64;
+    let now = auth::now_ms();
+    let mut tx = pool.begin().await.unwrap();
+    for _ in 0..limit - 1 {
+        sqlx::query(
+            "INSERT INTO commands (
+                id, device_id, name, params_json, status, created_at, expires_at, next_attempt_at
+             ) VALUES ($1, $2, 'reboot', '{}', 'pending', $3, $4, $3)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&device.id)
+        .bind(now)
+        .bind(now + 86_400_000)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    let base = app.base_url();
+    let first = http
+        .post(format!("{base}/api/v1/devices/{}/commands", device.id))
+        .header("X-IoT-CSRF", "1")
+        .header("X-Request-ID", "command-api-123")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(r#"{"name":"reboot","idempotency_key":"race-a"}"#)
+        .send();
+    let second = http
+        .post(format!("{base}/api/v1/devices/{}/commands", device.id))
+        .header("X-IoT-CSRF", "1")
+        .header("X-Request-ID", "command-api-123")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(r#"{"name":"reboot","idempotency_key":"race-b"}"#)
+        .send();
+    let (first, second) = tokio::join!(first, second);
+    let first = first.unwrap();
+    let second = second.unwrap();
+    let statuses = [first.status(), second.status()];
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == reqwest::StatusCode::ACCEPTED)
+            .count(),
+        1
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == reqwest::StatusCode::CONFLICT)
+            .count(),
+        1
+    );
+    let conflict = if first.status() == reqwest::StatusCode::CONFLICT {
+        first
+    } else {
+        second
+    };
+    let body: Value = conflict.json().await.unwrap();
+    assert_eq!(body["code"], "command_queue_full");
+    assert_eq!(body["details"]["limit"], limit);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM commands WHERE device_id = $1 AND status IN ('pending', 'dispatched')",
+        )
+        .bind(&device.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        limit
+    );
+}
+
 async fn insert_active_commands(pool: &sqlx::SqlitePool, device_id: &str, count: u64) {
     let now = auth::now_ms();
     let mut tx = pool.begin().await.unwrap();
@@ -532,19 +757,7 @@ async fn audit_failure_rolls_back_command_and_returns_storage_error() {
     .execute(&app.pool)
     .await
     .unwrap();
-
-    let response = create_command(
-        &http,
-        &app,
-        &device.id,
-        r#"{"name":"reboot","idempotency_key":"audit-failure"}"#,
-    )
-    .await;
-    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(
-        response.json::<Value>().await.unwrap()["code"],
-        "storage_unavailable"
-    );
+    assert_command_audit_failure(&http, &app.base, &device.id).await;
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM commands WHERE device_id = ?")
             .bind(&device.id)
@@ -562,4 +775,66 @@ async fn audit_failure_rolls_back_command_and_returns_storage_error() {
         .unwrap(),
         0
     );
+    sqlx::query("DROP TRIGGER fail_command_audit")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires tests/command_api_postgres.sh"]
+async fn audit_failure_rolls_back_command_and_returns_storage_error_postgres() {
+    let app = mqtt_auth_postgres::PostgresApp::start().await;
+    let device = app.create_device("command-audit").await;
+    let http = postgres_admin_client(app.admin_cookie());
+    let pool = sqlx::PgPool::connect(&std::env::var("IOT_TEST_POSTGRES_URL").unwrap())
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE FUNCTION fail_command_audit_fn() RETURNS trigger AS $$
+         BEGIN
+             IF NEW.action = 'command.create' THEN
+                 RAISE EXCEPTION 'injected audit failure';
+             END IF;
+             RETURN NEW;
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_command_audit BEFORE INSERT ON audit_events
+         FOR EACH ROW EXECUTE FUNCTION fail_command_audit_fn()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    assert_command_audit_failure(&http, app.base_url(), &device.id).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM commands WHERE device_id = $1")
+            .bind(&device.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'command.create'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        0
+    );
+    sqlx::query("DROP TRIGGER fail_command_audit ON audit_events")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP FUNCTION fail_command_audit_fn()")
+        .execute(&pool)
+        .await
+        .unwrap();
 }
