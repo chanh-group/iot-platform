@@ -4,6 +4,7 @@ use common::TestApp;
 use iot_server::core::auth;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::time::Duration;
 use uuid::Uuid;
 
 async fn admin_client(app: &TestApp, username: &str) -> reqwest::Client {
@@ -97,6 +98,50 @@ async fn assert_raw_request_idempotency(http: &reqwest::Client, base: &str, devi
     assert_eq!(
         conflict.json::<Value>().await.unwrap()["code"],
         "idempotency_conflict"
+    );
+}
+
+async fn assert_expired_command_api(
+    http: &reqwest::Client,
+    base: &str,
+    device_id: &str,
+    command_id: &str,
+    expires_at: i64,
+) {
+    let detail = format!("{base}/api/v1/commands/{command_id}");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let response = http.get(&detail).send().await.unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let command: Value = response.json().await.unwrap();
+            if command["status"] == "expired" {
+                assert_eq!(command["expires_at"], expires_at);
+                assert_eq!(command["completed_at"], expires_at);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("dispatcher expiry should be visible through command detail");
+
+    let page: Value = http
+        .get(format!("{base}/api/v1/devices/{device_id}/commands"))
+        .query(&[("status", "expired")])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command["id"] == command_id)
     );
 }
 
@@ -441,6 +486,79 @@ async fn command_list_paginates_filters_and_detail_is_scoped_to_contract_fields_
     .await
     .unwrap();
     assert_command_list_contract(&http, app.base_url(), &device.id, &ids, &expected_ids).await;
+}
+
+#[tokio::test]
+async fn expired_command_is_visible_in_detail_and_filtered_list() {
+    let app = TestApp::start().await;
+    let device = app.create_device("command-expiry-api", true).await;
+    let http = admin_client(&app, "command-expiry-api-admin").await;
+    let response = create_command(
+        &http,
+        &app,
+        &device.id,
+        r#"{"name":"expiry-check","ttl_ms":60000}"#,
+    )
+    .await;
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    let command_id = response.json::<Value>().await.unwrap()["command_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let expires_at = auth::now_ms() - 1_000;
+    let created_at = expires_at - 1_000;
+    sqlx::query(
+        "UPDATE commands SET created_at = ?, expires_at = ?, next_attempt_at = ? WHERE id = ?",
+    )
+    .bind(created_at)
+    .bind(expires_at)
+    .bind(expires_at)
+    .bind(&command_id)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+
+    assert_expired_command_api(&http, &app.base, &device.id, &command_id, expires_at).await;
+}
+
+#[tokio::test]
+#[ignore = "requires tests/command_api_postgres.sh"]
+async fn expired_command_is_visible_in_detail_and_filtered_list_postgres() {
+    let app = mqtt_auth_postgres::PostgresApp::start().await;
+    let device = app.create_device("command-expiry-api").await;
+    let http = postgres_admin_client(app.admin_cookie());
+    let response = http
+        .post(format!(
+            "{}/api/v1/devices/{}/commands",
+            app.base_url(),
+            device.id
+        ))
+        .header("X-IoT-CSRF", "1")
+        .json(&json!({"name":"expiry-check","ttl_ms":60000}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    let command_id = response.json::<Value>().await.unwrap()["command_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let expires_at = auth::now_ms() - 1_000;
+    let pool = sqlx::PgPool::connect(&std::env::var("IOT_TEST_POSTGRES_URL").unwrap())
+        .await
+        .unwrap();
+    let created_at = expires_at - 1_000;
+    sqlx::query(
+        "UPDATE commands SET created_at = $1, expires_at = $2, next_attempt_at = $2 WHERE id = $3",
+    )
+    .bind(created_at)
+    .bind(expires_at)
+    .bind(&command_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    assert_expired_command_api(&http, app.base_url(), &device.id, &command_id, expires_at).await;
 }
 
 fn postgres_admin_client(cookie: &str) -> reqwest::Client {
