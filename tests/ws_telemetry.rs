@@ -1,4 +1,6 @@
 mod common;
+#[path = "common/mqtt_auth_postgres.rs"]
+mod mqtt_auth_postgres;
 
 use std::time::Duration;
 
@@ -6,9 +8,11 @@ use common::{TestApp, TestWebSocket, mqtt_connect, wait_presence, ws_connect, ws
 use futures_util::{SinkExt, StreamExt};
 use iot_server::core::events::TelemetryCommitted;
 use iot_server::observability::metrics::Metrics;
+use mqtt_auth_postgres::PostgresApp;
 use rumqttc::{Event, Packet, QoS};
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 async fn publish(app: &TestApp, device_id: &str, token: &str, event_id: &str, raw: &[u8]) -> Value {
@@ -91,6 +95,321 @@ async fn expect_presence_transition(socket: &mut TestWebSocket, device_id: &str)
         assert_eq!(event["device_id"], device_id);
         assert_eq!(event["data"]["online"], online);
     }
+}
+
+async fn publish_postgres(
+    app: &PostgresApp,
+    device_id: &str,
+    token: &str,
+    event_id: &str,
+    raw: &[u8],
+) -> Value {
+    let (client, mut eventloop, _) =
+        common::mqtt_connect(app.mqtt_addr(), device_id, device_id, token, true).await;
+    let ack_topic = format!("devices/{device_id}/telemetry/ack");
+    client
+        .subscribe(&ack_topic, QoS::AtLeastOnce)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if matches!(
+                eventloop.poll().await.unwrap(),
+                Event::Incoming(Packet::SubAck(_))
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    client
+        .publish(
+            format!("devices/{device_id}/telemetry"),
+            QoS::AtLeastOnce,
+            false,
+            raw,
+        )
+        .await
+        .unwrap();
+    let ack = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Event::Incoming(Packet::Publish(packet)) = eventloop.poll().await.unwrap()
+                && packet.topic == ack_topic
+            {
+                let ack: Value = serde_json::from_slice(&packet.payload).unwrap();
+                assert_eq!(ack["event_id"], event_id);
+                break ack;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    drop(client);
+    drop(eventloop);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let response = reqwest::Client::new()
+                .get(format!("{}/api/v1/overview", app.base_url()))
+                .header("Cookie", app.admin_cookie())
+                .send()
+                .await
+                .unwrap();
+            let overview: Value = response.json().await.unwrap();
+            if overview["devices"]["online"] == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("PostgreSQL MQTT device should disconnect");
+    ack
+}
+
+async fn ws_connect_postgres(app: &PostgresApp) -> TestWebSocket {
+    let base = app.base_url();
+    let mut request = format!("ws://{}/api/v1/events", base.trim_start_matches("http://"))
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert(reqwest::header::COOKIE, app.admin_cookie().parse().unwrap());
+    request
+        .headers_mut()
+        .insert(reqwest::header::ORIGIN, base.parse().unwrap());
+    tokio_tungstenite::connect_async(request).await.unwrap().0
+}
+
+#[tokio::test]
+#[ignore = "requires tests/ws_telemetry_postgres.sh"]
+async fn subscribed_clients_receive_only_committed_telemetry_and_refetch_after_reconnect_postgres()
+{
+    let app = PostgresApp::start().await;
+    let client = reqwest::Client::new();
+    let device = app.create_device("ws-telemetry-postgres").await;
+    let mut socket = ws_connect_postgres(&app).await;
+
+    let hello = next_json(&mut socket).await;
+    assert_eq!(hello["type"], "hello");
+    assert_eq!(hello["max_subscriptions"], 8);
+    socket
+        .send(Message::Text(
+            json!({"action":"subscribe", "channels":["device:not-a-uuid"]})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(next_json(&mut socket).await["code"], "invalid_channel");
+    socket
+        .send(Message::Text(
+            json!({"action":"subscribe", "channels":[format!("device:{}", device.id)]})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(next_json(&mut socket).await["type"], "subscribed");
+    socket
+        .send(Message::Text(json!({"action":"ping"}).to_string().into()))
+        .await
+        .unwrap();
+    assert_eq!(next_json(&mut socket).await["type"], "pong");
+
+    let rejected = publish_postgres(
+        &app,
+        &device.id,
+        &device.token,
+        "invalid-ws-event",
+        br#"{"event_id":"invalid-ws-event","values":{"x":null}}"#,
+    )
+    .await;
+    assert_eq!(rejected["status"], "rejected");
+    assert_eq!(rejected["code"], "invalid_payload");
+    expect_presence_transition(&mut socket, &device.id).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), socket.next())
+            .await
+            .is_err()
+    );
+
+    let device_timestamp = iot_server::core::auth::now_ms() - 20_000;
+    let stored_ack = publish_postgres(&app, &device.id, &device.token, "committed-ws-event", &serde_json::to_vec(&json!({"event_id":"committed-ws-event", "ts":device_timestamp, "values":{"temperature":24.5}})).unwrap()).await;
+    assert_eq!(stored_ack["status"], "stored");
+    let event = next_event_type(&mut socket, "telemetry").await;
+    assert_eq!(event["type"], "telemetry");
+    assert_eq!(event["device_id"], device.id);
+    assert_eq!(event["data"]["event_id"], "committed-ws-event");
+    assert_eq!(event["data"]["ts"], device_timestamp);
+    assert_eq!(event["data"]["values"]["temperature"], 24.5);
+    let pool = sqlx::PgPool::connect(&std::env::var("IOT_TEST_POSTGRES_URL").unwrap())
+        .await
+        .unwrap();
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM telemetry_events WHERE device_id = $1 AND event_id = $2",
+    )
+    .bind(&device.id)
+    .bind("committed-ws-event")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, 1);
+    let committed_checkpoint: i64 = sqlx::query_scalar(
+        "SELECT internal_id FROM telemetry_events WHERE device_id = $1 AND event_id = $2",
+    )
+    .bind(&device.id)
+    .bind("committed-ws-event")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    socket
+        .send(Message::Text(
+            json!({"action":"unsubscribe", "channels":[format!("device:{}", device.id)]})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event_type(&mut socket, "unsubscribed").await["type"],
+        "unsubscribed"
+    );
+    socket.close(None).await.unwrap();
+
+    for (event_id, ts) in [
+        (
+            "missed-late-ws-event",
+            iot_server::core::auth::now_ms() - 300_000,
+        ),
+        ("missed-ws-event", iot_server::core::auth::now_ms()),
+    ] {
+        let ack = publish_postgres(
+            &app,
+            &device.id,
+            &device.token,
+            event_id,
+            &serde_json::to_vec(
+                &json!({"event_id":event_id, "ts":ts, "values":{"temperature":25.0}}),
+            )
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(ack["status"], "stored");
+    }
+    let command = client
+        .post(format!(
+            "{}/api/v1/devices/{}/commands",
+            app.base_url(),
+            device.id
+        ))
+        .header("Cookie", app.admin_cookie())
+        .header("X-IoT-CSRF", "1")
+        .json(&json!({"name":"reconnect-check"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(command.status(), reqwest::StatusCode::ACCEPTED);
+    let command_id = command.json::<Value>().await.unwrap()["command_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let mut reconnected = ws_connect_postgres(&app).await;
+    assert_eq!(next_json(&mut reconnected).await["type"], "hello");
+    reconnected
+        .send(Message::Text(
+            json!({"action":"subscribe", "channels":["overview", format!("device:{}", device.id)]})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(next_json(&mut reconnected).await["type"], "subscribed");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), reconnected.next())
+            .await
+            .is_err()
+    );
+
+    let history: Value = client
+        .get(format!(
+            "{}/api/v1/devices/{}/telemetry",
+            app.base_url(),
+            device.id
+        ))
+        .header("Cookie", app.admin_cookie())
+        .query(&[("after_id", committed_checkpoint.to_string())])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let event_ids: Vec<_> = history["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["event_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(event_ids, ["missed-late-ws-event", "missed-ws-event"]);
+    assert!(
+        history["items"][0]["ts"].as_i64().unwrap() < iot_server::core::auth::now_ms() - 60_000
+    );
+    let commands: Value = client
+        .get(format!(
+            "{}/api/v1/devices/{}/commands",
+            app.base_url(),
+            device.id
+        ))
+        .header("Cookie", app.admin_cookie())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        commands["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == command_id)
+    );
+    let overview: Value = client
+        .get(format!("{}/api/v1/overview", app.base_url()))
+        .header("Cookie", app.admin_cookie())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(overview["telemetry"]["events_24h"], 3);
+    assert!(
+        overview["commands"]["pending"].as_i64().unwrap()
+            + overview["commands"]["dispatched"].as_i64().unwrap()
+            >= 1
+    );
+    let logout = client
+        .post(format!("{}/api/v1/auth/logout", app.base_url()))
+        .header("Cookie", app.admin_cookie())
+        .header("X-IoT-CSRF", "1")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(logout.status(), reqwest::StatusCode::NO_CONTENT);
+    let closed = tokio::time::timeout(Duration::from_secs(2), reconnected.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(closed, Message::Close(Some(frame)) if frame.code == CloseCode::Library(4401))
+    );
 }
 
 #[tokio::test]

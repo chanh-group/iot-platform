@@ -79,6 +79,7 @@ jobs:
           sh tests/command_offline_postgres.sh
           sh tests/command_ack_postgres.sh
           sh tests/telemetry_api_postgres.sh
+          sh tests/ws_telemetry_postgres.sh
 
   frontend:
     runs-on: ubuntu-24.04
