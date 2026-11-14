@@ -432,8 +432,21 @@ async fn rotation_requires_admin_session_and_csrf() {
         app.base, device.id
     );
 
+    let http = admin_client(&app, "credential-auth").await;
+    assert_rotation_auth_and_csrf(&http, &url).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM device_credentials WHERE device_id = ?")
+            .bind(&device.id)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+async fn assert_rotation_auth_and_csrf(http: &reqwest::Client, url: &str) {
     let unauthenticated = reqwest::Client::new()
-        .post(&url)
+        .post(url)
         .header("X-IoT-CSRF", "1")
         .json(&json!({}))
         .send()
@@ -441,15 +454,40 @@ async fn rotation_requires_admin_session_and_csrf() {
         .unwrap();
     assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
 
-    let http = admin_client(&app, "credential-auth").await;
-    let csrf_missing = http.post(&url).json(&json!({})).send().await.unwrap();
+    let csrf_missing = http.post(url).json(&json!({})).send().await.unwrap();
     assert_eq!(csrf_missing.status(), reqwest::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+#[ignore = "requires tests/credential_rotate_postgres.sh"]
+async fn rotation_requires_admin_session_and_csrf_postgres() {
+    let app = mqtt_auth_postgres::PostgresApp::start().await;
+    let device = app.create_device("credential-auth").await;
+    let http = reqwest::Client::builder()
+        .default_headers(reqwest::header::HeaderMap::from_iter([(
+            reqwest::header::COOKIE,
+            app.admin_cookie().parse().unwrap(),
+        )]))
+        .build()
+        .unwrap();
+    let url = format!(
+        "{}/api/v1/devices/{}/credentials/rotate",
+        app.base_url(),
+        device.id
+    );
+    assert_rotation_auth_and_csrf(&http, &url).await;
+
+    let pool = sqlx::PgPool::connect(&std::env::var("IOT_TEST_POSTGRES_URL").unwrap())
+        .await
+        .unwrap();
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM device_credentials WHERE device_id = ?")
-            .bind(&device.id)
-            .fetch_one(&app.pool)
-            .await
-            .unwrap(),
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM device_credentials WHERE device_id = $1",
+        )
+        .bind(&device.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
         1
     );
 }
