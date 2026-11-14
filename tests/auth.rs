@@ -406,6 +406,52 @@ async fn login_rate_limit_returns_retry_after() {
 }
 
 #[tokio::test]
+#[ignore = "requires isolated disposable PostgreSQL fixture; run tests/auth_postgres.sh"]
+async fn login_rate_limit_returns_retry_after_postgres() {
+    let server = postgres::PostgresApp::start().await;
+    let client = reqwest::Client::new();
+
+    for _ in 0..5 {
+        let response = client
+            .post(format!("{}/api/v1/auth/login", server.base_url()))
+            .header("X-IoT-CSRF", "1")
+            .json(&json!({ "username": "admin", "password": "wrong-password" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    let response = client
+        .post(format!("{}/api/v1/auth/login", server.base_url()))
+        .header("X-IoT-CSRF", "1")
+        .json(&json!({ "username": "admin", "password": "mqtt-auth-test-password" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry_after: u64 = response
+        .headers()
+        .get(RETRY_AFTER)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(retry_after >= 1);
+    assert_eq!(json_body(response).await["code"], "rate_limited");
+
+    let response = client
+        .post(format!("{}/api/v1/auth/login", server.base_url()))
+        .header("X-IoT-CSRF", "1")
+        .json(&json!({ "username": "other", "password": "mqtt-auth-test-password" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn last_seen_updates_at_most_once_per_five_minutes() {
     let server = TestApp::start().await;
     server.create_admin("admin", PASSWORD).await;
