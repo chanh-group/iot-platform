@@ -1006,7 +1006,23 @@ async fn latest_uses_received_time_then_internal_id_as_tie_breakers_postgres() {
 async fn missing_device_and_invalid_range_or_cursor_return_safe_errors() {
     let app = TestApp::start().await;
     let client = logged_in_client(&app).await;
-    let url = format!("{}/api/v1/devices/missing-device/telemetry", app.base);
+    let device = app.create_device("telemetry-api-invalid", true).await;
+    let endpoint =
+        assert_missing_device_and_invalid_range_or_cursor(&client, &app.base, &device.id).await;
+
+    sqlx::query("DROP TABLE telemetry_events")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    assert_history_storage_error(&client, &endpoint).await;
+}
+
+async fn assert_missing_device_and_invalid_range_or_cursor(
+    client: &reqwest::Client,
+    base: &str,
+    device_id: &str,
+) -> String {
+    let url = format!("{base}/api/v1/devices/missing-device/telemetry");
     let unauthenticated = reqwest::Client::new()
         .get(&url)
         .query(&[("from", "1"), ("to", "2")])
@@ -1027,8 +1043,7 @@ async fn missing_device_and_invalid_range_or_cursor_return_safe_errors() {
         "device_not_found"
     );
 
-    let device = app.create_device("telemetry-api-invalid", true).await;
-    let endpoint = format!("{}/api/v1/devices/{}/telemetry", app.base, device.id);
+    let endpoint = format!("{base}/api/v1/devices/{device_id}/telemetry");
     let invalid_range = client
         .get(&endpoint)
         .query(&[("from", "10"), ("to", "9")])
@@ -1074,12 +1089,12 @@ async fn missing_device_and_invalid_range_or_cursor_return_safe_errors() {
         .unwrap();
     assert_eq!(too_many_keys.status(), reqwest::StatusCode::BAD_REQUEST);
 
-    sqlx::query("DROP TABLE telemetry_events")
-        .execute(&app.pool)
-        .await
-        .unwrap();
+    endpoint
+}
+
+async fn assert_history_storage_error(client: &reqwest::Client, endpoint: &str) {
     let internal_error = client
-        .get(&endpoint)
+        .get(endpoint)
         .query(&[("from", "1"), ("to", "2")])
         .send()
         .await
@@ -1091,4 +1106,29 @@ async fn missing_device_and_invalid_range_or_cursor_return_safe_errors() {
     let body = internal_error.text().await.unwrap().to_lowercase();
     assert!(!body.contains("select"));
     assert!(!body.contains("telemetry_events"));
+}
+
+#[tokio::test]
+#[ignore = "requires tests/telemetry_api_postgres.sh"]
+async fn missing_device_and_invalid_range_or_cursor_return_safe_errors_postgres() {
+    let app = PostgresApp::start().await;
+    let device = app.create_device("telemetry-api-invalid").await;
+    let mut headers = HeaderMap::new();
+    headers.insert(COOKIE, HeaderValue::from_str(app.admin_cookie()).unwrap());
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap();
+    let endpoint =
+        assert_missing_device_and_invalid_range_or_cursor(&client, app.base_url(), &device.id)
+            .await;
+
+    let pool = sqlx::PgPool::connect(&std::env::var("IOT_TEST_POSTGRES_URL").unwrap())
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE telemetry_events")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_history_storage_error(&client, &endpoint).await;
 }
