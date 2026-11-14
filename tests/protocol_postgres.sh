@@ -43,4 +43,5 @@ else
     run_case retained_last_will_is_replayed_after_ungraceful_disconnect_postgres
     run_case topic_level_limit_is_enforced_by_the_listener_postgres
     run_case packet_limit_is_enforced_by_the_listener_postgres
+    run_case connection_limit_rejects_an_additional_device_postgres
 fi

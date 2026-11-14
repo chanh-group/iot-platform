@@ -66,6 +66,26 @@ mod protocol_postgres {
     }
 
     impl Fixture {
+        pub async fn create_device(&self, name: &str) -> Device {
+            let response = reqwest::Client::new()
+                .post(format!("http://{}/api/v1/devices", self.http_addr))
+                .header("Cookie", &self.cookie)
+                .header("X-IoT-CSRF", "1")
+                .json(&serde_json::json!({"name": name}))
+                .send()
+                .await
+                .expect("create fixture device");
+            assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+            let body: serde_json::Value = response.json().await.expect("device response");
+            Device {
+                id: body["device"]["id"].as_str().expect("device id").to_owned(),
+                token: body["credential"]["token"]
+                    .as_str()
+                    .expect("device token")
+                    .to_owned(),
+            }
+        }
+
         pub async fn restart(&mut self) {
             self.child.stop();
             let url = std::env::var("IOT_TEST_POSTGRES_URL").expect("runner PostgreSQL URL");
@@ -1193,6 +1213,27 @@ async fn connection_limit_rejects_an_additional_device() {
         mqtt_connect(app.mqtt_addr, &first.id, &first.id, &first.token, true).await;
     assert_eq!(
         mqtt_connect_refused(app.mqtt_addr, &second.id, &second.id, &second.token).await,
+        ConnectReturnCode::NotAuthorized,
+        "the listener should explicitly refuse a connection above its configured cap"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture; run tests/protocol_postgres.sh"]
+async fn connection_limit_rejects_an_additional_device_postgres() {
+    let fixture =
+        protocol_postgres::start("protocol-connection-limit", "max_connections=1\n", "").await;
+    let second = fixture.create_device("protocol-connection-b").await;
+    let (_client, _eventloop, _) = mqtt_connect(
+        fixture.addr,
+        &fixture.device.id,
+        &fixture.device.id,
+        &fixture.device.token,
+        true,
+    )
+    .await;
+    assert_eq!(
+        mqtt_connect_refused(fixture.addr, &second.id, &second.id, &second.token).await,
         ConnectReturnCode::NotAuthorized,
         "the listener should explicitly refuse a connection above its configured cap"
     );
