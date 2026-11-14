@@ -212,23 +212,28 @@ async fn create_commits_command_and_redacted_audit_before_returning_202() {
 async fn command_endpoints_require_admin_and_post_requires_csrf() {
     let app = TestApp::start().await;
     let device = app.create_device("command-auth", true).await;
-    let path = format!("/api/v1/devices/{}/commands", device.id);
+    let http = admin_client(&app, "command-auth-admin").await;
+    assert_command_auth_contract(&app.base, &device.id, &http).await;
+}
+
+async fn assert_command_auth_contract(base: &str, device_id: &str, http: &reqwest::Client) {
+    let path = format!("/api/v1/devices/{device_id}/commands");
     let unauthenticated = reqwest::Client::new();
     for response in [
         unauthenticated
-            .post(format!("{}{}", app.base, path))
+            .post(format!("{base}{path}"))
             .header("X-IoT-CSRF", "1")
             .json(&json!({"name":"reboot"}))
             .send()
             .await
             .unwrap(),
         unauthenticated
-            .get(format!("{}{}", app.base, path))
+            .get(format!("{base}{path}"))
             .send()
             .await
             .unwrap(),
         unauthenticated
-            .get(format!("{}/api/v1/commands/missing", app.base))
+            .get(format!("{base}/api/v1/commands/missing"))
             .send()
             .await
             .unwrap(),
@@ -240,9 +245,8 @@ async fn command_endpoints_require_admin_and_post_requires_csrf() {
         );
     }
 
-    let http = admin_client(&app, "command-auth-admin").await;
     let response = http
-        .post(format!("{}{}", app.base, path))
+        .post(format!("{base}{path}"))
         .json(&json!({"name":"reboot"}))
         .send()
         .await
@@ -252,6 +256,15 @@ async fn command_endpoints_require_admin_and_post_requires_csrf() {
         response.json::<Value>().await.unwrap()["code"],
         "csrf_failed"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires tests/command_api_postgres.sh"]
+async fn command_endpoints_require_admin_and_post_requires_csrf_postgres() {
+    let app = mqtt_auth_postgres::PostgresApp::start().await;
+    let device = app.create_device("command-auth").await;
+    let http = postgres_admin_client(app.admin_cookie());
+    assert_command_auth_contract(app.base_url(), &device.id, &http).await;
 }
 
 #[tokio::test]
