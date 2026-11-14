@@ -29,3 +29,4 @@ run_case() (
 )
 run_case device_reads_use_live_presence_and_bound_pagination_postgres
 run_case pagination_orders_equal_timestamps_by_descending_id_postgres
+run_case device_audit_failures_roll_back_create_and_patch_postgres
