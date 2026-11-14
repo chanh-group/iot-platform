@@ -266,8 +266,17 @@ async fn commit_order_backfill_finds_late_events_and_paginates_by_checkpoint() {
     .await;
 
     let endpoint = format!("{}/api/v1/devices/{}/telemetry", app.base, device.id);
+    assert_commit_order_backfill(&client, &endpoint, checkpoint, now).await;
+}
+
+async fn assert_commit_order_backfill(
+    client: &reqwest::Client,
+    endpoint: &str,
+    checkpoint: i64,
+    now: i64,
+) {
     let first: Value = client
-        .get(&endpoint)
+        .get(endpoint)
         .query(&[
             ("after_id", checkpoint.to_string()),
             ("limit", "2".to_owned()),
@@ -294,7 +303,7 @@ async fn commit_order_backfill_finds_late_events_and_paginates_by_checkpoint() {
     let cursor = first["next_cursor"].as_str().unwrap();
 
     let second: Value = client
-        .get(&endpoint)
+        .get(endpoint)
         .query(&[
             ("after_id", checkpoint.to_string()),
             ("limit", "2".to_owned()),
@@ -321,13 +330,63 @@ async fn commit_order_backfill_finds_late_events_and_paginates_by_checkpoint() {
         vec![("after_id", "-1".to_owned())],
         vec![("after_id", (through_id + 1).to_string())],
     ] {
-        let response = client.get(&endpoint).query(&query).send().await.unwrap();
+        let response = client.get(endpoint).query(&query).send().await.unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
         assert_eq!(
             response.json::<Value>().await.unwrap()["code"],
             "validation_error"
         );
     }
+}
+
+#[tokio::test]
+#[ignore = "requires tests/telemetry_api_postgres.sh"]
+async fn commit_order_backfill_finds_late_events_and_paginates_by_checkpoint_postgres() {
+    let app = PostgresApp::start().await;
+    let device = app.create_device("telemetry-received-backfill").await;
+    let now = auth::now_ms();
+    let pool = sqlx::PgPool::connect(&std::env::var("IOT_TEST_POSTGRES_URL").unwrap())
+        .await
+        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    let checkpoint: i64 = sqlx::query_scalar(
+        "UPDATE telemetry_id_allocator SET last_id = last_id + 4 WHERE id = 1 RETURNING last_id - 3",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    for (offset, event_id, received_at, value) in [
+        (0_i64, "before-checkpoint", now - 1, 0),
+        (1_i64, "checkpoint-overlap", now, 1),
+        (2_i64, "late-event-1", now + 1, 2),
+        (3_i64, "late-event-2", now + 2, 3),
+    ] {
+        sqlx::query(
+            "INSERT INTO telemetry_events
+             (internal_id, device_id, event_id, ts, received_at, values_json, payload_sha256)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(checkpoint + offset)
+        .bind(&device.id)
+        .bind(event_id)
+        .bind(now - 300_000)
+        .bind(received_at)
+        .bind(json!({"x": value}))
+        .bind([0_u8; 32].as_slice())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    let mut headers = HeaderMap::new();
+    headers.insert(COOKIE, HeaderValue::from_str(app.admin_cookie()).unwrap());
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap();
+    let endpoint = format!("{}/api/v1/devices/{}/telemetry", app.base_url(), device.id);
+    assert_commit_order_backfill(&client, &endpoint, checkpoint, now).await;
 }
 
 #[tokio::test]

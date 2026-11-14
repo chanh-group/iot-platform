@@ -33,3 +33,4 @@ run_case() {
 }
 run_case history_pages_are_stable_and_key_filter_projects_matching_values_postgres
 run_case latest_uses_received_time_then_internal_id_as_tie_breakers_postgres
+run_case commit_order_backfill_finds_late_events_and_paginates_by_checkpoint_postgres
