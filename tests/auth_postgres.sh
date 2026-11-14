@@ -38,3 +38,4 @@ run_test() {
 
 run_test login_me_logout_roundtrip_and_cookie_flags_postgres
 run_test csrf_content_type_and_origin_are_enforced_postgres
+run_test login_rate_limit_returns_retry_after_postgres
