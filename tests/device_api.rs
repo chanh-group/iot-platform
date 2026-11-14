@@ -329,6 +329,107 @@ async fn device_audit_failures_roll_back_create_and_patch() {
 }
 
 #[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture; run tests/device_api_postgres.sh"]
+async fn device_audit_failures_roll_back_create_and_patch_postgres() {
+    let fixture = DevicePostgresFixture::start().await;
+    let url = std::env::var("IOT_TEST_POSTGRES_URL").unwrap();
+    let pool = PgPool::connect(&url).await.unwrap();
+    let http = &fixture.http;
+    let devices_url = format!("{}/api/v1/devices", fixture.base);
+    assert!(
+        http.post(format!("{}/api/v1/auth/login", fixture.base))
+            .header("X-IoT-CSRF", "1")
+            .json(&json!({"username":"device-admin", "password":"device-test-password"}))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    sqlx::query(
+        "CREATE FUNCTION fail_device_create_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             IF NEW.action = 'device.create' THEN RAISE EXCEPTION 'injected audit failure'; END IF;
+             RETURN NEW;
+         END $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_device_create_audit BEFORE INSERT ON audit_events
+         FOR EACH ROW EXECUTE FUNCTION fail_device_create_audit()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let failed = http
+        .post(&devices_url)
+        .header("X-IoT-CSRF", "1")
+        .json(&json!({"name":"create-rollback"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM devices WHERE name = 'create-rollback'")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM device_credentials")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    sqlx::query("DROP TRIGGER fail_device_create_audit ON audit_events")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP FUNCTION fail_device_create_audit()")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (device_id, _) = fixture.create_device("patch-rollback", true).await;
+    sqlx::query(
+        "CREATE FUNCTION fail_device_update_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             IF NEW.action = 'device.disable' THEN RAISE EXCEPTION 'injected audit failure'; END IF;
+             RETURN NEW;
+         END $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_device_update_audit BEFORE INSERT ON audit_events
+         FOR EACH ROW EXECUTE FUNCTION fail_device_update_audit()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let failed = http
+        .patch(format!("{devices_url}/{device_id}"))
+        .header("X-IoT-CSRF", "1")
+        .json(&json!({"name":"must-rollback", "enabled":false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let row: (String, bool) = sqlx::query_as("SELECT name, enabled FROM devices WHERE id = $1")
+        .bind(&device_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row, ("patch-rollback".to_owned(), true));
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn disabling_a_device_kicks_its_live_session_and_blocks_reconnect() {
     let app = TestApp::start().await;
     let url = format!("{}/api/v1/devices", app.base);
