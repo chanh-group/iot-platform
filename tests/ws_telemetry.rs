@@ -720,6 +720,101 @@ async fn failed_telemetry_commit_is_not_broadcast() {
 }
 
 #[tokio::test]
+#[ignore = "requires tests/ws_telemetry_postgres.sh"]
+async fn failed_telemetry_commit_is_not_broadcast_postgres() {
+    let app = PostgresApp::start().await;
+    let device = app.create_device("ws-commit-failure-postgres").await;
+    let mut socket = ws_connect_postgres(&app).await;
+    assert_eq!(next_json(&mut socket).await["type"], "hello");
+    socket
+        .send(Message::Text(
+            json!({
+                "action":"subscribe",
+                "channels":["overview", format!("device:{}", device.id)],
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(next_json(&mut socket).await["type"], "subscribed");
+
+    let pool = sqlx::PgPool::connect(&std::env::var("IOT_TEST_POSTGRES_URL").unwrap())
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE FUNCTION ws_fail_telemetry_insert() RETURNS trigger
+         LANGUAGE plpgsql AS $$ BEGIN
+             IF NEW.event_id = 'failed-commit-event' THEN
+                 RAISE EXCEPTION 'injected commit failure';
+             END IF;
+             RETURN NEW;
+         END $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_telemetry BEFORE INSERT ON telemetry_events
+         FOR EACH ROW EXECUTE FUNCTION ws_fail_telemetry_insert()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let failed_ack = publish_postgres(
+        &app,
+        &device.id,
+        &device.token,
+        "failed-commit-event",
+        br#"{"event_id":"failed-commit-event","values":{"x":1}}"#,
+    )
+    .await;
+    assert_eq!(failed_ack["status"], "retryable");
+    assert_eq!(failed_ack["code"], "storage_unavailable");
+    let system = next_event_type(&mut socket, "system").await;
+    assert_eq!(system["data"]["kind"], "storage_unavailable");
+    assert_eq!(system["data"]["severity"], "error");
+    assert!(!system.to_string().contains("injected commit failure"));
+    for _ in 0..3 {
+        if let Ok(Some(Ok(Message::Text(text)))) =
+            tokio::time::timeout(Duration::from_millis(200), socket.next()).await
+        {
+            let event: Value = serde_json::from_str(text.as_str()).unwrap();
+            assert_ne!(event["type"], "telemetry");
+        }
+    }
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM telemetry_events WHERE device_id = $1 AND event_id = $2",
+    )
+    .bind(&device.id)
+    .bind("failed-commit-event")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, 0);
+
+    let readiness = reqwest::Client::new()
+        .get(format!("{}/readyz", app.base_url()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(readiness.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let readiness: Value = readiness.json().await.unwrap();
+    assert_eq!(readiness["checks"]["database"], "ok");
+    assert_eq!(readiness["checks"]["ingest"], "degraded");
+
+    sqlx::query("DROP TRIGGER fail_telemetry ON telemetry_events")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP FUNCTION ws_fail_telemetry_insert()")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn slow_websocket_is_closed_and_releases_its_connection_slot() {
     let app = TestApp::builder().websocket_limits(2, 16).start().await;
     let dropped_before = Metrics::global().ws_dropped_total.get();
