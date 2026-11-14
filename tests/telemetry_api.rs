@@ -648,8 +648,19 @@ async fn commit_checkpoint_does_not_advance_past_an_uncommitted_batch() {
     .unwrap();
 
     let endpoint = format!("{}/api/v1/devices/{}/telemetry", app.base, device.id);
+    assert_checkpoint_stays_committed(&client, &endpoint, checkpoint).await;
+
+    sqlx::query("COMMIT").execute(&mut *conn).await.unwrap();
+    assert_uncommitted_event_is_backfilled(&client, &endpoint, checkpoint).await;
+}
+
+async fn assert_checkpoint_stays_committed(
+    client: &reqwest::Client,
+    endpoint: &str,
+    checkpoint: i64,
+) {
     let before_commit: Value = client
-        .get(&endpoint)
+        .get(endpoint)
         .query(&[("after_id", checkpoint.to_string())])
         .send()
         .await
@@ -661,10 +672,15 @@ async fn commit_checkpoint_does_not_advance_past_an_uncommitted_batch() {
         .unwrap();
     assert_eq!(before_commit["through_id"], checkpoint);
     assert!(before_commit["items"].as_array().unwrap().is_empty());
+}
 
-    sqlx::query("COMMIT").execute(&mut *conn).await.unwrap();
+async fn assert_uncommitted_event_is_backfilled(
+    client: &reqwest::Client,
+    endpoint: &str,
+    checkpoint: i64,
+) {
     let after_commit: Value = client
-        .get(&endpoint)
+        .get(endpoint)
         .query(&[("after_id", checkpoint.to_string())])
         .send()
         .await
@@ -680,6 +696,78 @@ async fn commit_checkpoint_does_not_advance_past_an_uncommitted_batch() {
         after_commit["items"][0]["ts"].as_i64().unwrap()
             < auth::now_ms() - 31 * 24 * 60 * 60 * 1_000
     );
+}
+
+#[tokio::test]
+#[ignore = "requires tests/telemetry_api_postgres.sh"]
+async fn commit_checkpoint_does_not_advance_past_an_uncommitted_batch_postgres() {
+    let app = PostgresApp::start().await;
+    let device = app.create_device("telemetry-api-pending-commit").await;
+    let pool = sqlx::PgPool::connect(&std::env::var("IOT_TEST_POSTGRES_URL").unwrap())
+        .await
+        .unwrap();
+    let now = auth::now_ms();
+    let committed_id: i64 = sqlx::query_scalar(
+        "UPDATE telemetry_id_allocator SET last_id = last_id + 1 WHERE id = 1 RETURNING last_id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO telemetry_events
+         (internal_id, device_id, event_id, ts, received_at, values_json, payload_sha256)
+         VALUES ($1, $2, 'committed-before-pending', $3, $4, $5, $6)",
+    )
+    .bind(committed_id)
+    .bind(&device.id)
+    .bind(now)
+    .bind(now)
+    .bind(json!({"x": 1}))
+    .bind([0_u8; 32].as_slice())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let checkpoint: i64 = sqlx::query_scalar(
+        "SELECT internal_id FROM telemetry_events WHERE device_id = $1 AND event_id = 'committed-before-pending'",
+    )
+    .bind(&device.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let mut tx = pool.begin().await.unwrap();
+    let pending_id: i64 = sqlx::query_scalar(
+        "UPDATE telemetry_id_allocator SET last_id = last_id + 1 WHERE id = 1 RETURNING last_id",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    let old_timestamp = auth::now_ms() - 40 * 24 * 60 * 60 * 1_000;
+    sqlx::query(
+        "INSERT INTO telemetry_events
+         (internal_id, device_id, event_id, ts, received_at, values_json, payload_sha256)
+         VALUES ($1, $2, 'waiting-for-commit', $3, $4, $5, $6)",
+    )
+    .bind(pending_id)
+    .bind(&device.id)
+    .bind(old_timestamp)
+    .bind(old_timestamp)
+    .bind(json!({"x": 2}))
+    .bind([7_u8; 32].as_slice())
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+
+    let mut headers = HeaderMap::new();
+    headers.insert(COOKIE, HeaderValue::from_str(app.admin_cookie()).unwrap());
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap();
+    let endpoint = format!("{}/api/v1/devices/{}/telemetry", app.base_url(), device.id);
+    assert_checkpoint_stays_committed(&client, &endpoint, checkpoint).await;
+    tx.commit().await.unwrap();
+    assert_uncommitted_event_is_backfilled(&client, &endpoint, checkpoint).await;
 }
 
 #[tokio::test]
