@@ -416,8 +416,22 @@ async fn starting_checkpoint_avoids_scanning_old_history_before_a_missed_event()
     tx.commit().await.unwrap();
 
     let endpoint = format!("{}/api/v1/devices/{}/telemetry", app.base, device.id);
+    let checkpoint = assert_history_checkpoint(&client, &endpoint).await;
+    insert_event(
+        &app,
+        &device.id,
+        "missed-near-now",
+        now - 1_000,
+        now,
+        json!({"x": 2}),
+    )
+    .await;
+    assert_missed_event_recovered(&client, &endpoint, checkpoint).await;
+}
+
+async fn assert_history_checkpoint(client: &reqwest::Client, endpoint: &str) -> i64 {
     let baseline: Value = client
-        .get(&endpoint)
+        .get(endpoint)
         .query(&[("after_id", "0"), ("limit", "1")])
         .send()
         .await
@@ -430,18 +444,12 @@ async fn starting_checkpoint_avoids_scanning_old_history_before_a_missed_event()
     let checkpoint = baseline["through_id"].as_i64().unwrap();
     assert_eq!(checkpoint, 1_001);
     assert!(baseline["next_cursor"].is_string());
+    checkpoint
+}
 
-    insert_event(
-        &app,
-        &device.id,
-        "missed-near-now",
-        now - 1_000,
-        now,
-        json!({"x": 2}),
-    )
-    .await;
+async fn assert_missed_event_recovered(client: &reqwest::Client, endpoint: &str, checkpoint: i64) {
     let recovered: Value = client
-        .get(&endpoint)
+        .get(endpoint)
         .query(&[("after_id", checkpoint.to_string())])
         .send()
         .await
@@ -454,6 +462,79 @@ async fn starting_checkpoint_avoids_scanning_old_history_before_a_missed_event()
     assert_eq!(recovered["items"].as_array().unwrap().len(), 1);
     assert_eq!(recovered["items"][0]["event_id"], "missed-near-now");
     assert!(recovered["through_id"].as_i64().unwrap() > checkpoint);
+}
+
+#[tokio::test]
+#[ignore = "requires tests/telemetry_api_postgres.sh"]
+async fn starting_checkpoint_avoids_scanning_old_history_before_a_missed_event_postgres() {
+    let app = PostgresApp::start().await;
+    let device = app.create_device("telemetry-api-large-history").await;
+    let now = auth::now_ms();
+    let old_timestamp = now - 40 * 24 * 60 * 60 * 1_000;
+    let pool = sqlx::PgPool::connect(&std::env::var("IOT_TEST_POSTGRES_URL").unwrap())
+        .await
+        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    let first_internal_id: i64 = sqlx::query_scalar(
+        "UPDATE telemetry_id_allocator SET last_id = last_id + 1001 WHERE id = 1 RETURNING last_id - 1000",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    for offset in 0..1_001_i64 {
+        sqlx::query(
+            "INSERT INTO telemetry_events
+             (internal_id, device_id, event_id, ts, received_at, values_json, payload_sha256)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(first_internal_id + offset)
+        .bind(&device.id)
+        .bind(format!("old-history-{offset}"))
+        .bind(old_timestamp - offset)
+        .bind(old_timestamp - offset)
+        .bind(json!({"x": 1}))
+        .bind([3_u8; 32].as_slice())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+    let checkpoint = first_internal_id + 1_000;
+    assert_eq!(checkpoint, 1_001);
+
+    let mut headers = HeaderMap::new();
+    headers.insert(COOKIE, HeaderValue::from_str(app.admin_cookie()).unwrap());
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap();
+    let endpoint = format!("{}/api/v1/devices/{}/telemetry", app.base_url(), device.id);
+    assert_eq!(
+        assert_history_checkpoint(&client, &endpoint).await,
+        checkpoint
+    );
+
+    let missed_internal_id: i64 = sqlx::query_scalar(
+        "UPDATE telemetry_id_allocator SET last_id = last_id + 1 WHERE id = 1 RETURNING last_id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO telemetry_events
+         (internal_id, device_id, event_id, ts, received_at, values_json, payload_sha256)
+         VALUES ($1, $2, 'missed-near-now', $3, $4, $5, $6)",
+    )
+    .bind(missed_internal_id)
+    .bind(&device.id)
+    .bind(now - 1_000)
+    .bind(now)
+    .bind(json!({"x": 2}))
+    .bind([0_u8; 32].as_slice())
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_missed_event_recovered(&client, &endpoint, checkpoint).await;
 }
 
 #[tokio::test]
