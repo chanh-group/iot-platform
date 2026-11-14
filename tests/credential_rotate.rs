@@ -245,6 +245,65 @@ async fn rotates_disabled_device_without_enabling_it() {
 }
 
 #[tokio::test]
+#[ignore = "requires tests/credential_rotate_postgres.sh"]
+async fn rotates_disabled_device_without_enabling_it_postgres() {
+    let app = mqtt_auth_postgres::PostgresApp::start().await;
+    let http = reqwest::Client::builder()
+        .default_headers(reqwest::header::HeaderMap::from_iter([(
+            reqwest::header::COOKIE,
+            app.admin_cookie().parse().unwrap(),
+        )]))
+        .build()
+        .unwrap();
+    let device = app.create_device_disabled("credential-disabled").await;
+
+    let response = http
+        .post(format!(
+            "{}/api/v1/devices/{}/credentials/rotate",
+            app.base_url(),
+            device.id
+        ))
+        .header("X-IoT-CSRF", "1")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    let new_token = body["credential"]["token"].as_str().unwrap();
+    assert_ne!(new_token, device.token);
+
+    let pool = sqlx::PgPool::connect(&std::env::var("IOT_TEST_POSTGRES_URL").unwrap())
+        .await
+        .unwrap();
+    let enabled: bool = sqlx::query_scalar("SELECT enabled FROM devices WHERE id = $1")
+        .bind(&device.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!enabled);
+    assert_eq!(
+        mqtt_connect_refused(app.mqtt_addr(), &device.id, &device.id, &device.token).await,
+        ConnectReturnCode::BadUserNamePassword
+    );
+    assert_eq!(
+        mqtt_connect_refused(app.mqtt_addr(), &device.id, &device.id, new_token).await,
+        ConnectReturnCode::BadUserNamePassword
+    );
+
+    let enabled = http
+        .patch(format!("{}/api/v1/devices/{}", app.base_url(), device.id))
+        .header("X-IoT-CSRF", "1")
+        .json(&json!({"enabled": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(enabled.status(), reqwest::StatusCode::OK);
+    let (_client, _eventloop, _) =
+        mqtt_connect(app.mqtt_addr(), &device.id, &device.id, new_token, true).await;
+}
+
+#[tokio::test]
 async fn audit_failure_rolls_back_rotation_and_preserves_old_credential() {
     let app = TestApp::start().await;
     let http = admin_client(&app, "credential-audit").await;
