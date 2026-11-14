@@ -2,6 +2,8 @@ mod common;
 #[path = "common/mqtt_auth_postgres.rs"]
 mod mqtt_auth_postgres;
 
+use std::time::Duration;
+
 use iot_server::core::auth;
 use iot_server::core::telemetry::{self, TelemetryPayload, TelemetryRepository};
 use iot_server::storage::sqlite::telemetry as telemetry_storage;
@@ -1139,6 +1141,238 @@ async fn sqlite_commit_checkpoint_serializes_competing_writers_and_backfills_bot
     )
     .await;
 
+    let after_rollback: Value = client
+        .get(&endpoint)
+        .query(&[("after_id", through_id.to_string())])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after_rollback["items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        after_rollback["items"][0]["event_id"],
+        "writer-after-rollback"
+    );
+}
+
+fn validated_test_event(
+    event_id: &str,
+    ts: i64,
+    received_at: i64,
+    value: i64,
+) -> telemetry::ValidatedTelemetry {
+    let raw = json!({"event_id": event_id, "ts": ts, "values": {"x": value}})
+        .to_string()
+        .into_bytes();
+    let limits =
+        TelemetryPayload::try_from(&iot_server::config::schema::TelemetryConfig::default())
+            .unwrap();
+    telemetry::validate(&raw, received_at, limits).unwrap()
+}
+
+async fn wait_for_postgres_allocator_lock(pool: &sqlx::PgPool) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pg_stat_activity
+                    WHERE datname = current_database()
+                      AND pid <> pg_backend_pid()
+                      AND wait_event_type = 'Lock'
+                      AND query LIKE '%telemetry_id_allocator%'
+                )",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("competing PostgreSQL writer should wait on the allocator row");
+}
+
+#[tokio::test]
+#[ignore = "requires tests/telemetry_api_postgres.sh"]
+async fn postgres_commit_checkpoint_serializes_competing_writers_and_backfills_both() {
+    let app = PostgresApp::start().await;
+    let device = app.create_device("telemetry-api-writer-order").await;
+    let mut headers = HeaderMap::new();
+    headers.insert(COOKIE, HeaderValue::from_str(app.admin_cookie()).unwrap());
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap();
+    let pool = sqlx::PgPool::connect(&std::env::var("IOT_TEST_POSTGRES_URL").unwrap())
+        .await
+        .unwrap();
+    let endpoint = format!("{}/api/v1/devices/{}/telemetry", app.base_url(), device.id);
+
+    let mut first = pool.begin().await.unwrap();
+    let first_id: i64 = sqlx::query_scalar(
+        "UPDATE telemetry_id_allocator SET last_id = last_id + 1 WHERE id = 1 RETURNING last_id",
+    )
+    .fetch_one(&mut *first)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO telemetry_events
+         (internal_id, device_id, event_id, ts, received_at, values_json, payload_sha256)
+         VALUES ($1, $2, 'writer-one', $3, $4, $5, $6)",
+    )
+    .bind(first_id)
+    .bind(&device.id)
+    .bind(auth::now_ms())
+    .bind(auth::now_ms())
+    .bind(json!({"x": 1}))
+    .bind([1_u8; 32].as_slice())
+    .execute(&mut *first)
+    .await
+    .unwrap();
+
+    let writer_pool = pool.clone();
+    let writer_device_id = device.id.clone();
+    let (started, started_rx) = tokio::sync::oneshot::channel();
+    let mut writer_two = tokio::spawn(async move {
+        let event = validated_test_event("writer-two", auth::now_ms(), auth::now_ms(), 2);
+        started.send(()).unwrap();
+        iot_server::storage::postgres::telemetry::PostgresTelemetryRepository::new(writer_pool)
+            .insert_batch(&[(writer_device_id, event)])
+            .await
+    });
+    started_rx.await.unwrap();
+    wait_for_postgres_allocator_lock(&pool).await;
+
+    let while_first_is_open: Value = client
+        .get(&endpoint)
+        .query(&[("after_id", "0"), ("limit", "1")])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(while_first_is_open["through_id"], 0);
+    assert!(while_first_is_open["items"].as_array().unwrap().is_empty());
+
+    first.commit().await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), &mut writer_two)
+            .await
+            .expect("second writer proceeds after first commit")
+            .unwrap()
+            .unwrap(),
+        [iot_server::core::telemetry::TelemetryInsertResult::Stored]
+    );
+    let first_page: Value = client
+        .get(&endpoint)
+        .query(&[("after_id", "0"), ("limit", "1")])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(first_page["items"][0]["event_id"], "writer-one");
+    let first_id = first_page["items"][0]["internal_id"].as_i64().unwrap();
+    let through_id = first_page["through_id"].as_i64().unwrap();
+    assert!(through_id > first_id);
+    let second_page: Value = client
+        .get(&endpoint)
+        .query(&[
+            ("after_id", "0"),
+            ("limit", "1"),
+            ("cursor", first_page["next_cursor"].as_str().unwrap()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(second_page["items"][0]["event_id"], "writer-two");
+    let second_id = second_page["items"][0]["internal_id"].as_i64().unwrap();
+    assert!(second_id > first_id && second_id <= through_id);
+    assert_eq!(second_page["through_id"], through_id);
+    assert!(second_page["next_cursor"].is_null());
+
+    let mut rollback = pool.begin().await.unwrap();
+    let rollback_id: i64 = sqlx::query_scalar(
+        "UPDATE telemetry_id_allocator SET last_id = last_id + 1 WHERE id = 1 RETURNING last_id",
+    )
+    .fetch_one(&mut *rollback)
+    .await
+    .unwrap();
+    let rollback_ts = auth::now_ms();
+    sqlx::query(
+        "INSERT INTO telemetry_events
+         (internal_id, device_id, event_id, ts, received_at, values_json, payload_sha256)
+         VALUES ($1, $2, 'writer-rolled-back', $3, $4, $5, $6)",
+    )
+    .bind(rollback_id)
+    .bind(&device.id)
+    .bind(rollback_ts)
+    .bind(rollback_ts)
+    .bind(json!({"x": 3}))
+    .bind([3_u8; 32].as_slice())
+    .execute(&mut *rollback)
+    .await
+    .unwrap();
+
+    let writer_pool = pool.clone();
+    let writer_device_id = device.id.clone();
+    let (started, started_rx) = tokio::sync::oneshot::channel();
+    let mut after_rollback_writer = tokio::spawn(async move {
+        let event =
+            validated_test_event("writer-after-rollback", auth::now_ms(), auth::now_ms(), 4);
+        started.send(()).unwrap();
+        iot_server::storage::postgres::telemetry::PostgresTelemetryRepository::new(writer_pool)
+            .insert_batch(&[(writer_device_id, event)])
+            .await
+    });
+    started_rx.await.unwrap();
+    wait_for_postgres_allocator_lock(&pool).await;
+    let while_rollback_is_open: Value = client
+        .get(&endpoint)
+        .query(&[("after_id", through_id.to_string())])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(while_rollback_is_open["through_id"], through_id);
+    assert!(
+        while_rollback_is_open["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    rollback.rollback().await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), &mut after_rollback_writer)
+            .await
+            .expect("competing writer proceeds after rollback")
+            .unwrap()
+            .unwrap(),
+        [iot_server::core::telemetry::TelemetryInsertResult::Stored]
+    );
     let after_rollback: Value = client
         .get(&endpoint)
         .query(&[("after_id", through_id.to_string())])
