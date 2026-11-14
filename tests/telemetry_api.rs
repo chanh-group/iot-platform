@@ -867,10 +867,13 @@ async fn latest_uses_received_time_then_internal_id_as_tie_breakers() {
     )
     .await;
 
+    assert_latest_tie_breakers(&client, &app.base, &device.id).await;
+}
+
+async fn assert_latest_tie_breakers(client: &reqwest::Client, base: &str, device_id: &str) {
     let response: Value = client
         .get(format!(
-            "{}/api/v1/devices/{}/telemetry/latest",
-            app.base, device.id
+            "{base}/api/v1/devices/{device_id}/telemetry/latest"
         ))
         .query(&[("keys", "a,z")])
         .send()
@@ -890,6 +893,54 @@ async fn latest_uses_received_time_then_internal_id_as_tie_breakers() {
     assert!(
         response["items"][0]["ts"].as_i64().unwrap() > response["items"][1]["ts"].as_i64().unwrap()
     );
+}
+
+#[tokio::test]
+#[ignore = "requires tests/telemetry_api_postgres.sh"]
+async fn latest_uses_received_time_then_internal_id_as_tie_breakers_postgres() {
+    let app = PostgresApp::start().await;
+    let device = app.create_device("telemetry-api-latest").await;
+    let ts = auth::now_ms() - 1_000;
+    let pool = sqlx::PgPool::connect(&std::env::var("IOT_TEST_POSTGRES_URL").unwrap())
+        .await
+        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    let previous_id: i64 = sqlx::query_scalar(
+        "UPDATE telemetry_id_allocator SET last_id = last_id + 4 WHERE id = 1 RETURNING last_id - 4",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    for (offset, event_id, event_ts, received_at, values) in [
+        (1_i64, "latest-1", ts, ts + 10, json!({"z": 4})),
+        (2_i64, "latest-2", ts + 20, ts + 30, json!({"a": 2})),
+        (3_i64, "latest-3", ts + 20, ts + 30, json!({"a": 3})),
+        (4_i64, "latest-4", ts + 20, ts + 25, json!({"a": 4})),
+    ] {
+        sqlx::query(
+            "INSERT INTO telemetry_events
+             (internal_id, device_id, event_id, ts, received_at, values_json, payload_sha256)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(previous_id + offset)
+        .bind(&device.id)
+        .bind(event_id)
+        .bind(event_ts)
+        .bind(received_at)
+        .bind(values)
+        .bind([0_u8; 32].as_slice())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(COOKIE, HeaderValue::from_str(app.admin_cookie()).unwrap());
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap();
+    assert_latest_tie_breakers(&client, app.base_url(), &device.id).await;
 }
 
 #[tokio::test]
