@@ -17,6 +17,7 @@ use iot_server::core::command::{
 use iot_server::core::device_channel::{DeviceChannel, DeviceChannelError};
 use iot_server::core::events::{EventBus, RealtimeEvent};
 use iot_server::observability::metrics::Metrics;
+use iot_server::storage::postgres::commands::PostgresCommandRepository;
 use iot_server::storage::sqlite::commands::SqliteCommandRepository;
 use rumqttc::{Event as MqttEvent, Packet, QoS, SubscribeReasonCode};
 use serde_json::{Value, json};
@@ -98,7 +99,7 @@ async fn wait_status(pool: &SqlitePool, command_id: &str, expected: &str) {
 }
 
 struct BlockingAckRepository {
-    inner: SqliteCommandRepository,
+    inner: std::sync::Arc<dyn CommandRepository>,
     started: Notify,
     release: Notify,
     completed: Notify,
@@ -665,7 +666,7 @@ async fn on_time_queued_ack_defers_expiry_while_worker_is_blocked() {
     let command_id = insert_command(&pool, &device_id, "pending", expires_at).await;
     let repository = SqliteCommandRepository::new(pool.clone());
     let gated = std::sync::Arc::new(BlockingAckRepository {
-        inner: repository.clone(),
+        inner: std::sync::Arc::new(repository.clone()),
         started: Notify::new(),
         release: Notify::new(),
         completed: Notify::new(),
@@ -722,6 +723,89 @@ async fn on_time_queued_ack_defers_expiry_while_worker_is_blocked() {
 }
 
 #[tokio::test]
+#[ignore = "requires tests/command_ack_postgres.sh"]
+async fn on_time_queued_ack_defers_expiry_while_worker_is_blocked_postgres() {
+    let app = mqtt_auth_postgres::PostgresApp::start().await;
+    let device = app.create_device("queued-ack-expiry-postgres").await;
+    let pool = sqlx::PgPool::connect(&std::env::var("IOT_TEST_POSTGRES_URL").unwrap())
+        .await
+        .unwrap();
+    let before_send = auth::now_ms();
+    let expires_at = before_send + 5_000;
+    let command_id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO commands (
+            id, device_id, name, params_json, status, created_at, expires_at, next_attempt_at
+         ) VALUES ($1, $2, 'reboot', '{}', 'pending', $3, $4, $5)",
+    )
+    .bind(&command_id)
+    .bind(&device.id)
+    .bind(before_send - 60_000)
+    .bind(expires_at)
+    .bind(before_send)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let repository = std::sync::Arc::new(PostgresCommandRepository::new(pool.clone()));
+    let gated = std::sync::Arc::new(BlockingAckRepository {
+        inner: repository.clone(),
+        started: Notify::new(),
+        release: Notify::new(),
+        completed: Notify::new(),
+        dispatch_gate: None,
+    });
+    let cancel = CancellationToken::new();
+    let (handle, worker) = spawn_ack_worker(gated.clone(), EventBus::new(), cancel.clone());
+    let payload = json!({
+        "command_id": command_id,
+        "status": "succeeded",
+        "result": {"queued": true},
+    })
+    .to_string();
+
+    handle.try_send(&device.id, payload.as_bytes());
+    let after_send = auth::now_ms();
+    tokio::time::timeout(Duration::from_secs(1), gated.started.notified())
+        .await
+        .expect("ACK worker should pick up the queued ACK");
+    let dispatcher = CommandDispatcher::new(
+        repository,
+        std::sync::Arc::new(OfflineCommandChannel),
+        CommandsConfig::default(),
+        handle.pending(),
+        closed_wakes(),
+    );
+    dispatcher.run_once(expires_at + 1).await.unwrap();
+    let before_ack_persistence: String =
+        sqlx::query_scalar("SELECT status FROM commands WHERE id = $1")
+            .bind(&command_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(before_ack_persistence, "pending");
+
+    gated.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), gated.completed.notified())
+        .await
+        .expect("ACK worker should persist after the expiry sweep");
+    let row: (String, i64, Option<i64>, Option<Value>) = sqlx::query_as(
+        "SELECT status, completed_at, late_ack_at, result_json FROM commands WHERE id = $1",
+    )
+    .bind(&command_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "succeeded");
+    assert!((before_send..=after_send).contains(&row.1));
+    assert_eq!(row.2, None);
+    assert_eq!(row.3, Some(json!({"queued": true})));
+
+    cancel.cancel();
+    worker.await.unwrap();
+}
+
+#[tokio::test]
 async fn delayed_dispatch_event_after_ack_has_stale_version_and_rest_stays_terminal() {
     let app = TestApp::builder()
         .command_dispatch_timing(10_000, 10_000)
@@ -756,7 +840,7 @@ async fn delayed_dispatch_event_after_ack_has_stale_version_and_rest_stays_termi
     let dispatch_release = std::sync::Arc::new(Notify::new());
     let repository: std::sync::Arc<dyn CommandRepository> =
         std::sync::Arc::new(BlockingAckRepository {
-            inner: SqliteCommandRepository::new(app.pool.clone()),
+            inner: std::sync::Arc::new(SqliteCommandRepository::new(app.pool.clone())),
             started: Notify::new(),
             release: Notify::new(),
             completed: Notify::new(),
