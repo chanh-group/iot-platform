@@ -27,8 +27,17 @@ async fn create_command(
     device_id: &str,
     body: &str,
 ) -> reqwest::Response {
+    create_command_at(client, &app.base, device_id, body).await
+}
+
+async fn create_command_at(
+    client: &reqwest::Client,
+    base: &str,
+    device_id: &str,
+    body: &str,
+) -> reqwest::Response {
     client
-        .post(format!("{}/api/v1/devices/{device_id}/commands", app.base))
+        .post(format!("{base}/api/v1/devices/{device_id}/commands"))
         .header("X-IoT-CSRF", "1")
         .header("X-Request-ID", "command-api-123")
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -274,6 +283,15 @@ async fn create_validates_fields_and_device_state() {
     let disabled = app.create_device("command-disabled", false).await;
     let http = admin_client(&app, "command-validation-admin").await;
 
+    assert_create_validation_contract(&http, &app.base, &device.id, &disabled.id).await;
+}
+
+async fn assert_create_validation_contract(
+    http: &reqwest::Client,
+    base: &str,
+    device_id: &str,
+    disabled_device_id: &str,
+) {
     let mut invalid = vec![
         "{".to_owned(),
         r#"{"name":"Reboot"}"#.to_owned(),
@@ -290,7 +308,7 @@ async fn create_validates_fields_and_device_state() {
         "x".repeat(16_385)
     ));
     for body in invalid {
-        let response = create_command(&http, &app, &device.id, &body).await;
+        let response = create_command_at(http, base, device_id, &body).await;
         assert_eq!(
             response.status(),
             reqwest::StatusCode::BAD_REQUEST,
@@ -308,9 +326,9 @@ async fn create_validates_fields_and_device_state() {
         );
     }
 
-    let missing = create_command(
-        &http,
-        &app,
+    let missing = create_command_at(
+        http,
+        base,
         "019c0000-0000-7000-8000-000000000000",
         r#"{"name":"reboot"}"#,
     )
@@ -321,12 +339,23 @@ async fn create_validates_fields_and_device_state() {
         "device_not_found"
     );
 
-    let disabled = create_command(&http, &app, &disabled.id, r#"{"name":"reboot"}"#).await;
+    let disabled = create_command_at(http, base, disabled_device_id, r#"{"name":"reboot"}"#).await;
     assert_eq!(disabled.status(), reqwest::StatusCode::CONFLICT);
     assert_eq!(
         disabled.json::<Value>().await.unwrap()["code"],
         "device_disabled"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires tests/command_api_postgres.sh"]
+async fn create_validates_fields_and_device_state_postgres() {
+    let app = mqtt_auth_postgres::PostgresApp::start().await;
+    let device = app.create_device("command-validation").await;
+    let disabled = app.create_device_disabled("command-disabled").await;
+    let http = postgres_admin_client(app.admin_cookie());
+
+    assert_create_validation_contract(&http, app.base_url(), &device.id, &disabled.id).await;
 }
 
 #[tokio::test]
