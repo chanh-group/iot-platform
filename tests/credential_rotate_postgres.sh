@@ -36,3 +36,4 @@ run_case() {
 }
 run_case rotates_an_online_device_and_rejects_the_previous_token_postgres
 run_case rotates_disabled_device_without_enabling_it_postgres
+run_case missing_device_returns_not_found_postgres

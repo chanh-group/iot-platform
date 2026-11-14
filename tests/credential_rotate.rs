@@ -393,8 +393,34 @@ async fn audit_failure_rolls_back_rotation_and_preserves_old_credential() {
 async fn missing_device_returns_not_found() {
     let app = TestApp::start().await;
     let http = admin_client(&app, "credential-missing").await;
-    let response = rotate(&http, &app, "019c0000-0000-7000-8000-000000000000").await;
+    assert_missing_device_returns_not_found(&http, &app.base).await;
+}
+
+async fn assert_missing_device_returns_not_found(http: &reqwest::Client, base: &str) {
+    let response = http
+        .post(format!(
+            "{base}/api/v1/devices/019c0000-0000-7000-8000-000000000000/credentials/rotate"
+        ))
+        .header("X-IoT-CSRF", "1")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+#[ignore = "requires tests/credential_rotate_postgres.sh"]
+async fn missing_device_returns_not_found_postgres() {
+    let app = mqtt_auth_postgres::PostgresApp::start().await;
+    let http = reqwest::Client::builder()
+        .default_headers(reqwest::header::HeaderMap::from_iter([(
+            reqwest::header::COOKIE,
+            app.admin_cookie().parse().unwrap(),
+        )]))
+        .build()
+        .unwrap();
+    assert_missing_device_returns_not_found(&http, app.base_url()).await;
 }
 
 #[tokio::test]
