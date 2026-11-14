@@ -3,7 +3,7 @@ mod common;
 mod mqtt_auth_postgres;
 
 use iot_server::core::auth;
-use iot_server::core::telemetry::{self, TelemetryPayload};
+use iot_server::core::telemetry::{self, TelemetryPayload, TelemetryRepository};
 use iot_server::storage::sqlite::telemetry as telemetry_storage;
 use reqwest::header::{COOKIE, HeaderMap, HeaderValue};
 use serde_json::{Value, json};
@@ -770,6 +770,51 @@ async fn commit_checkpoint_does_not_advance_past_an_uncommitted_batch_postgres()
     assert_uncommitted_event_is_backfilled(&client, &endpoint, checkpoint).await;
 }
 
+async fn telemetry_page_after(
+    client: &reqwest::Client,
+    endpoint: &str,
+    checkpoint: i64,
+    limit: i64,
+) -> Value {
+    client
+        .get(endpoint)
+        .query(&[
+            ("after_id", checkpoint.to_string()),
+            ("limit", limit.to_string()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+async fn assert_ignored_write_advances_checkpoint(
+    client: &reqwest::Client,
+    endpoint: &str,
+    checkpoint: i64,
+) -> i64 {
+    let page = telemetry_page_after(client, endpoint, checkpoint, 1).await;
+    let next_checkpoint = page["through_id"].as_i64().unwrap();
+    assert!(next_checkpoint > checkpoint);
+    assert!(page["items"].as_array().unwrap().is_empty());
+    next_checkpoint
+}
+
+async fn assert_event_backfills_after_checkpoint(
+    client: &reqwest::Client,
+    endpoint: &str,
+    checkpoint: i64,
+    event_id: &str,
+) {
+    let page = telemetry_page_after(client, endpoint, checkpoint, 1).await;
+    assert_eq!(page["items"].as_array().unwrap().len(), 1);
+    assert_eq!(page["items"][0]["event_id"], event_id);
+}
+
 #[tokio::test]
 async fn ignored_duplicate_and_conflict_advance_checkpoint_without_backfill_rows() {
     let app = TestApp::start().await;
@@ -795,17 +840,7 @@ async fn ignored_duplicate_and_conflict_advance_checkpoint_without_backfill_rows
         [iot_server::core::telemetry::TelemetryInsertResult::Stored]
     );
 
-    let initial: Value = client
-        .get(&endpoint)
-        .query(&[("after_id", "0"), ("limit", "1")])
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let initial = telemetry_page_after(&client, &endpoint, 0, 1).await;
     let initial_checkpoint = initial["through_id"].as_i64().unwrap();
 
     let duplicate = telemetry::validate(&original_raw, ts, limits).unwrap();
@@ -815,20 +850,8 @@ async fn ignored_duplicate_and_conflict_advance_checkpoint_without_backfill_rows
             .unwrap(),
         [iot_server::core::telemetry::TelemetryInsertResult::Duplicate]
     );
-    let after_duplicate: Value = client
-        .get(&endpoint)
-        .query(&[("after_id", initial_checkpoint.to_string())])
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let duplicate_checkpoint = after_duplicate["through_id"].as_i64().unwrap();
-    assert!(duplicate_checkpoint > initial_checkpoint);
-    assert!(after_duplicate["items"].as_array().unwrap().is_empty());
+    let duplicate_checkpoint =
+        assert_ignored_write_advances_checkpoint(&client, &endpoint, initial_checkpoint).await;
 
     let conflict_raw = json!({
         "event_id": "ignored-insert",
@@ -844,20 +867,9 @@ async fn ignored_duplicate_and_conflict_advance_checkpoint_without_backfill_rows
             .unwrap(),
         [iot_server::core::telemetry::TelemetryInsertResult::Conflict]
     );
-    let after_conflict: Value = client
-        .get(&endpoint)
-        .query(&[("after_id", initial_checkpoint.to_string())])
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let safe_checkpoint = after_conflict["through_id"].as_i64().unwrap();
+    let safe_checkpoint =
+        assert_ignored_write_advances_checkpoint(&client, &endpoint, initial_checkpoint).await;
     assert!(safe_checkpoint > duplicate_checkpoint);
-    assert!(after_conflict["items"].as_array().unwrap().is_empty());
 
     insert_event(
         &app,
@@ -868,22 +880,107 @@ async fn ignored_duplicate_and_conflict_advance_checkpoint_without_backfill_rows
         json!({"x": 3}),
     )
     .await;
-    let recovered: Value = client
-        .get(&endpoint)
-        .query(&[("after_id", safe_checkpoint.to_string())])
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
+    assert_event_backfills_after_checkpoint(
+        &client,
+        &endpoint,
+        safe_checkpoint,
+        "stored-after-ignored-inserts",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires tests/telemetry_api_postgres.sh"]
+async fn ignored_duplicate_and_conflict_advance_checkpoint_without_backfill_rows_postgres() {
+    let app = PostgresApp::start().await;
+    let device = app.create_device("telemetry-api-ignored-inserts").await;
+    let pool = sqlx::PgPool::connect(&std::env::var("IOT_TEST_POSTGRES_URL").unwrap())
         .await
         .unwrap();
-    assert_eq!(recovered["items"].as_array().unwrap().len(), 1);
+    let repository =
+        iot_server::storage::postgres::telemetry::PostgresTelemetryRepository::new(pool.clone());
+    let ts = auth::now_ms();
+    let limits =
+        TelemetryPayload::try_from(&iot_server::config::schema::TelemetryConfig::default())
+            .unwrap();
+    let original_raw = json!({
+        "event_id": "ignored-insert",
+        "ts": ts,
+        "values": {"x": 1},
+    })
+    .to_string()
+    .into_bytes();
+    let original = telemetry::validate(&original_raw, ts, limits).unwrap();
     assert_eq!(
-        recovered["items"][0]["event_id"],
-        "stored-after-ignored-inserts"
+        repository
+            .insert_batch(&[(device.id.clone(), original)])
+            .await
+            .unwrap(),
+        [iot_server::core::telemetry::TelemetryInsertResult::Stored]
     );
+
+    let mut headers = HeaderMap::new();
+    headers.insert(COOKIE, HeaderValue::from_str(app.admin_cookie()).unwrap());
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap();
+    let endpoint = format!("{}/api/v1/devices/{}/telemetry", app.base_url(), device.id);
+    let initial = telemetry_page_after(&client, &endpoint, 0, 1).await;
+    let initial_checkpoint = initial["through_id"].as_i64().unwrap();
+
+    let duplicate = telemetry::validate(&original_raw, ts, limits).unwrap();
+    assert_eq!(
+        repository
+            .insert_batch(&[(device.id.clone(), duplicate)])
+            .await
+            .unwrap(),
+        [iot_server::core::telemetry::TelemetryInsertResult::Duplicate]
+    );
+    let duplicate_checkpoint =
+        assert_ignored_write_advances_checkpoint(&client, &endpoint, initial_checkpoint).await;
+
+    let conflict_raw = json!({
+        "event_id": "ignored-insert",
+        "ts": ts,
+        "values": {"x": 2},
+    })
+    .to_string()
+    .into_bytes();
+    let conflict = telemetry::validate(&conflict_raw, ts, limits).unwrap();
+    assert_eq!(
+        repository
+            .insert_batch(&[(device.id.clone(), conflict)])
+            .await
+            .unwrap(),
+        [iot_server::core::telemetry::TelemetryInsertResult::Conflict]
+    );
+    let safe_checkpoint =
+        assert_ignored_write_advances_checkpoint(&client, &endpoint, initial_checkpoint).await;
+    assert!(safe_checkpoint > duplicate_checkpoint);
+
+    let stored_raw = json!({
+        "event_id": "stored-after-ignored-inserts",
+        "ts": ts + 1,
+        "values": {"x": 3},
+    })
+    .to_string()
+    .into_bytes();
+    let stored = telemetry::validate(&stored_raw, ts + 1, limits).unwrap();
+    assert_eq!(
+        repository
+            .insert_batch(&[(device.id.clone(), stored)])
+            .await
+            .unwrap(),
+        [iot_server::core::telemetry::TelemetryInsertResult::Stored]
+    );
+    assert_event_backfills_after_checkpoint(
+        &client,
+        &endpoint,
+        safe_checkpoint,
+        "stored-after-ignored-inserts",
+    )
+    .await;
 }
 
 #[tokio::test]
