@@ -1,11 +1,15 @@
 mod common;
+#[path = "common/mqtt_auth_postgres.rs"]
+mod mqtt_auth_postgres;
 
 use iot_server::core::auth;
 use iot_server::core::telemetry::{self, TelemetryPayload};
 use iot_server::storage::sqlite::telemetry as telemetry_storage;
+use reqwest::header::{COOKIE, HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 
 use common::TestApp;
+use mqtt_auth_postgres::PostgresApp;
 
 async fn logged_in_client(app: &TestApp) -> reqwest::Client {
     app.create_admin("telemetry-admin", "telemetry-test-password")
@@ -46,6 +50,86 @@ async fn insert_event(
     );
 }
 
+async fn assert_history_pages(client: &reqwest::Client, endpoint: &str, ts: i64) {
+    let first: Value = client
+        .get(endpoint)
+        .query(&[
+            ("from", ts.to_string()),
+            ("to", (ts + 1).to_string()),
+            ("limit", "1".to_owned()),
+            ("keys", "x".to_owned()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(first["items"][0]["event_id"], "history-1");
+    assert_eq!(first["items"][0]["values"], json!({ "x": 1 }));
+    let cursor = first["next_cursor"].as_str().unwrap();
+
+    let changed_to = client
+        .get(endpoint)
+        .query(&[
+            ("from", ts.to_string()),
+            ("to", (ts + 2).to_string()),
+            ("limit", "1".to_owned()),
+            ("keys", "x".to_owned()),
+            ("cursor", cursor.to_owned()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(changed_to.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        changed_to.json::<Value>().await.unwrap()["code"],
+        "invalid_cursor"
+    );
+
+    let second: Value = client
+        .get(endpoint)
+        .query(&[
+            ("from", ts.to_string()),
+            ("to", (ts + 1).to_string()),
+            ("limit", "1".to_owned()),
+            ("keys", "x".to_owned()),
+            ("cursor", cursor.to_owned()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(second["items"][0]["event_id"], "history-2");
+    let cursor = second["next_cursor"].as_str().unwrap();
+
+    let third: Value = client
+        .get(endpoint)
+        .query(&[
+            ("from", ts.to_string()),
+            ("to", (ts + 1).to_string()),
+            ("limit", "1".to_owned()),
+            ("keys", "x".to_owned()),
+            ("cursor", cursor.to_owned()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(third["items"][0]["event_id"], "history-3");
+    assert!(third["next_cursor"].is_null());
+}
+
 #[tokio::test]
 async fn history_pages_are_stable_and_key_filter_projects_matching_values() {
     let app = TestApp::start().await;
@@ -82,83 +166,53 @@ async fn history_pages_are_stable_and_key_filter_projects_matching_values() {
     .await;
 
     let endpoint = format!("{}/api/v1/devices/{}/telemetry", app.base, device.id);
-    let first: Value = client
-        .get(&endpoint)
-        .query(&[
-            ("from", ts.to_string()),
-            ("to", (ts + 1).to_string()),
-            ("limit", "1".to_owned()),
-            ("keys", "x".to_owned()),
-        ])
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(first["items"][0]["event_id"], "history-1");
-    assert_eq!(first["items"][0]["values"], json!({ "x": 1 }));
-    let cursor = first["next_cursor"].as_str().unwrap();
+    assert_history_pages(&client, &endpoint, ts).await;
+}
 
-    let changed_to = client
-        .get(&endpoint)
-        .query(&[
-            ("from", ts.to_string()),
-            ("to", (ts + 2).to_string()),
-            ("limit", "1".to_owned()),
-            ("keys", "x".to_owned()),
-            ("cursor", cursor.to_owned()),
-        ])
-        .send()
+#[tokio::test]
+#[ignore = "requires the guarded PostgreSQL runner"]
+async fn history_pages_are_stable_and_key_filter_projects_matching_values_postgres() {
+    let app = PostgresApp::start().await;
+    let device = app.create_device("telemetry-api-history").await;
+    let ts = auth::now_ms() - 1_000;
+    let pool = sqlx::PgPool::connect(&std::env::var("IOT_TEST_POSTGRES_URL").unwrap())
         .await
         .unwrap();
-    assert_eq!(changed_to.status(), reqwest::StatusCode::BAD_REQUEST);
-    assert_eq!(
-        changed_to.json::<Value>().await.unwrap()["code"],
-        "invalid_cursor"
-    );
-
-    let second: Value = client
-        .get(&endpoint)
-        .query(&[
-            ("from", ts.to_string()),
-            ("to", (ts + 1).to_string()),
-            ("limit", "1".to_owned()),
-            ("keys", "x".to_owned()),
-            ("cursor", cursor.to_owned()),
-        ])
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(second["items"][0]["event_id"], "history-2");
-    let cursor = second["next_cursor"].as_str().unwrap();
-
-    let third: Value = client
-        .get(&endpoint)
-        .query(&[
-            ("from", ts.to_string()),
-            ("to", (ts + 1).to_string()),
-            ("limit", "1".to_owned()),
-            ("keys", "x".to_owned()),
-            ("cursor", cursor.to_owned()),
-        ])
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
+    let mut tx = pool.begin().await.unwrap();
+    let last_id: i64 = sqlx::query_scalar(
+        "UPDATE telemetry_id_allocator SET last_id = last_id + 3 WHERE id = 1 RETURNING last_id - 3",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    for (offset, event_id, received_at, values) in [
+        (1_i64, "history-1", ts + 20, json!({"x": 1, "y": 10})),
+        (2_i64, "history-2", ts + 40, json!({"x": 2})),
+        (3_i64, "history-3", ts + 40, json!({"x": 3})),
+    ] {
+        sqlx::query(
+            "INSERT INTO telemetry_events (internal_id, device_id, event_id, ts, received_at, values_json, payload_sha256) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(last_id + offset)
+        .bind(&device.id)
+        .bind(event_id)
+        .bind(ts)
+        .bind(received_at)
+        .bind(values)
+        .bind([0_u8; 32].as_slice())
+        .execute(&mut *tx)
         .await
         .unwrap();
-    assert_eq!(third["items"][0]["event_id"], "history-3");
-    assert!(third["next_cursor"].is_null());
+    }
+    tx.commit().await.unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(COOKIE, HeaderValue::from_str(app.admin_cookie()).unwrap());
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap();
+    let endpoint = format!("{}/api/v1/devices/{}/telemetry", app.base_url(), device.id);
+    assert_history_pages(&client, &endpoint, ts).await;
 }
 
 #[tokio::test]
