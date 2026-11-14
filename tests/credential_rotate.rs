@@ -390,6 +390,135 @@ async fn audit_failure_rolls_back_rotation_and_preserves_old_credential() {
 }
 
 #[tokio::test]
+#[ignore = "requires tests/credential_rotate_postgres.sh"]
+async fn audit_failure_rolls_back_rotation_and_preserves_old_credential_postgres() {
+    let app = mqtt_auth_postgres::PostgresApp::start().await;
+    let http = reqwest::Client::builder()
+        .default_headers(reqwest::header::HeaderMap::from_iter([(
+            reqwest::header::COOKIE,
+            app.admin_cookie().parse().unwrap(),
+        )]))
+        .build()
+        .unwrap();
+    let device = app.create_device("credential-audit").await;
+    let (old_client, _old_eventloop, _) =
+        mqtt_connect(app.mqtt_addr(), &device.id, &device.id, &device.token, true).await;
+    let pool = sqlx::PgPool::connect(&std::env::var("IOT_TEST_POSTGRES_URL").unwrap())
+        .await
+        .unwrap();
+    let before: (String, Vec<u8>) = sqlx::query_as(
+        "SELECT id, token_hash FROM device_credentials
+         WHERE device_id = $1 AND status = 'active'",
+    )
+    .bind(&device.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE FUNCTION fail_credential_rotate_audit() RETURNS trigger
+         LANGUAGE plpgsql AS $$ BEGIN
+             IF NEW.action = 'credential.rotate' THEN
+                 RAISE EXCEPTION 'injected audit failure';
+             END IF;
+             RETURN NEW;
+         END $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_credential_rotate_audit BEFORE INSERT ON audit_events
+         FOR EACH ROW EXECUTE FUNCTION fail_credential_rotate_audit()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let response = http
+        .post(format!(
+            "{}/api/v1/devices/{}/credentials/rotate",
+            app.base_url(),
+            device.id
+        ))
+        .header("X-IoT-CSRF", "1")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let active: (String, Vec<u8>) = sqlx::query_as(
+        "SELECT id, token_hash FROM device_credentials
+         WHERE device_id = $1 AND status = 'active'",
+    )
+    .bind(&device.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(active, before);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM device_credentials WHERE device_id = $1",
+        )
+        .bind(&device.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_events WHERE target_id = $1 AND action = 'credential.rotate'",
+        )
+        .bind(&device.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        0
+    );
+    drop(old_client);
+
+    let (reconnected, mut eventloop) = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let options =
+                mqtt_options(app.mqtt_addr(), &device.id, &device.id, &device.token, true);
+            let (client, mut eventloop) = AsyncClient::new(options, 32);
+            match eventloop.poll().await {
+                Ok(Event::Incoming(Packet::ConnAck(ack)))
+                    if ack.code == ConnectReturnCode::Success =>
+                {
+                    break (client, eventloop);
+                }
+                Err(ConnectionError::ConnectionRefused(ConnectReturnCode::NotAuthorized)) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                other => panic!("unexpected MQTT connection result: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("old credential should reconnect after the rollback fence clears");
+    mqtt_publish(
+        &reconnected,
+        &format!("devices/{}/data/after-rollback", device.id),
+        QoS::AtLeastOnce,
+        false,
+        b"still-connected",
+    )
+    .await;
+    mqtt_wait_puback(&mut eventloop, Duration::from_secs(2)).await;
+    drop(reconnected);
+
+    sqlx::query("DROP TRIGGER fail_credential_rotate_audit ON audit_events")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP FUNCTION fail_credential_rotate_audit()")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn missing_device_returns_not_found() {
     let app = TestApp::start().await;
     let http = admin_client(&app, "credential-missing").await;
